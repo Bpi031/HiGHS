@@ -9,6 +9,8 @@
 #ifndef HIGHS_ROOT_WORK_H_
 #define HIGHS_ROOT_WORK_H_
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -23,6 +25,7 @@ enum class HighsRootWorkPhase : uint8_t {
   kRestart,
   kCleanup,
   kTree,
+  kCount,
 };
 
 enum class HighsRootWorkAction : uint8_t {
@@ -70,6 +73,36 @@ struct HighsRootWorkSnapshot {
   bool tree_entered = false;
 };
 
+struct HighsRootWorkObservation {
+  double time = 0.0;
+  int64_t lp_iterations = 0;
+  int64_t improving_solutions = 0;
+  double incumbent = std::numeric_limits<double>::infinity();
+  double dual_bound = -std::numeric_limits<double>::infinity();
+  int64_t active_lp_rows = 0;
+  int64_t active_lp_nonzeros = 0;
+  int64_t cut_pool_rows = 0;
+  int64_t fractional_integers = 0;
+};
+
+struct HighsRootWorkActivityAccount {
+  double wall_time = 0.0;
+  int64_t lp_iterations = 0;
+  int64_t calls = 0;
+  int64_t successes = 0;
+  int64_t accepted_incumbents = 0;
+  double primal_gain = 0.0;
+  double dual_gain = 0.0;
+  int64_t cuts_generated = 0;
+  int64_t cut_pool_rows_added = 0;
+  int64_t lp_rows_added = 0;
+  int64_t lp_nonzeros_added = 0;
+  int64_t last_fractional_integers = -1;
+};
+
+constexpr size_t kHighsRootWorkPhaseCount =
+    static_cast<size_t>(HighsRootWorkPhase::kCount);
+
 class HighsRootWorkController {
  public:
   void beginStage(const HighsRootWorkConfig& config, double now,
@@ -81,11 +114,18 @@ class HighsRootWorkController {
   double optionalAllowance(HighsRootWorkPhase phase, double now) const;
   void recordCompleted(HighsRootWorkPhase phase, double elapsed,
                        bool produced_separation_round = false);
+  void recordCompleted(HighsRootWorkPhase phase,
+                       const HighsRootWorkObservation& before,
+                       const HighsRootWorkObservation& after,
+                       int64_t cuts_generated = 0,
+                       bool produced_separation_round = false);
   void recordTreeEntry();
 
   bool enabled() const { return config_.enabled; }
   const HighsRootWorkConfig& config() const { return config_; }
   const HighsRootWorkSnapshot& snapshot() const { return snapshot_; }
+  const HighsRootWorkActivityAccount& activity(
+      HighsRootWorkPhase phase) const;
 
   static const char* phaseName(HighsRootWorkPhase phase);
   static const char* actionName(HighsRootWorkAction action);
@@ -97,9 +137,12 @@ class HighsRootWorkController {
   bool separationLimited() const;
   bool heuristicLimited() const;
   static bool isHeuristic(HighsRootWorkPhase phase);
+  static size_t phaseIndex(HighsRootWorkPhase phase);
 
   HighsRootWorkConfig config_;
   HighsRootWorkSnapshot snapshot_;
+  std::array<HighsRootWorkActivityAccount, kHighsRootWorkPhaseCount>
+      activities_;
 };
 
 #endif

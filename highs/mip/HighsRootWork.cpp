@@ -9,12 +9,14 @@
 #include "mip/HighsRootWork.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 
 void HighsRootWorkController::beginStage(const HighsRootWorkConfig& config,
                                          double now, double absolute_deadline) {
   config_ = config;
   snapshot_ = HighsRootWorkSnapshot{};
+  activities_ = {};
   snapshot_.stage_start = now;
   snapshot_.absolute_deadline = absolute_deadline;
 }
@@ -83,12 +85,58 @@ void HighsRootWorkController::recordCompleted(HighsRootWorkPhase phase,
   if (!config_.enabled) return;
   const double accounted =
       std::isfinite(elapsed) ? std::max(0.0, elapsed) : 0.0;
+  HighsRootWorkActivityAccount& account = activities_[phaseIndex(phase)];
+  account.wall_time += accounted;
+  ++account.calls;
   if (phase == HighsRootWorkPhase::kSeparation) {
     snapshot_.separation_time += accounted;
     if (produced_separation_round) ++snapshot_.separation_rounds;
   } else if (isHeuristic(phase)) {
     snapshot_.heuristic_time += accounted;
   }
+}
+
+void HighsRootWorkController::recordCompleted(
+    HighsRootWorkPhase phase, const HighsRootWorkObservation& before,
+    const HighsRootWorkObservation& after, int64_t cuts_generated,
+    bool produced_separation_round) {
+  if (!config_.enabled) return;
+
+  const double elapsed = after.time - before.time;
+  recordCompleted(phase, elapsed, produced_separation_round);
+
+  HighsRootWorkActivityAccount& account = activities_[phaseIndex(phase)];
+  const int64_t lp_iterations =
+      std::max<int64_t>(0, after.lp_iterations - before.lp_iterations);
+  const int64_t accepted_incumbents = std::max<int64_t>(
+      0, after.improving_solutions - before.improving_solutions);
+  const int64_t cut_pool_rows_added =
+      std::max<int64_t>(0, after.cut_pool_rows - before.cut_pool_rows);
+  const int64_t lp_rows_added =
+      std::max<int64_t>(0, after.active_lp_rows - before.active_lp_rows);
+  const int64_t lp_nonzeros_added = std::max<int64_t>(
+      0, after.active_lp_nonzeros - before.active_lp_nonzeros);
+
+  double primal_gain = 0.0;
+  if (std::isfinite(before.incumbent) && std::isfinite(after.incumbent))
+    primal_gain = std::max(0.0, before.incumbent - after.incumbent);
+
+  double dual_gain = 0.0;
+  if (std::isfinite(before.dual_bound) && std::isfinite(after.dual_bound))
+    dual_gain = std::max(0.0, after.dual_bound - before.dual_bound);
+
+  account.lp_iterations += lp_iterations;
+  account.accepted_incumbents += accepted_incumbents;
+  account.primal_gain += primal_gain;
+  account.dual_gain += dual_gain;
+  account.cuts_generated += std::max<int64_t>(0, cuts_generated);
+  account.cut_pool_rows_added += cut_pool_rows_added;
+  account.lp_rows_added += lp_rows_added;
+  account.lp_nonzeros_added += lp_nonzeros_added;
+  account.last_fractional_integers = after.fractional_integers;
+  if (accepted_incumbents > 0 || primal_gain > 0.0 || dual_gain > 0.0 ||
+      cuts_generated > 0 || cut_pool_rows_added > 0 || lp_rows_added > 0)
+    ++account.successes;
 }
 
 void HighsRootWorkController::recordTreeEntry() {
@@ -131,9 +179,21 @@ bool HighsRootWorkController::isHeuristic(HighsRootWorkPhase phase) {
     case HighsRootWorkPhase::kRestart:
     case HighsRootWorkPhase::kCleanup:
     case HighsRootWorkPhase::kTree:
+    case HighsRootWorkPhase::kCount:
       return false;
   }
   return false;
+}
+
+size_t HighsRootWorkController::phaseIndex(HighsRootWorkPhase phase) {
+  const size_t index = static_cast<size_t>(phase);
+  assert(index < kHighsRootWorkPhaseCount);
+  return index;
+}
+
+const HighsRootWorkActivityAccount& HighsRootWorkController::activity(
+    HighsRootWorkPhase phase) const {
+  return activities_[phaseIndex(phase)];
 }
 
 const char* HighsRootWorkController::phaseName(HighsRootWorkPhase phase) {
@@ -158,6 +218,8 @@ const char* HighsRootWorkController::phaseName(HighsRootWorkPhase phase) {
       return "cleanup";
     case HighsRootWorkPhase::kTree:
       return "tree";
+    case HighsRootWorkPhase::kCount:
+      return "unknown";
   }
   return "unknown";
 }

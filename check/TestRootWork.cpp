@@ -1,4 +1,5 @@
 #include <limits>
+#include <vector>
 
 #include "HCheckConfig.h"
 #include "Highs.h"
@@ -156,6 +157,102 @@ TEST_CASE("root-work-new-stage-resets-cumulative-and-tree-state",
   REQUIRE(
       controller.beforeOptional(HighsRootWorkPhase::kSeparation, 21.0).action ==
       HighsRootWorkAction::kContinue);
+}
+
+TEST_CASE("root-work-records-separate-activity-evidence",
+          "[highs_root_work]") {
+  HighsRootWorkConfig config;
+  config.enabled = true;
+  HighsRootWorkController controller;
+  controller.beginStage(config, 0.0, 100.0);
+  controller.beginEpoch();
+
+  HighsRootWorkObservation before;
+  before.time = 1.0;
+  before.lp_iterations = 10;
+  before.improving_solutions = 1;
+  before.incumbent = 100.0;
+  before.dual_bound = 20.0;
+  before.active_lp_rows = 10;
+  before.active_lp_nonzeros = 30;
+  before.cut_pool_rows = 2;
+  before.fractional_integers = 5;
+
+  HighsRootWorkObservation after;
+  after.time = 3.0;
+  after.lp_iterations = 25;
+  after.improving_solutions = 2;
+  after.incumbent = 90.0;
+  after.dual_bound = 26.0;
+  after.active_lp_rows = 12;
+  after.active_lp_nonzeros = 40;
+  after.cut_pool_rows = 3;
+  after.fractional_integers = 4;
+
+  controller.recordCompleted(HighsRootWorkPhase::kSeparation, before, after,
+                             3, true);
+
+  const HighsRootWorkActivityAccount& account =
+      controller.activity(HighsRootWorkPhase::kSeparation);
+  REQUIRE(account.calls == 1);
+  REQUIRE(account.successes == 1);
+  REQUIRE(account.wall_time == 2.0);
+  REQUIRE(account.lp_iterations == 15);
+  REQUIRE(account.accepted_incumbents == 1);
+  REQUIRE(account.primal_gain == 10.0);
+  REQUIRE(account.dual_gain == 6.0);
+  REQUIRE(account.cuts_generated == 3);
+  REQUIRE(account.cut_pool_rows_added == 1);
+  REQUIRE(account.lp_rows_added == 2);
+  REQUIRE(account.lp_nonzeros_added == 10);
+  REQUIRE(account.last_fractional_integers == 4);
+  REQUIRE(controller.snapshot().separation_rounds == 1);
+  REQUIRE(controller.snapshot().separation_time == 2.0);
+}
+
+TEST_CASE("root-work-unlimited-telemetry-preserves-deterministic-search",
+          "[highs_root_work]") {
+  const std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/rgn.mps";
+
+  struct SolveEvidence {
+    HighsModelStatus status;
+    double objective;
+    int64_t nodes;
+    HighsInt simplex_iterations;
+    std::vector<double> solution;
+  };
+
+  auto solve = [&](bool telemetry) {
+    Highs highs;
+    REQUIRE(highs.setOptionValue("output_flag", false) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("threads", 1) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("random_seed", 42) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_rel_gap", 0.0) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_abs_gap", 0.0) == HighsStatus::kOk);
+    REQUIRE(highs.readModel(filename) == HighsStatus::kOk);
+    if (telemetry)
+      REQUIRE(highs.setOptionValue("mip_root_work_budget", true) ==
+              HighsStatus::kOk);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    const HighsInfo& info = highs.getInfo();
+    SolveEvidence evidence{highs.getModelStatus(),
+                           info.objective_function_value,
+                           info.mip_node_count,
+                           info.simplex_iteration_count,
+                           highs.getSolution().col_value};
+    highs.resetGlobalScheduler(true);
+    return evidence;
+  };
+
+  const SolveEvidence baseline = solve(false);
+  const SolveEvidence telemetry = solve(true);
+  REQUIRE(baseline.status == HighsModelStatus::kOptimal);
+  REQUIRE(telemetry.status == baseline.status);
+  REQUIRE(telemetry.objective == baseline.objective);
+  REQUIRE(telemetry.nodes == baseline.nodes);
+  REQUIRE(telemetry.simplex_iterations == baseline.simplex_iterations);
+  REQUIRE(telemetry.solution == baseline.solution);
 }
 
 TEST_CASE("root-work-active-path-preserves-tiny-mip-optimum",
