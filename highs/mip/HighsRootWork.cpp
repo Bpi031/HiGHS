@@ -176,6 +176,8 @@ bool HighsRootWorkController::isHeuristic(HighsRootWorkPhase phase) {
     case HighsRootWorkPhase::kInitialLp:
     case HighsRootWorkPhase::kSeparation:
     case HighsRootWorkPhase::kAnalyticCenter:
+    case HighsRootWorkPhase::kLpReoptimization:
+    case HighsRootWorkPhase::kSymmetry:
     case HighsRootWorkPhase::kRestart:
     case HighsRootWorkPhase::kCleanup:
     case HighsRootWorkPhase::kTree:
@@ -212,6 +214,10 @@ const char* HighsRootWorkController::phaseName(HighsRootWorkPhase phase) {
       return "rens";
     case HighsRootWorkPhase::kFeasibilityPump:
       return "feasibility_pump";
+    case HighsRootWorkPhase::kLpReoptimization:
+      return "lp_reoptimization";
+    case HighsRootWorkPhase::kSymmetry:
+      return "symmetry";
     case HighsRootWorkPhase::kRestart:
       return "restart";
     case HighsRootWorkPhase::kCleanup:

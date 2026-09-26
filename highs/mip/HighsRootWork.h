@@ -22,6 +22,8 @@ enum class HighsRootWorkPhase : uint8_t {
   kReducedCostHeuristic,
   kRens,
   kFeasibilityPump,
+  kLpReoptimization,
+  kSymmetry,
   kRestart,
   kCleanup,
   kTree,

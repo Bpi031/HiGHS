@@ -2241,9 +2241,13 @@ restart:
     }
 #endif
     getLp().addCuts(cutset);
+    const HighsRootWorkObservation cut_pool_reoptimization_started =
+        captureRootWork();
     profiling->start(kMipClockEvaluateRootLp);
     status = evaluateRootLp(worker);
     profiling->stop(kMipClockEvaluateRootLp);
+    completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                     cut_pool_reoptimization_started);
     getLp().removeObsoleteRows();
     if (status == HighsLpRelaxation::Status::kInfeasible)
       return clockOff(profiling);
@@ -2275,9 +2279,13 @@ restart:
     completeRootWork(HighsRootWorkPhase::kRounding, initial_rounding_started);
   }
 
+  const HighsRootWorkObservation post_rounding_reoptimization_started =
+      captureRootWork();
   profiling->start(kMipClockEvaluateRootLp);
   status = evaluateRootLp(worker);
   profiling->stop(kMipClockEvaluateRootLp);
+  completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                   post_rounding_reoptimization_started);
   if (status == HighsLpRelaxation::Status::kInfeasible)
     return clockOff(profiling);
 
@@ -2421,9 +2429,13 @@ restart:
         profiling->stop(kMipClockRootSeparation);
         return clockOff(profiling);
       }
+      const HighsRootWorkObservation central_reoptimization_started =
+          captureRootWork();
       profiling->start(kMipClockRootSeparationEvaluateRootLp);
       status = evaluateRootLp(worker);
       profiling->stop(kMipClockRootSeparationEvaluateRootLp);
+      completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                       central_reoptimization_started);
       if (status == HighsLpRelaxation::Status::kInfeasible) {
         profiling->stop(kMipClockRootSeparation);
         return clockOff(profiling);
@@ -2492,9 +2504,13 @@ restart:
   }
 
   getLp().setIterationLimit();
+  const HighsRootWorkObservation post_separation_reoptimization_started =
+      captureRootWork();
   profiling->start(kMipClockEvaluateRootLp);
   status = evaluateRootLp(worker);
   profiling->stop(kMipClockEvaluateRootLp);
+  completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                   post_separation_reoptimization_started);
   if (status == HighsLpRelaxation::Status::kInfeasible)
     return clockOff(profiling);
 
@@ -2538,9 +2554,13 @@ restart:
     // more separation round
     if (checkLimits()) return clockOff(profiling);
     bool separate = !getDomain().getChangedCols().empty();
+    const HighsRootWorkObservation post_analytic_reoptimization_started =
+        captureRootWork();
     profiling->start(kMipClockEvaluateRootLp);
     status = evaluateRootLp(worker);
     profiling->stop(kMipClockEvaluateRootLp);
+    completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                     post_analytic_reoptimization_started);
     if (status == HighsLpRelaxation::Status::kInfeasible)
       return clockOff(profiling);
     if (separate && getLp().scaledOptimal(status)) {
@@ -2610,9 +2630,13 @@ restart:
     // if there are new global bound changes we re-evaluate the LP and do one
     // more separation round
     bool separate = !getDomain().getChangedCols().empty();
+    const HighsRootWorkObservation post_reduced_cost_reoptimization_started =
+        captureRootWork();
     profiling->start(kMipClockEvaluateRootLp);
     status = evaluateRootLp(worker);
     profiling->stop(kMipClockEvaluateRootLp);
+    completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                     post_reduced_cost_reoptimization_started);
     if (status == HighsLpRelaxation::Status::kInfeasible)
       return clockOff(profiling);
     if (separate && getLp().scaledOptimal(status)) {
@@ -2663,9 +2687,13 @@ restart:
     // if there are new global bound changes we re-evaluate the LP and do one
     // more separation round
     separate = !getDomain().getChangedCols().empty();
+    const HighsRootWorkObservation post_rens_reoptimization_started =
+        captureRootWork();
     profiling->start(kMipClockEvaluateRootLp);
     status = evaluateRootLp(worker);
     profiling->stop(kMipClockEvaluateRootLp);
+    completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                     post_rens_reoptimization_started);
     if (status == HighsLpRelaxation::Status::kInfeasible)
       return clockOff(profiling);
     if (separate && getLp().scaledOptimal(status)) {
@@ -2715,9 +2743,13 @@ restart:
     heuristics.flushStatistics(mipsolver, worker);
 
     if (checkLimits()) return clockOff(profiling);
+    const HighsRootWorkObservation post_pump_reoptimization_started =
+        captureRootWork();
     profiling->start(kMipClockEvaluateRootLp);
     status = evaluateRootLp(worker);
     profiling->stop(kMipClockEvaluateRootLp);
+    completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                     post_pump_reoptimization_started);
     if (status == HighsLpRelaxation::Status::kInfeasible)
       return clockOff(profiling);
   } while (false);
@@ -2735,9 +2767,13 @@ restart:
   // if there are new global bound changes we re-evaluate the LP and do one
   // more separation round
   bool separate = !getDomain().getChangedCols().empty();
+  const HighsRootWorkObservation final_root_reoptimization_started =
+      captureRootWork();
   profiling->start(kMipClockEvaluateRootLp);
   status = evaluateRootLp(worker);
   profiling->stop(kMipClockEvaluateRootLp);
+  completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                   final_root_reoptimization_started);
   if (status == HighsLpRelaxation::Status::kInfeasible)
     return clockOff(profiling);
   if (separate && getLp().scaledOptimal(status)) {
@@ -2811,10 +2847,16 @@ restart:
     }
 
     if (detectSymmetries) {
+      const HighsRootWorkObservation symmetry_started = captureRootWork();
       finishSymmetryDetection(tg, symData);
+      completeRootWork(HighsRootWorkPhase::kSymmetry, symmetry_started);
+      const HighsRootWorkObservation post_symmetry_reoptimization_started =
+          captureRootWork();
       profiling->start(kMipClockEvaluateRootLp);
       status = evaluateRootLp(worker);
       profiling->stop(kMipClockEvaluateRootLp);
+      completeRootWork(HighsRootWorkPhase::kLpReoptimization,
+                       post_symmetry_reoptimization_started);
       if (status == HighsLpRelaxation::Status::kInfeasible)
         return clockOff(profiling);
     }
