@@ -33,6 +33,7 @@ enum class HighsRootWorkPhase : uint8_t {
 enum class HighsRootWorkAction : uint8_t {
   kContinue,
   kSkipOptional,
+  kStopSeparation,
   kYieldToTree,
   kStopGlobal,
 };
@@ -44,6 +45,7 @@ enum class HighsRootWorkReason : uint8_t {
   kTreeReserve,
   kSeparationRoundLimit,
   kSeparationTimeLimit,
+  kSeparationLowMarginalValue,
   kHeuristicTimeLimit,
 };
 
@@ -73,6 +75,9 @@ struct HighsRootWorkSnapshot {
   double stage_start = 0.0;
   double absolute_deadline = std::numeric_limits<double>::infinity();
   bool tree_entered = false;
+  bool separation_stopped = false;
+  int64_t consecutive_low_value_separation_rounds = 0;
+  double last_separation_marginal_value = -1.0;
 };
 
 struct HighsRootWorkObservation {
@@ -121,13 +126,13 @@ class HighsRootWorkController {
                        const HighsRootWorkObservation& after,
                        int64_t cuts_generated = 0,
                        bool produced_separation_round = false);
+  void recordSeparationStop() { snapshot_.separation_stopped = true; }
   void recordTreeEntry();
 
   bool enabled() const { return config_.enabled; }
   const HighsRootWorkConfig& config() const { return config_; }
   const HighsRootWorkSnapshot& snapshot() const { return snapshot_; }
-  const HighsRootWorkActivityAccount& activity(
-      HighsRootWorkPhase phase) const;
+  const HighsRootWorkActivityAccount& activity(HighsRootWorkPhase phase) const;
 
   static const char* phaseName(HighsRootWorkPhase phase);
   static const char* actionName(HighsRootWorkAction action);
@@ -138,6 +143,8 @@ class HighsRootWorkController {
   bool atTreeReserve(double now) const;
   bool separationLimited() const;
   bool heuristicLimited() const;
+  void updateSeparationMarginalValue(const HighsRootWorkObservation& before,
+                                     const HighsRootWorkObservation& after);
   static bool isHeuristic(HighsRootWorkPhase phase);
   static size_t phaseIndex(HighsRootWorkPhase phase);
 

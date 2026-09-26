@@ -7,6 +7,7 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipSolverData.h"
 
+#include <functional>
 #include <random>
 #include <sstream>
 
@@ -19,6 +20,21 @@
 #include "parallel/HighsParallel.h"
 #include "presolve/HPresolve.h"
 #include "util/HighsIntegers.h"
+
+namespace {
+class RootWorkSummaryGuard {
+ public:
+  explicit RootWorkSummaryGuard(std::function<void()> callback)
+      : callback_(std::move(callback)) {}
+  ~RootWorkSummaryGuard() { callback_(); }
+
+  RootWorkSummaryGuard(const RootWorkSummaryGuard&) = delete;
+  RootWorkSummaryGuard& operator=(const RootWorkSummaryGuard&) = delete;
+
+ private:
+  std::function<void()> callback_;
+};
+}  // namespace
 
 HighsMipSolverData::HighsMipSolverData(HighsMipSolver& mipsolver)
     : mipsolver(mipsolver),
@@ -2016,7 +2032,9 @@ void HighsMipSolverData::evaluateRootNode(HighsMipWorker& worker) {
   HighsRootWorkController root_work;
   root_work.beginStage(root_work_config, mipsolver.timer_.read(),
                        mipsolver.options_mip_->time_limit);
-  bool root_work_yield_requested = false;
+  bool root_work_tree_requested = false;
+  bool root_work_separation_stopped = false;
+  bool root_work_summary_emitted = false;
 
   auto logRootWorkDecision = [&](HighsRootWorkPhase phase,
                                  const HighsRootWorkDecision& decision) {
@@ -2042,8 +2060,12 @@ void HighsMipSolverData::evaluateRootNode(HighsMipWorker& worker) {
     const HighsRootWorkDecision decision =
         root_work.beforeOptional(phase, mipsolver.timer_.read());
     logRootWorkDecision(phase, decision);
-    if (decision.action == HighsRootWorkAction::kYieldToTree)
-      root_work_yield_requested = true;
+    if (decision.action == HighsRootWorkAction::kStopSeparation) {
+      root_work.recordSeparationStop();
+      root_work_separation_stopped = true;
+    } else if (decision.action == HighsRootWorkAction::kYieldToTree) {
+      root_work_tree_requested = true;
+    }
     return decision;
   };
 
@@ -2063,44 +2085,60 @@ void HighsMipSolverData::evaluateRootNode(HighsMipWorker& worker) {
     return observation;
   };
 
-  auto completeRootWork = [&](HighsRootWorkPhase phase,
-                              const HighsRootWorkObservation& before,
-                              int64_t cuts_generated = 0,
-                              bool separation_round = false) {
+  auto completeRootWork =
+      [&](HighsRootWorkPhase phase, const HighsRootWorkObservation& before,
+          int64_t cuts_generated = 0, bool separation_round = false) {
+        if (!root_work.enabled()) return;
+        const HighsRootWorkObservation after = captureRootWork();
+        root_work.recordCompleted(phase, before, after, cuts_generated,
+                                  separation_round);
+      };
+
+  auto logRootWorkActivity = [&](HighsRootWorkPhase phase) {
     if (!root_work.enabled()) return;
-    const HighsRootWorkObservation after = captureRootWork();
-    const double elapsed = after.time - before.time;
-    root_work.recordCompleted(phase, before, after, cuts_generated,
-                              separation_round);
     const HighsRootWorkSnapshot& snapshot = root_work.snapshot();
     const HighsRootWorkActivityAccount& activity = root_work.activity(phase);
-    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
-                 "MIP-RootWork: schema=rost/highs-root-work/v1 event=phase_end "
-                 "time=%.17g epoch=%lld phase=%s elapsed=%.17g "
-                 "separation_rounds=%lld separation_time=%.17g "
-                 "heuristic_time=%.17g calls=%lld successes=%lld "
-                 "phase_time=%.17g phase_lp_iterations=%lld "
-                 "accepted_incumbents=%lld primal_gain=%.17g "
-                 "dual_gain=%.17g cuts_generated=%lld "
-                 "cut_pool_rows_added=%lld lp_rows_added=%lld "
-                 "lp_nonzeros_added=%lld fractional_integers=%lld\n",
-                 after.time,
-                 static_cast<long long>(snapshot.epoch),
-                 HighsRootWorkController::phaseName(phase), elapsed,
-                 static_cast<long long>(snapshot.separation_rounds),
-                 snapshot.separation_time, snapshot.heuristic_time,
-                 static_cast<long long>(activity.calls),
-                 static_cast<long long>(activity.successes),
-                 activity.wall_time,
-                 static_cast<long long>(activity.lp_iterations),
-                 static_cast<long long>(activity.accepted_incumbents),
-                 activity.primal_gain, activity.dual_gain,
-                 static_cast<long long>(activity.cuts_generated),
-                 static_cast<long long>(activity.cut_pool_rows_added),
-                 static_cast<long long>(activity.lp_rows_added),
-                 static_cast<long long>(activity.lp_nonzeros_added),
-                 static_cast<long long>(activity.last_fractional_integers));
+    if (activity.calls == 0) return;
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-RootWork: schema=rost/highs-root-work/v1 event=phase_exit "
+        "time=%.17g epoch=%lld phase=%s "
+        "separation_rounds=%lld separation_time=%.17g "
+        "heuristic_time=%.17g separation_stopped=%d "
+        "low_value_rounds=%lld marginal_value=%.17g "
+        "calls=%lld successes=%lld "
+        "phase_time=%.17g phase_lp_iterations=%lld "
+        "accepted_incumbents=%lld primal_gain=%.17g "
+        "dual_gain=%.17g cuts_generated=%lld "
+        "cut_pool_rows_added=%lld lp_rows_added=%lld "
+        "lp_nonzeros_added=%lld fractional_integers=%lld\n",
+        mipsolver.timer_.read(), static_cast<long long>(snapshot.epoch),
+        HighsRootWorkController::phaseName(phase),
+        static_cast<long long>(snapshot.separation_rounds),
+        snapshot.separation_time, snapshot.heuristic_time,
+        snapshot.separation_stopped ? 1 : 0,
+        static_cast<long long>(
+            snapshot.consecutive_low_value_separation_rounds),
+        snapshot.last_separation_marginal_value,
+        static_cast<long long>(activity.calls),
+        static_cast<long long>(activity.successes), activity.wall_time,
+        static_cast<long long>(activity.lp_iterations),
+        static_cast<long long>(activity.accepted_incumbents),
+        activity.primal_gain, activity.dual_gain,
+        static_cast<long long>(activity.cuts_generated),
+        static_cast<long long>(activity.cut_pool_rows_added),
+        static_cast<long long>(activity.lp_rows_added),
+        static_cast<long long>(activity.lp_nonzeros_added),
+        static_cast<long long>(activity.last_fractional_integers));
   };
+
+  auto logRootWorkSummary = [&]() {
+    if (!root_work.enabled() || root_work_summary_emitted) return;
+    for (size_t index = 0; index < kHighsRootWorkPhaseCount; ++index)
+      logRootWorkActivity(static_cast<HighsRootWorkPhase>(index));
+    root_work_summary_emitted = true;
+  };
+  RootWorkSummaryGuard root_work_summary_guard(logRootWorkSummary);
 
   if (root_work.enabled())
     highsLogUser(
@@ -2265,8 +2303,7 @@ restart:
       checkLimits())
     return clockOff(profiling);
   if (initial_rounding_decision.action == HighsRootWorkAction::kContinue) {
-    const HighsRootWorkObservation initial_rounding_started =
-        captureRootWork();
+    const HighsRootWorkObservation initial_rounding_started = captureRootWork();
     if (mipsolver.options_mip_->mip_heuristic_run_zi_round)
       heuristics.ziRound(worker, firstlpsol);
     profiling->start(kMipClockRandomizedRounding);
@@ -2376,15 +2413,14 @@ restart:
 
     HighsInt ncuts;
 
-    const HighsRootWorkObservation separation_round_started =
-        captureRootWork();
+    const HighsRootWorkObservation separation_round_started = captureRootWork();
     profiling->start(kMipClockRootSeparationRound);
     const bool root_separation_round_result =
         rootSeparationRound(worker, sepa, ncuts, status);
     profiling->stop(kMipClockRootSeparationRound);
     completeRootWork(HighsRootWorkPhase::kSeparation, separation_round_started,
                      ncuts, true);
-    if (profiling->mip_) {
+    if (profiling->mip_ && !root_work.enabled()) {
       highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                    "MIP-RootRound: time=%.17g round=%" HIGHSINT_FORMAT
                    " cuts=%" HIGHSINT_FORMAT " cut_pool=%" HIGHSINT_FORMAT
@@ -2602,9 +2638,11 @@ restart:
   profiling->stop(kMipClockEvaluateRootNode0);
   profiling->start(kMipClockEvaluateRootNode1);
   do {
-    if (root_work_yield_requested) break;
+    if (root_work_tree_requested) break;
     if (rootlpsol.empty()) break;
-    if (upper_limit != kHighsInf && !moreHeuristicsAllowed()) break;
+    if (!root_work_separation_stopped && upper_limit != kHighsInf &&
+        !moreHeuristicsAllowed())
+      break;
 
     if (mipsolver.options_mip_->mip_heuristic_run_root_reduced_cost) {
       const HighsRootWorkDecision heuristic_decision =
@@ -2661,7 +2699,10 @@ restart:
       }
     }
 
-    if (root_work_yield_requested) break;
+    // Stopping separation is not a request to skip the entire finishing
+    // pipeline. The reduced-cost helper above gets one bounded opportunity,
+    // its changes are reoptimized once, and then control moves to the tree.
+    if (root_work_separation_stopped || root_work_tree_requested) break;
 
     if (upper_limit != kHighsInf && !moreHeuristicsAllowed()) break;
 
@@ -2724,7 +2765,7 @@ restart:
       }
     }
 
-    if (root_work_yield_requested) break;
+    if (root_work_separation_stopped || root_work_tree_requested) break;
 
     if (upper_limit != kHighsInf || mipsolver.submip) break;
 
@@ -2761,6 +2802,7 @@ restart:
     pruned_treeweight = 1.0;
     num_nodes += 1;
     num_leaves += 1;
+    logRootWorkSummary();
     return clockOff(profiling);
   }
 
@@ -2867,6 +2909,7 @@ restart:
         getLp().computeBestEstimate(worker.getPseudocost()), 1);
     root_work.recordTreeEntry();
     if (root_work.enabled()) {
+      logRootWorkSummary();
       const HighsRootWorkSnapshot& snapshot = root_work.snapshot();
       highsLogUser(
           mipsolver.options_mip_->log_options, HighsLogType::kInfo,
@@ -2879,6 +2922,7 @@ restart:
     }
   }
   // End of HighsMipSolverData::evaluateRootNode()
+  logRootWorkSummary();
   clockOff(profiling);
 }
 

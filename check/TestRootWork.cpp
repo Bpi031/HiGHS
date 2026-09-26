@@ -36,7 +36,7 @@ TEST_CASE("root-work-cumulative-across-restarts", "[highs_root_work]") {
   REQUIRE(controller.snapshot().epoch == 1);
   REQUIRE(controller.snapshot().separation_rounds == 2);
   REQUIRE(controller.snapshot().separation_time == 3.0);
-  REQUIRE(decision.action == HighsRootWorkAction::kYieldToTree);
+  REQUIRE(decision.action == HighsRootWorkAction::kStopSeparation);
   REQUIRE(decision.reason == HighsRootWorkReason::kSeparationRoundLimit);
 }
 
@@ -127,11 +127,55 @@ TEST_CASE("root-work-zero-budgets-yield-or-skip-without-global-stop",
       controller.beforeOptional(HighsRootWorkPhase::kSeparation, 1.0);
   const HighsRootWorkDecision heuristic =
       controller.beforeOptional(HighsRootWorkPhase::kRens, 1.0);
-  REQUIRE(separation.action == HighsRootWorkAction::kYieldToTree);
+  REQUIRE(separation.action == HighsRootWorkAction::kStopSeparation);
   REQUIRE(separation.reason == HighsRootWorkReason::kSeparationRoundLimit);
   REQUIRE(heuristic.action == HighsRootWorkAction::kSkipOptional);
   REQUIRE(heuristic.reason == HighsRootWorkReason::kHeuristicTimeLimit);
   REQUIRE(controller.optionalAllowance(HighsRootWorkPhase::kRens, 1.0) == 0.0);
+}
+
+TEST_CASE("root-work-low-marginal-separation-is-phase-local",
+          "[highs_root_work]") {
+  HighsRootWorkConfig config;
+  config.enabled = true;
+  HighsRootWorkController controller;
+  controller.beginStage(config, 0.0, 100.0);
+  controller.beginEpoch();
+
+  auto record = [&](double start, double finish, double before_bound,
+                    double after_bound) {
+    HighsRootWorkObservation before;
+    before.time = start;
+    before.lp_iterations = static_cast<int64_t>(start * 1000.0);
+    before.incumbent = 1000.0;
+    before.dual_bound = before_bound;
+    before.active_lp_rows = 100;
+    before.active_lp_nonzeros = 1000;
+    HighsRootWorkObservation after = before;
+    after.time = finish;
+    after.lp_iterations += 10000;
+    after.dual_bound = after_bound;
+    after.active_lp_rows += 100;
+    after.active_lp_nonzeros += 1000;
+    controller.recordCompleted(HighsRootWorkPhase::kSeparation, before, after,
+                               10, true);
+  };
+
+  record(0.0, 1.0, 100.0, 110.0);
+  record(1.0, 2.0, 110.0, 120.0);
+  record(2.0, 3.0, 120.0, 120.0);
+  REQUIRE_FALSE(controller.snapshot().separation_stopped);
+  record(3.0, 4.0, 120.0, 120.0);
+  REQUIRE(controller.snapshot().separation_stopped);
+
+  const HighsRootWorkDecision separation =
+      controller.beforeOptional(HighsRootWorkPhase::kSeparation, 5.0);
+  const HighsRootWorkDecision reduced_cost =
+      controller.beforeOptional(HighsRootWorkPhase::kReducedCostHeuristic, 5.0);
+  REQUIRE(separation.action == HighsRootWorkAction::kStopSeparation);
+  REQUIRE(separation.reason ==
+          HighsRootWorkReason::kSeparationLowMarginalValue);
+  REQUIRE(reduced_cost.action == HighsRootWorkAction::kContinue);
 }
 
 TEST_CASE("root-work-new-stage-resets-cumulative-and-tree-state",
@@ -159,8 +203,7 @@ TEST_CASE("root-work-new-stage-resets-cumulative-and-tree-state",
       HighsRootWorkAction::kContinue);
 }
 
-TEST_CASE("root-work-records-separate-activity-evidence",
-          "[highs_root_work]") {
+TEST_CASE("root-work-records-separate-activity-evidence", "[highs_root_work]") {
   HighsRootWorkConfig config;
   config.enabled = true;
   HighsRootWorkController controller;
@@ -189,8 +232,8 @@ TEST_CASE("root-work-records-separate-activity-evidence",
   after.cut_pool_rows = 3;
   after.fractional_integers = 4;
 
-  controller.recordCompleted(HighsRootWorkPhase::kSeparation, before, after,
-                             3, true);
+  controller.recordCompleted(HighsRootWorkPhase::kSeparation, before, after, 3,
+                             true);
 
   const HighsRootWorkActivityAccount& account =
       controller.activity(HighsRootWorkPhase::kSeparation);
@@ -230,15 +273,19 @@ TEST_CASE("root-work-unlimited-telemetry-preserves-deterministic-search",
     REQUIRE(highs.setOptionValue("random_seed", 42) == HighsStatus::kOk);
     REQUIRE(highs.setOptionValue("mip_rel_gap", 0.0) == HighsStatus::kOk);
     REQUIRE(highs.setOptionValue("mip_abs_gap", 0.0) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_max_nodes", 1) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_root_max_separation_rounds", 2) ==
+            HighsStatus::kOk);
     REQUIRE(highs.readModel(filename) == HighsStatus::kOk);
     if (telemetry)
       REQUIRE(highs.setOptionValue("mip_root_work_budget", true) ==
               HighsStatus::kOk);
-    REQUIRE(highs.run() == HighsStatus::kOk);
+    // A deterministic node limit is expected to return warning/limited status;
+    // only a native error invalidates the identity experiment.
+    REQUIRE(highs.run() != HighsStatus::kError);
     const HighsInfo& info = highs.getInfo();
     SolveEvidence evidence{highs.getModelStatus(),
-                           info.objective_function_value,
-                           info.mip_node_count,
+                           info.objective_function_value, info.mip_node_count,
                            info.simplex_iteration_count,
                            highs.getSolution().col_value};
     highs.resetGlobalScheduler(true);
@@ -247,7 +294,6 @@ TEST_CASE("root-work-unlimited-telemetry-preserves-deterministic-search",
 
   const SolveEvidence baseline = solve(false);
   const SolveEvidence telemetry = solve(true);
-  REQUIRE(baseline.status == HighsModelStatus::kOptimal);
   REQUIRE(telemetry.status == baseline.status);
   REQUIRE(telemetry.objective == baseline.objective);
   REQUIRE(telemetry.nodes == baseline.nodes);

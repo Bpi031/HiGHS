@@ -12,6 +12,19 @@
 #include <cassert>
 #include <cmath>
 
+namespace {
+// Experimental root allocation remains opt-in. These conservative constants
+// stop separation only after two measured low-value rounds and at least three
+// completed rounds. The score charges elapsed time, LP iterations, and matrix
+// growth, so a large cut LP must earn proportionate dual-bound progress.
+constexpr int64_t kMinSeparationRoundsBeforeMarginalStop = 3;
+constexpr int64_t kLowValueRoundsBeforeMarginalStop = 2;
+constexpr double kMinimumSeparationMarginalValue = 1e-9;
+constexpr double kLpIterationsPerCostUnit = 100000.0;
+constexpr double kRowsPerCostUnit = 1000.0;
+constexpr double kNonzerosPerCostUnit = 100000.0;
+}  // namespace
+
 void HighsRootWorkController::beginStage(const HighsRootWorkConfig& config,
                                          double now, double absolute_deadline) {
   config_ = config;
@@ -32,9 +45,17 @@ HighsRootWorkDecision HighsRootWorkController::beforeOptional(
     return {HighsRootWorkAction::kStopGlobal,
             HighsRootWorkReason::kGlobalLimit};
 
-  if (atTreeReserve(now))
+  if (phase == HighsRootWorkPhase::kSeparation && snapshot_.separation_stopped)
+    return {HighsRootWorkAction::kStopSeparation,
+            HighsRootWorkReason::kSeparationLowMarginalValue};
+
+  if (atTreeReserve(now)) {
+    if (phase == HighsRootWorkPhase::kSeparation)
+      return {HighsRootWorkAction::kStopSeparation,
+              HighsRootWorkReason::kTreeReserve};
     return {HighsRootWorkAction::kYieldToTree,
             HighsRootWorkReason::kTreeReserve};
+  }
 
   if (phase == HighsRootWorkPhase::kSeparation && separationLimited()) {
     const HighsRootWorkReason reason =
@@ -42,7 +63,7 @@ HighsRootWorkDecision HighsRootWorkController::beforeOptional(
                 snapshot_.separation_rounds >= config_.max_separation_rounds
             ? HighsRootWorkReason::kSeparationRoundLimit
             : HighsRootWorkReason::kSeparationTimeLimit;
-    return {HighsRootWorkAction::kYieldToTree, reason};
+    return {HighsRootWorkAction::kStopSeparation, reason};
   }
 
   if (isHeuristic(phase) && heuristicLimited())
@@ -137,6 +158,54 @@ void HighsRootWorkController::recordCompleted(
   if (accepted_incumbents > 0 || primal_gain > 0.0 || dual_gain > 0.0 ||
       cuts_generated > 0 || cut_pool_rows_added > 0 || lp_rows_added > 0)
     ++account.successes;
+
+  if (phase == HighsRootWorkPhase::kSeparation && produced_separation_round)
+    updateSeparationMarginalValue(before, after);
+}
+
+void HighsRootWorkController::updateSeparationMarginalValue(
+    const HighsRootWorkObservation& before,
+    const HighsRootWorkObservation& after) {
+  const double elapsed = std::max(0.0, std::isfinite(after.time - before.time)
+                                           ? after.time - before.time
+                                           : 0.0);
+  const double dual_gain =
+      std::isfinite(before.dual_bound) && std::isfinite(after.dual_bound)
+          ? std::max(0.0, after.dual_bound - before.dual_bound)
+          : 0.0;
+  double reference_scale = 1.0;
+  if (std::isfinite(before.dual_bound))
+    reference_scale = std::max(reference_scale, std::abs(before.dual_bound));
+  if (std::isfinite(before.incumbent))
+    reference_scale = std::max(reference_scale, std::abs(before.incumbent));
+
+  const int64_t lp_iterations =
+      std::max<int64_t>(0, after.lp_iterations - before.lp_iterations);
+  const int64_t rows_added =
+      std::max<int64_t>(0, after.active_lp_rows - before.active_lp_rows);
+  const int64_t nonzeros_added = std::max<int64_t>(
+      0, after.active_lp_nonzeros - before.active_lp_nonzeros);
+  const double cost =
+      std::max(1e-9, elapsed + lp_iterations / kLpIterationsPerCostUnit +
+                         rows_added / kRowsPerCostUnit +
+                         nonzeros_added / kNonzerosPerCostUnit);
+  snapshot_.last_separation_marginal_value =
+      (dual_gain / reference_scale) / cost;
+
+  if (snapshot_.separation_rounds < kMinSeparationRoundsBeforeMarginalStop) {
+    snapshot_.consecutive_low_value_separation_rounds = 0;
+    return;
+  }
+
+  if (snapshot_.last_separation_marginal_value <
+      kMinimumSeparationMarginalValue)
+    ++snapshot_.consecutive_low_value_separation_rounds;
+  else
+    snapshot_.consecutive_low_value_separation_rounds = 0;
+
+  if (snapshot_.consecutive_low_value_separation_rounds >=
+      kLowValueRoundsBeforeMarginalStop)
+    snapshot_.separation_stopped = true;
 }
 
 void HighsRootWorkController::recordTreeEntry() {
@@ -236,6 +305,8 @@ const char* HighsRootWorkController::actionName(HighsRootWorkAction action) {
       return "continue";
     case HighsRootWorkAction::kSkipOptional:
       return "skip_optional";
+    case HighsRootWorkAction::kStopSeparation:
+      return "stop_separation";
     case HighsRootWorkAction::kYieldToTree:
       return "yield_to_tree";
     case HighsRootWorkAction::kStopGlobal:
@@ -258,6 +329,8 @@ const char* HighsRootWorkController::reasonName(HighsRootWorkReason reason) {
       return "separation_round_limit";
     case HighsRootWorkReason::kSeparationTimeLimit:
       return "separation_time_limit";
+    case HighsRootWorkReason::kSeparationLowMarginalValue:
+      return "separation_low_marginal_value";
     case HighsRootWorkReason::kHeuristicTimeLimit:
       return "heuristic_time_limit";
   }
