@@ -20,6 +20,7 @@ enum class HighsRootWorkPhase : uint8_t {
   kAnalyticCenter,
   kRounding,
   kReducedCostHeuristic,
+  kIncumbentCompletion,
   kRens,
   kFeasibilityPump,
   kLpReoptimization,

@@ -239,6 +239,7 @@ bool HighsRootWorkController::isHeuristic(HighsRootWorkPhase phase) {
   switch (phase) {
     case HighsRootWorkPhase::kRounding:
     case HighsRootWorkPhase::kReducedCostHeuristic:
+    case HighsRootWorkPhase::kIncumbentCompletion:
     case HighsRootWorkPhase::kRens:
     case HighsRootWorkPhase::kFeasibilityPump:
       return true;
@@ -279,6 +280,8 @@ const char* HighsRootWorkController::phaseName(HighsRootWorkPhase phase) {
       return "rounding";
     case HighsRootWorkPhase::kReducedCostHeuristic:
       return "reduced_cost_heuristic";
+    case HighsRootWorkPhase::kIncumbentCompletion:
+      return "incumbent_completion";
     case HighsRootWorkPhase::kRens:
       return "rens";
     case HighsRootWorkPhase::kFeasibilityPump:

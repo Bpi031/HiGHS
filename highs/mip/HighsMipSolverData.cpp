@@ -2663,6 +2663,27 @@ restart:
       heuristics.flushStatistics(mipsolver, worker);
     }
 
+    // A phase-local separation stop still receives one deterministic,
+    // controller-accounted incumbent-completion attempt. Central rounding is
+    // a single bounded pass over the retained root points; every candidate is
+    // checked by the existing HiGHS incumbent path before acceptance.
+    if (root_work_separation_stopped) {
+      const HighsRootWorkDecision completion_decision =
+          beforeOptionalRootWork(HighsRootWorkPhase::kIncumbentCompletion);
+      if (completion_decision.action == HighsRootWorkAction::kStopGlobal &&
+          checkLimits())
+        return clockOff(profiling);
+      if (completion_decision.action == HighsRootWorkAction::kContinue) {
+        const HighsRootWorkObservation completion_started = captureRootWork();
+        profiling->start(kMipClockRootCentralRounding);
+        heuristics.centralRounding(worker);
+        profiling->stop(kMipClockRootCentralRounding);
+        completeRootWork(HighsRootWorkPhase::kIncumbentCompletion,
+                         completion_started);
+        heuristics.flushStatistics(mipsolver, worker);
+      }
+    }
+
     if (checkLimits()) return clockOff(profiling);
 
     // if there are new global bound changes we re-evaluate the LP and do one

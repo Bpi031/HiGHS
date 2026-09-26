@@ -172,10 +172,13 @@ TEST_CASE("root-work-low-marginal-separation-is-phase-local",
       controller.beforeOptional(HighsRootWorkPhase::kSeparation, 5.0);
   const HighsRootWorkDecision reduced_cost =
       controller.beforeOptional(HighsRootWorkPhase::kReducedCostHeuristic, 5.0);
+  const HighsRootWorkDecision completion =
+      controller.beforeOptional(HighsRootWorkPhase::kIncumbentCompletion, 5.0);
   REQUIRE(separation.action == HighsRootWorkAction::kStopSeparation);
   REQUIRE(separation.reason ==
           HighsRootWorkReason::kSeparationLowMarginalValue);
   REQUIRE(reduced_cost.action == HighsRootWorkAction::kContinue);
+  REQUIRE(completion.action == HighsRootWorkAction::kContinue);
 }
 
 TEST_CASE("root-work-new-stage-resets-cumulative-and-tree-state",
