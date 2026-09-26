@@ -76,6 +76,7 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
       TestRanging.cpp
       TestRays.cpp
       TestRunData.cpp
+      TestRootWork.cpp
       TestSemiVariables.cpp
       TestSetup.cpp
       TestSort.cpp

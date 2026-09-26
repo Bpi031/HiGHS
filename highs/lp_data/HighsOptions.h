@@ -499,6 +499,15 @@ struct HighsOptionsStruct {
   double mip_min_logging_interval;
   std::string mip_lp_solver;
   std::string mip_ipm_solver;
+  HighsInt mip_root_simplex_strategy;
+  HighsInt mip_root_max_separation_rounds;
+  double mip_root_max_separation_time;
+  bool mip_root_work_budget;
+  HighsInt mip_root_work_max_separation_rounds;
+  double mip_root_work_max_separation_time;
+  double mip_root_work_max_heuristic_time;
+  double mip_root_work_max_single_helper_time;
+  double mip_root_work_tree_reserve_time;
 #ifdef HIGHS_DEBUGSOL
   std::string mip_debug_solution_file;
 #endif
@@ -665,6 +674,15 @@ struct HighsOptionsStruct {
         mip_min_logging_interval(0.0),
         mip_lp_solver(""),
         mip_ipm_solver(""),
+        mip_root_simplex_strategy(-1),
+        mip_root_max_separation_rounds(-1),
+        mip_root_max_separation_time(-1.0),
+        mip_root_work_budget(false),
+        mip_root_work_max_separation_rounds(-1),
+        mip_root_work_max_separation_time(-1.0),
+        mip_root_work_max_heuristic_time(-1.0),
+        mip_root_work_max_single_helper_time(-1.0),
+        mip_root_work_tree_reserve_time(-1.0),
 #ifdef HIGHS_DEBUGSOL
         mip_debug_solution_file(""),
 #endif
@@ -1215,6 +1233,67 @@ class HighsOptions : public HighsOptionsStruct {
     record_double = new OptionRecordDouble(
         "mip_heuristic_effort", "Effort spent for MIP heuristics", advanced,
         &mip_heuristic_effort, 0.0, 0.05, 1.0);
+    records.push_back(record_double);
+
+    record_int = new OptionRecordInt(
+        "mip_root_simplex_strategy",
+        "Simplex strategy for the first root relaxation only; -1 keeps the "
+        "upstream MIP default and 0..4 use simplex_strategy values",
+        advanced, &mip_root_simplex_strategy, -1, -1, kSimplexStrategyMax);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_root_max_separation_rounds",
+        "Maximum root separation rounds; -1 keeps the upstream adaptive limit",
+        advanced, &mip_root_max_separation_rounds, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_root_max_separation_time",
+        "Wall seconds for root separation; -1 keeps the upstream adaptive limit",
+        advanced, &mip_root_max_separation_time, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_root_work_budget",
+        "Enable experimental cumulative root-work allocation", advanced,
+        &mip_root_work_budget, false);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_root_work_max_separation_rounds",
+        "Cumulative optional root separation rounds across restarts; -1 is "
+        "unlimited",
+        advanced, &mip_root_work_max_separation_rounds, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_root_work_max_separation_time",
+        "Cumulative wall seconds for optional root separation and "
+        "reoptimization; -1 is unlimited",
+        advanced, &mip_root_work_max_separation_time, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_root_work_max_heuristic_time",
+        "Cumulative wall seconds for optional root heuristics; -1 is "
+        "unlimited",
+        advanced, &mip_root_work_max_heuristic_time, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_root_work_max_single_helper_time",
+        "Maximum wall seconds for one optional root helper sub-MIP; -1 is "
+        "unlimited",
+        advanced, &mip_root_work_max_single_helper_time, -1.0, -1.0,
+        kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_root_work_tree_reserve_time",
+        "Requested global-time reserve before starting more optional root "
+        "work; -1 disables the reserve",
+        advanced, &mip_root_work_tree_reserve_time, -1.0, -1.0, kHighsInf);
     records.push_back(record_double);
 
     record_bool =

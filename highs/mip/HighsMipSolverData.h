@@ -166,7 +166,8 @@ struct HighsMipSolverData {
   HighsModelStatus trivialHeuristics();
 
   void startAnalyticCenterComputation(
-      const highs::parallel::TaskGroup& taskGroup);
+      const highs::parallel::TaskGroup& taskGroup,
+      double local_time_limit = kHighsInf);
   void finishAnalyticCenterComputation(
       const highs::parallel::TaskGroup& taskGroup);
 

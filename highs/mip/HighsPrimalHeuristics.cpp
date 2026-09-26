@@ -78,7 +78,7 @@ bool HighsPrimalHeuristics::solveSubMip(
     HighsMipWorker& worker, const HighsLp& lp, const HighsBasis& basis,
     double fixingRate, std::vector<double> colLower,
     std::vector<double> colUpper, HighsInt maxleaves, HighsInt maxnodes,
-    HighsInt stallnodes) {
+    HighsInt stallnodes, double max_time) {
   HighsOptions submipoptions = *mipsolver.options_mip_;
   HighsLp submip = lp;
 
@@ -106,6 +106,9 @@ bool HighsPrimalHeuristics::solveSubMip(
   submipoptions.mip_max_stall_nodes = stallnodes;
   submipoptions.mip_pscost_minreliable = 0;
   submipoptions.time_limit -= mipsolver.timer_.read();
+  if (max_time >= 0.0)
+    submipoptions.time_limit = std::min(submipoptions.time_limit, max_time);
+  submipoptions.time_limit = std::max(0.0, submipoptions.time_limit);
   submipoptions.objective_bound = worker.upper_limit;
 
   if (!mipsolver.submip) {
@@ -311,7 +314,8 @@ class HeuristicNeighbourhood {
   }
 };
 
-void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker) {
+void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker,
+                                            double max_submip_time) {
   std::vector<std::pair<double, HighsDomainChange>> lurkingBounds =
       mipsolver.mipdata_->redcostfixing.getLurkingBounds(
           mipsolver, worker.getGlobalDomain());
@@ -371,7 +375,7 @@ void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker) {
               500,  // std::max(50, int(0.05 *
                     // (mipsolver.mipdata_->num_leaves))),
               200 + static_cast<HighsInt>(mipsolver.mipdata_->num_nodes / 20),
-              12);
+              12, max_submip_time);
 }
 
 static double calcFixVal(double rootchange, double fracval, double cost) {
@@ -392,7 +396,8 @@ static double calcFixVal(double rootchange, double fracval, double cost) {
 }
 
 void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
-                                 const std::vector<double>& tmp) {
+                                 const std::vector<double>& tmp,
+                                 double max_submip_time) {
   // return if domain is infeasible
   if (worker.getGlobalDomain().infeasible()) return;
 
@@ -629,7 +634,8 @@ retry:
       localdom.col_lower_, localdom.col_upper_,
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
-      200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12);
+      200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
+      max_submip_time);
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =

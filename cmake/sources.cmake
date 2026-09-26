@@ -391,6 +391,7 @@ set(highs_sources
     mip/HighsPrimalHeuristics.cpp
     mip/HighsPseudocost.cpp
     mip/HighsRedcostFixing.cpp
+    mip/HighsRootWork.cpp
     mip/HighsSearch.cpp
     mip/HighsSeparation.cpp
     mip/HighsSeparator.cpp
@@ -523,6 +524,7 @@ set(highs_headers
     mip/HighsPrimalHeuristics.h
     mip/HighsPseudocost.h
     mip/HighsRedcostFixing.h
+    mip/HighsRootWork.h
     mip/HighsSearch.h
     mip/HighsSeparation.h
     mip/HighsSeparator.h

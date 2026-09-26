@@ -37,13 +37,16 @@ class HighsPrimalHeuristics {
   bool solveSubMip(HighsMipWorker& worker, const HighsLp& lp,
                    const HighsBasis& basis, double fixingRate,
                    std::vector<double> colLower, std::vector<double> colUpper,
-                   HighsInt maxleaves, HighsInt maxnodes, HighsInt stallnodes);
+                   HighsInt maxleaves, HighsInt maxnodes, HighsInt stallnodes,
+                   double max_time = kHighsInf);
 
   double determineTargetFixingRate(HighsMipWorker& worker);
 
-  void rootReducedCost(HighsMipWorker& worker);
+  void rootReducedCost(HighsMipWorker& worker,
+                       double max_submip_time = kHighsInf);
 
-  void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
+  void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol,
+            double max_submip_time = kHighsInf);
 
   void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
 

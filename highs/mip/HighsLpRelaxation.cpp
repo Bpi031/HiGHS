@@ -1164,6 +1164,22 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
   lpsolver.setOptionValue("solver", use_solver);
   bool use_ipm = useIpm(use_solver);
   bool use_simplex = !use_ipm;
+  HighsInt saved_simplex_strategy;
+  lpsolver.getOptionValue("simplex_strategy", saved_simplex_strategy);
+  const bool override_first_root_simplex =
+      use_simplex && !valid_basis && !mipsolver.submip &&
+      !this->solved_first_lp &&
+      mipsolver.options_mip_->mip_root_simplex_strategy >= 0;
+  if (override_first_root_simplex) {
+    lpsolver.setOptionValue(
+        "simplex_strategy",
+        mipsolver.options_mip_->mip_root_simplex_strategy);
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-RootSolver: solver=simplex requested_simplex_strategy=%d "
+        "basis=without\n",
+        int(mipsolver.options_mip_->mip_root_simplex_strategy));
+  }
   if (use_ipm) {
     assert(!valid_basis);
     const bool ipm_logging = false;
@@ -1214,13 +1230,25 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
     mipsolver.profiling_->solveCall("LP2", mipsolver.submip);
     callstatus = lpsolver.optimizeLp();
   }
+  if (override_first_root_simplex)
+    lpsolver.setOptionValue("simplex_strategy", saved_simplex_strategy);
   // Revert the value of lpsolver.options_.solver
   lpsolver.setOptionValue("solver", solver);
+  HighsModelStatus model_status = lpsolver.getModelStatus();
   if (mipsolver.profiling_->mip_ && !mipsolver.submip &&
       !this->solved_first_lp) {
     highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                  "MIP-Timing: %11.2g - finish first LP solve\n",
                  mipsolver.timer_.read());
+    const bool root_lp_complete =
+        model_status == HighsModelStatus::kOptimal ||
+        model_status == HighsModelStatus::kInfeasible ||
+        model_status == HighsModelStatus::kUnbounded ||
+        model_status == HighsModelStatus::kObjectiveBound;
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP-RootLp: complete=%s model_status=%s\n",
+                 root_lp_complete ? "true" : "false",
+                 lpsolver.modelStatusToString(model_status).c_str());
   }
   this->solved_first_lp = true;
   HighsInt itercount = -1;
@@ -1258,7 +1286,6 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
     return Status::kError;
   }
 
-  HighsModelStatus model_status = lpsolver.getModelStatus();
   switch (model_status) {
     case HighsModelStatus::kObjectiveBound:
       ++numSolved;
