@@ -26,14 +26,27 @@ class HighsLpRelaxation;
 class HighsLpAggregator {
  private:
   const HighsLpRelaxation& lprelaxation;
+  bool model_rows_only;
+  int64_t model_row_uses = 0;
+  int64_t cut_pool_row_uses = 0;
+  int64_t rejected_cut_pool_row_uses = 0;
 
   HighsSparseVectorSum vectorsum;
 
  public:
-  HighsLpAggregator(const HighsLpRelaxation& lprelaxation);
+  HighsLpAggregator(const HighsLpRelaxation& lprelaxation,
+                    bool model_rows_only = false);
 
   /// add an LP row to the aggregation using the given weight
-  void addRow(HighsInt row, double weight);
+  bool addRow(HighsInt row, double weight);
+
+  bool acceptsRow(HighsInt row) const;
+
+  int64_t getModelRowUses() const { return model_row_uses; }
+  int64_t getCutPoolRowUses() const { return cut_pool_row_uses; }
+  int64_t getRejectedCutPoolRowUses() const {
+    return rejected_cut_pool_row_uses;
+  }
 
   /// returns the current aggregation of LP rows. The aggregation includes slack
   /// variables so that it is always an equation with right hand side 0.

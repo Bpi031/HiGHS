@@ -84,6 +84,7 @@ struct HighsMipSolverData {
   HighsRedcostFixing redcostfixing;
   HighsObjectiveFunction objectiveFunction;
   presolve::HighsPostsolveStack postSolveStack;
+  HighsPresolveLog presolve_log;
   HighsPresolveStatus presolve_status;
   HighsLp presolvedModel;
   bool cliquesExtracted;

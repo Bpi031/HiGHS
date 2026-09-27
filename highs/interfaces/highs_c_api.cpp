@@ -1191,6 +1191,75 @@ HighsInt Highs_getPresolvedNumNz(const void* highs) {
   return ((Highs*)highs)->getPresolvedLp().a_matrix_.numNz();
 }
 
+HighsInt Highs_getPresolveSummary(
+    const void* highs, HighsInt* original_num_col,
+    HighsInt* original_num_row, HighsInt* original_num_nz,
+    HighsInt* reduced_num_col, HighsInt* reduced_num_row,
+    HighsInt* reduced_num_nz, HighsInt* postsolve_reductions,
+    HighsInt* complete, HighsInt* reconciled) {
+  if (highs == nullptr || original_num_col == nullptr ||
+      original_num_row == nullptr || original_num_nz == nullptr ||
+      reduced_num_col == nullptr || reduced_num_row == nullptr ||
+      reduced_num_nz == nullptr || postsolve_reductions == nullptr ||
+      complete == nullptr || reconciled == nullptr)
+    return kHighsStatusError;
+  const HighsPresolveLog& log = ((Highs*)highs)->getPresolveLog();
+  *original_num_col = log.original_num_col;
+  *original_num_row = log.original_num_row;
+  *original_num_nz = log.original_num_nz;
+  *reduced_num_col = log.reduced_num_col;
+  *reduced_num_row = log.reduced_num_row;
+  *reduced_num_nz = log.reduced_num_nz;
+  *postsolve_reductions = log.postsolve_reductions;
+  *complete = log.complete ? 1 : 0;
+  *reconciled = log.reconciled ? 1 : 0;
+  return kHighsStatusOk;
+}
+
+HighsInt Highs_getPresolvePhaseCount(const void* highs) {
+  if (highs == nullptr) return kHighsStatusError;
+  return static_cast<HighsInt>(((Highs*)highs)->getPresolveLog().phase.size());
+}
+
+HighsInt Highs_getPresolvePhaseName(const void* highs,
+                                    const HighsInt phase, char* name) {
+  static const char* kPhaseNames[kPresolvePhaseCount] = {
+      "initial_sweep",          "fast_loop",
+      "conflict_substitution",  "aggregator",
+      "sparsify",               "parallel_rows_and_columns",
+      "inequality_strengthening", "dominated_columns",
+      "enumeration",            "probing",
+      "dependent_equations",    "dependent_free_columns",
+      "remove_slacks",          "scale_mip",
+      "unattributed"};
+  if (highs == nullptr || name == nullptr || phase < 0 ||
+      phase >= kPresolvePhaseCount)
+    return kHighsStatusError;
+  strcpy(name, kPhaseNames[phase]);
+  return kHighsStatusOk;
+}
+
+HighsInt Highs_getPresolvePhaseLog(
+    const void* highs, const HighsInt phase, HighsInt* calls,
+    HighsInt* columns_removed, HighsInt* rows_removed,
+    HighsInt* nonzero_delta, HighsInt* fill_added, double* wall_time) {
+  if (highs == nullptr || calls == nullptr || columns_removed == nullptr ||
+      rows_removed == nullptr || nonzero_delta == nullptr ||
+      fill_added == nullptr || wall_time == nullptr)
+    return kHighsStatusError;
+  const HighsPresolveLog& log = ((Highs*)highs)->getPresolveLog();
+  if (phase < 0 || static_cast<size_t>(phase) >= log.phase.size())
+    return kHighsStatusError;
+  const HighsPresolvePhaseLog& record = log.phase[phase];
+  *calls = record.call;
+  *columns_removed = record.col_removed;
+  *rows_removed = record.row_removed;
+  *nonzero_delta = record.nonzero_delta;
+  *fill_added = record.fill_added;
+  *wall_time = record.wall_time;
+  return kHighsStatusOk;
+}
+
 // Gets pointers to all the public data members of HighsLp: avoids
 // duplicate code in Highs_getModel, Highs_getPresolvedLp,
 static HighsInt Highs_getHighsLpData(const HighsLp& lp, const HighsInt a_format,

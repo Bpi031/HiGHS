@@ -8,6 +8,8 @@
 #include "lp_data/HighsModelUtils.h"
 #include "presolve/HPresolve.h"
 
+#include <algorithm>
+
 void HPresolveAnalysis::setup(const HighsLp* model_,
                               const HighsOptions* options_,
                               const HighsInt& numDeletedRows_,
@@ -80,6 +82,86 @@ void HighsPresolveLog::clear() {
     this->rule[rule_type].col_removed = 0;
     this->rule[rule_type].row_removed = 0;
   }
+  this->phase.assign(kPresolvePhaseCount, HighsPresolvePhaseLog{});
+  this->original_num_col = 0;
+  this->original_num_row = 0;
+  this->original_num_nz = 0;
+  this->reduced_num_col = 0;
+  this->reduced_num_row = 0;
+  this->reduced_num_nz = 0;
+  this->postsolve_reductions = 0;
+  this->complete = false;
+  this->reconciled = false;
+}
+
+void HPresolveAnalysis::startPresolveSummary(const HighsInt num_row,
+                                             const HighsInt num_col,
+                                             const HighsInt num_nz) {
+  presolve_log_.original_num_row = num_row;
+  presolve_log_.original_num_col = num_col;
+  presolve_log_.original_num_nz = num_nz;
+  presolve_log_.reduced_num_row = num_row;
+  presolve_log_.reduced_num_col = num_col;
+  presolve_log_.reduced_num_nz = num_nz;
+}
+
+void HPresolveAnalysis::recordPresolvePhase(
+    const PresolvePhaseType phase, const HighsInt before_num_row,
+    const HighsInt before_num_col, const HighsInt before_num_nz,
+    const double before_time, const HighsInt after_num_row,
+    const HighsInt after_num_col, const HighsInt after_num_nz,
+    const double after_time) {
+  assert(phase >= 0 && phase < kPresolvePhaseCount);
+  HighsPresolvePhaseLog& record = presolve_log_.phase[phase];
+  ++record.call;
+  record.row_removed += before_num_row - after_num_row;
+  record.col_removed += before_num_col - after_num_col;
+  const HighsInt nonzero_delta = after_num_nz - before_num_nz;
+  record.nonzero_delta += nonzero_delta;
+  record.fill_added += std::max(HighsInt{0}, nonzero_delta);
+  record.wall_time += std::max(0.0, after_time - before_time);
+}
+
+void HPresolveAnalysis::finishPresolveSummary(
+    const HighsInt num_row, const HighsInt num_col, const HighsInt num_nz,
+    const HighsInt postsolve_reductions) {
+  presolve_log_.reduced_num_row = num_row;
+  presolve_log_.reduced_num_col = num_col;
+  presolve_log_.reduced_num_nz = num_nz;
+  presolve_log_.postsolve_reductions = postsolve_reductions;
+
+  HighsInt observed_rows_removed = 0;
+  HighsInt observed_cols_removed = 0;
+  HighsInt observed_nonzero_delta = 0;
+  for (HighsInt phase = 0; phase < kPresolvePhaseUnattributed; ++phase) {
+    observed_rows_removed += presolve_log_.phase[phase].row_removed;
+    observed_cols_removed += presolve_log_.phase[phase].col_removed;
+    observed_nonzero_delta += presolve_log_.phase[phase].nonzero_delta;
+  }
+
+  const HighsInt expected_rows_removed =
+      presolve_log_.original_num_row - num_row;
+  const HighsInt expected_cols_removed =
+      presolve_log_.original_num_col - num_col;
+  const HighsInt expected_nonzero_delta =
+      num_nz - presolve_log_.original_num_nz;
+  presolve_log_.reconciled =
+      observed_rows_removed == expected_rows_removed &&
+      observed_cols_removed == expected_cols_removed &&
+      observed_nonzero_delta == expected_nonzero_delta;
+
+  if (!presolve_log_.reconciled) {
+    HighsPresolvePhaseLog& unattributed =
+        presolve_log_.phase[kPresolvePhaseUnattributed];
+    unattributed.call = 1;
+    unattributed.row_removed = expected_rows_removed - observed_rows_removed;
+    unattributed.col_removed = expected_cols_removed - observed_cols_removed;
+    unattributed.nonzero_delta =
+        expected_nonzero_delta - observed_nonzero_delta;
+    unattributed.fill_added =
+        std::max(HighsInt{0}, unattributed.nonzero_delta);
+  }
+  presolve_log_.complete = true;
 }
 
 void HPresolveAnalysis::resetNumDeleted() {

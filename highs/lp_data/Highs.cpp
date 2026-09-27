@@ -49,7 +49,7 @@ HighsInt highsVersionPatch() { return HIGHS_VERSION_PATCH; }
 const char* highsGithash() { return HIGHS_GITHASH; }
 const char* highsCompilationDate() { return "deprecated"; }
 
-Highs::Highs() : callback_(this) {}
+Highs::Highs() : callback_(this) { presolve_log_.clear(); }
 
 std::string Highs::getThirdPartyNotice() const {
   return HighsExternalApi::getThirdPartyNotice<HighsExtras::all>();
@@ -71,6 +71,7 @@ HighsStatus Highs::clearSolver() {
   HighsStatus return_status = HighsStatus::kOk;
   clearDerivedModelProperties();
   invalidateSolverData();
+  presolve_log_.clear();
   ekk_instance_.clear();
   return returnFromHighs(return_status);
 }
@@ -3807,7 +3808,7 @@ HighsPresolveStatus Highs::runPresolve(const bool force_lp_presolve,
     presolve_.data_.reduced_lp_ = solver.getPresolvedModel();
     presolve_.data_.postSolveStack = solver.getPostsolveStack();
     presolve_.presolve_status_ = presolve_return_status;
-    //    presolve_.data_.presolve_log_ =
+    presolve_.data_.presolve_log_ = solver.getPresolveLog();
   } else {
     // Use presolve for LP
     presolve_.init(original_lp, timer_);
@@ -4362,6 +4363,7 @@ HighsStatus Highs::callSolveMip() {
   profiling_->start(kSubSolverMip);
   solver.run();
   profiling_->stop(kSubSolverMip);
+  presolve_log_ = solver.getPresolveLog();
   options_.log_dev_level = log_dev_level;
   // Set the return_status, model status and, for completeness, scaled
   // model status

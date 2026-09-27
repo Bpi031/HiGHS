@@ -40,6 +40,20 @@ class HPresolveAnalysis {
   void setup(const HighsLp* model_, const HighsOptions* options_,
              const HighsInt& numDeletedRows_, const HighsInt& numDeletedCols_,
              const bool silent);
+  void startPresolveSummary(const HighsInt num_row, const HighsInt num_col,
+                            const HighsInt num_nz);
+  void recordPresolvePhase(const PresolvePhaseType phase,
+                           const HighsInt before_num_row,
+                           const HighsInt before_num_col,
+                           const HighsInt before_num_nz,
+                           const double before_time,
+                           const HighsInt after_num_row,
+                           const HighsInt after_num_col,
+                           const HighsInt after_num_nz,
+                           const double after_time);
+  void finishPresolveSummary(const HighsInt num_row, const HighsInt num_col,
+                             const HighsInt num_nz,
+                             const HighsInt postsolve_reductions);
   void resetNumDeleted();
 
   std::string presolveReductionTypeToString(const HighsInt reduction_type);

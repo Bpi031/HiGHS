@@ -817,6 +817,7 @@ void HighsMipSolverData::init() {
   upper_bound = kHighsInf;
   upper_limit = mipsolver.options_mip_->objective_bound;
   optimality_limit = mipsolver.options_mip_->objective_bound;
+  presolve_log.clear();
   primal_dual_integral.initialise();
 
   if (mipsolver.options_mip_->mip_report_level == 0)
@@ -831,12 +832,14 @@ void HighsMipSolverData::runMipPresolve(
     const HighsInt presolve_reduction_limit) {
   mipsolver.timer_.start(mipsolver.timer_.presolve_clock);
   presolve::HPresolve presolve;
+  if (numRestarts == 0) presolve_log.clear();
   if (!presolve.okSetInput(mipsolver, presolve_reduction_limit)) {
     mipsolver.modelstatus_ = HighsModelStatus::kMemoryLimit;
     presolve_status = HighsPresolveStatus::kOutOfMemory;
   } else {
     mipsolver.modelstatus_ = presolve.run(postSolveStack);
     presolve_status = presolve.getPresolveStatus();
+    if (numRestarts == 0) presolve_log = presolve.getPresolveLog();
   }
   mipsolver.timer_.stop(mipsolver.timer_.presolve_clock);
 

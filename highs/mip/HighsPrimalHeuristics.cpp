@@ -1042,7 +1042,8 @@ bool HighsPrimalHeuristics::tryRoundedPoint(HighsMipWorker& worker,
       double rhs;
       if (lprelax.computeDualInfProof(worker.getGlobalDomain(), inds, vals,
                                       rhs)) {
-        HighsCutGeneration cutGen(lprelax, worker.getCutPool());
+        HighsCutGeneration cutGen(lprelax, worker.getCutPool(),
+                                  HighsCutOrigin::kHeuristic);
         cutGen.generateConflict(localdom, worker.getGlobalDomain(), inds, vals,
                                 rhs);
       }
@@ -1192,7 +1193,8 @@ void HighsPrimalHeuristics::randomizedRounding(
       double rhs;
       if (lprelax.computeDualInfProof(worker.getGlobalDomain(), inds, vals,
                                       rhs)) {
-        HighsCutGeneration cutGen(lprelax, worker.getCutPool());
+        HighsCutGeneration cutGen(lprelax, worker.getCutPool(),
+                                  HighsCutOrigin::kHeuristic);
         cutGen.generateConflict(localdom, worker.getGlobalDomain(), inds, vals,
                                 rhs);
       }

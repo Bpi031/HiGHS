@@ -518,6 +518,22 @@ struct HighsOptionsStruct {
   HighsInt mip_lifting_for_probing;
   bool mip_search_simulate_concurrency;
   bool mip_allow_cut_separation_at_nodes;
+  bool mip_node_separation_controller;
+  HighsInt mip_node_cut_mode;
+  HighsInt mip_node_cut_maximum_depth;
+  HighsInt mip_node_cut_frequency;
+  HighsInt mip_node_max_separation_rounds;
+  double mip_node_max_separation_time;
+  HighsInt mip_node_max_separation_lp_iterations;
+  HighsInt mip_node_max_cut_rows;
+  HighsInt mip_node_max_cut_nonzeros;
+  HighsInt mip_node_max_cuts_per_family;
+  double mip_node_max_row_growth;
+  double mip_node_max_nonzero_growth;
+  HighsInt mip_node_cut_low_value_patience;
+  double mip_node_cut_min_gain_per_second;
+  double mip_node_cut_min_gain_per_1000_iterations;
+  bool mip_node_cut_base_model_rows_only;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -693,7 +709,23 @@ struct HighsOptionsStruct {
         mip_lifting_for_probing(-1),
         mip_search_simulate_concurrency(false),
         // clang-format off
-        mip_allow_cut_separation_at_nodes(true) {};
+        mip_allow_cut_separation_at_nodes(true),
+        mip_node_separation_controller(false),
+        mip_node_cut_mode(1),
+        mip_node_cut_maximum_depth(-1),
+        mip_node_cut_frequency(-1),
+        mip_node_max_separation_rounds(-1),
+        mip_node_max_separation_time(-1.0),
+        mip_node_max_separation_lp_iterations(-1),
+        mip_node_max_cut_rows(-1),
+        mip_node_max_cut_nonzeros(-1),
+        mip_node_max_cuts_per_family(-1),
+        mip_node_max_row_growth(-1.0),
+        mip_node_max_nonzero_growth(-1.0),
+        mip_node_cut_low_value_patience(-1),
+        mip_node_cut_min_gain_per_second(-1.0),
+        mip_node_cut_min_gain_per_1000_iterations(-1.0),
+        mip_node_cut_base_model_rows_only(false) {};
   // clang-format on
 };
 
@@ -1295,6 +1327,113 @@ class HighsOptions : public HighsOptionsStruct {
         "work; -1 disables the reserve",
         advanced, &mip_root_work_tree_reserve_time, -1.0, -1.0, kHighsInf);
     records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_node_separation_controller",
+        "Enable experimental bounded node-separation allocation", advanced,
+        &mip_node_separation_controller, false);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_node_cut_mode",
+        "Node-cut effort: 0 off, 1 automatic, 2 conservative, 3 moderate, "
+        "4 aggressive, 5 unlimited legacy",
+        advanced, &mip_node_cut_mode, 0, 1, 5);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_cut_maximum_depth",
+        "Maximum tree depth eligible for node separation; -1 uses the "
+        "selected mode",
+        advanced, &mip_node_cut_maximum_depth, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_cut_frequency",
+        "Separate every nth eligible node; -1 uses the selected mode",
+        advanced, &mip_node_cut_frequency, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_max_separation_rounds",
+        "Maximum separation rounds per node; -1 uses the selected mode",
+        advanced, &mip_node_max_separation_rounds, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_node_max_separation_time",
+        "Maximum cumulative generation and reoptimization seconds per node; "
+        "-1 uses the selected mode",
+        advanced, &mip_node_max_separation_time, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_int = new OptionRecordInt(
+        "mip_node_max_separation_lp_iterations",
+        "Maximum separation LP iterations per node; -1 uses the selected "
+        "mode",
+        advanced, &mip_node_max_separation_lp_iterations, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_max_cut_rows",
+        "Maximum selected cut rows per node; -1 uses the selected mode",
+        advanced, &mip_node_max_cut_rows, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_max_cut_nonzeros",
+        "Maximum selected cut nonzeros per node; -1 uses the selected mode",
+        advanced, &mip_node_max_cut_nonzeros, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_max_cuts_per_family",
+        "Maximum selected cuts from one family per node; -1 uses the "
+        "selected mode",
+        advanced, &mip_node_max_cuts_per_family, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_node_max_row_growth",
+        "Maximum selected node-cut rows relative to model rows; -1 uses the "
+        "selected mode",
+        advanced, &mip_node_max_row_growth, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_node_max_nonzero_growth",
+        "Maximum selected node-cut nonzeros relative to model nonzeros; -1 "
+        "uses the selected mode",
+        advanced, &mip_node_max_nonzero_growth, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_int = new OptionRecordInt(
+        "mip_node_cut_low_value_patience",
+        "Consecutive low-value node-separation rounds before stopping; -1 "
+        "uses the selected mode",
+        advanced, &mip_node_cut_low_value_patience, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_node_cut_min_gain_per_second",
+        "Minimum node dual gain per separation second; -1 disables this "
+        "test",
+        advanced, &mip_node_cut_min_gain_per_second, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_node_cut_min_gain_per_1000_iterations",
+        "Minimum node dual gain per 1000 separation LP iterations; -1 "
+        "disables this test",
+        advanced, &mip_node_cut_min_gain_per_1000_iterations, -1.0, -1.0,
+        kHighsInf);
+    records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_node_cut_base_model_rows_only",
+        "Restrict experimental node-cut aggregation to original model rows",
+        advanced, &mip_node_cut_base_model_rows_only, false);
+    records.push_back(record_bool);
 
     record_bool =
         new OptionRecordBool("mip_heuristic_run_feasibility_jump",

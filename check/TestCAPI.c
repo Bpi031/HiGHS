@@ -2516,6 +2516,83 @@ void testFixedLp() {
   Highs_destroy(highs);
 }
 
+void testPresolveTelemetry() {
+  const HighsInt num_col = 2;
+  const HighsInt num_row = 1;
+  const HighsInt num_nz = 2;
+  const HighsInt a_format = kHighsMatrixFormatColwise;
+  const HighsInt sense = kHighsObjSenseMinimize;
+  const double offset = 0.0;
+  double col_cost[2] = {1.0, 2.0};
+  double col_lower[2] = {0.0, 0.0};
+  double col_upper[2] = {1.0, 1.0};
+  double row_lower[1] = {1.0};
+  double row_upper[1] = {1.0};
+  HighsInt a_start[3] = {0, 1, 2};
+  HighsInt a_index[2] = {0, 0};
+  double a_value[2] = {1.0, 1.0};
+  HighsInt integrality[2] = {kHighsVarTypeInteger, kHighsVarTypeInteger};
+
+  void* highs = Highs_create();
+  Highs_setBoolOptionValue(highs, "output_flag", 0);
+  assert(Highs_passMip(highs, num_col, num_row, num_nz, a_format, sense,
+                       offset, col_cost, col_lower, col_upper, row_lower,
+                       row_upper, a_start, a_index, a_value, integrality) ==
+         kHighsStatusOk);
+  assert(Highs_run(highs) == kHighsStatusOk);
+
+  HighsInt original_num_col = -1;
+  HighsInt original_num_row = -1;
+  HighsInt original_num_nz = -1;
+  HighsInt reduced_num_col = -1;
+  HighsInt reduced_num_row = -1;
+  HighsInt reduced_num_nz = -1;
+  HighsInt postsolve_reductions = -1;
+  HighsInt complete = 0;
+  HighsInt reconciled = 0;
+  assert(Highs_getPresolveSummary(
+             highs, &original_num_col, &original_num_row, &original_num_nz,
+             &reduced_num_col, &reduced_num_row, &reduced_num_nz,
+             &postsolve_reductions, &complete, &reconciled) == kHighsStatusOk);
+  assert(original_num_col == num_col);
+  assert(original_num_row == num_row);
+  assert(original_num_nz == num_nz);
+  assert(complete == 1);
+  assert(reconciled == 1);
+  assert(postsolve_reductions >= 0);
+
+  const HighsInt phase_count = Highs_getPresolvePhaseCount(highs);
+  assert(phase_count > 0 && phase_count <= 32);
+  HighsInt rows_removed = 0;
+  HighsInt columns_removed = 0;
+  HighsInt nonzero_delta = 0;
+  for (HighsInt phase = 0; phase < phase_count; ++phase) {
+    char name[kHighsMaximumStringLength];
+    HighsInt calls = -1;
+    HighsInt phase_columns_removed = 0;
+    HighsInt phase_rows_removed = 0;
+    HighsInt phase_nonzero_delta = 0;
+    HighsInt fill_added = -1;
+    double wall_time = -1.0;
+    assert(Highs_getPresolvePhaseName(highs, phase, name) == kHighsStatusOk);
+    assert(strlen(name) > 0);
+    assert(Highs_getPresolvePhaseLog(
+               highs, phase, &calls, &phase_columns_removed,
+               &phase_rows_removed, &phase_nonzero_delta, &fill_added,
+               &wall_time) == kHighsStatusOk);
+    assert(calls >= 0);
+    assert(fill_added >= 0);
+    assert(wall_time >= 0.0);
+    columns_removed += phase_columns_removed;
+    rows_removed += phase_rows_removed;
+    nonzero_delta += phase_nonzero_delta;
+  }
+  assert(columns_removed == original_num_col - reduced_num_col);
+  assert(rows_removed == original_num_row - reduced_num_row);
+  assert(nonzero_delta == reduced_num_nz - original_num_nz);
+  Highs_destroy(highs);
+}
+
 int main() {
   minimalApiIllegalLp();
   testCallback();
@@ -2541,6 +2618,7 @@ int main() {
   testDeleteRowResolveWithBasis();
   testIis();
   testFixedLp();
+  testPresolveTelemetry();
   return 0;
 }
 //  testSetSolution();

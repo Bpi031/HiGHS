@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "mip/HighsCutPool.h"
 #include "util/HighsCDouble.h"
 #include "util/HighsInt.h"
 #include "util/HighsRandom.h"
@@ -32,6 +33,7 @@ class HighsCutGeneration {
  private:
   const HighsLpRelaxation& lpRelaxation;
   HighsCutPool& cutpool;
+  HighsCutOrigin origin;
   HighsRandom randgen;
   std::vector<HighsInt> cover;
   HighsCDouble coverweight;
@@ -92,7 +94,8 @@ class HighsCutGeneration {
 
  public:
   HighsCutGeneration(const HighsLpRelaxation& lpRelaxation,
-                     HighsCutPool& cutpool);
+                     HighsCutPool& cutpool,
+                     HighsCutOrigin origin = HighsCutOrigin::kUnknown);
 
   /// separates the LP solution for the given single row relaxation
   bool generateCut(HighsTransformedLp& transLp, std::vector<HighsInt>& inds,

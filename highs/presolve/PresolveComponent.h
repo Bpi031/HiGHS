@@ -45,6 +45,7 @@ struct PresolveComponentData : public HighsComponentData {
     reduced_lp_.clear();
     recovered_solution_.clear();
     recovered_basis_.clear();
+    presolve_log_.clear();
   }
 
   virtual ~PresolveComponentData() = default;

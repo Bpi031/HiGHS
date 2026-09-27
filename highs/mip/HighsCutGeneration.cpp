@@ -14,9 +14,11 @@
 #include "util/HighsIntegers.h"
 
 HighsCutGeneration::HighsCutGeneration(const HighsLpRelaxation& lpRelaxation,
-                                       HighsCutPool& cutpool)
+                                       HighsCutPool& cutpool,
+                                       HighsCutOrigin origin)
     : lpRelaxation(lpRelaxation),
       cutpool(cutpool),
+      origin(origin),
       randgen(lpRelaxation.getMipSolver().options_mip_->random_seed +
               lpRelaxation.getNumLpIterations() + cutpool.getNumCuts()),
       feastol(lpRelaxation.getMipSolver().mipdata_->feastol),
@@ -1189,7 +1191,8 @@ bool HighsCutGeneration::generateCut(HighsTransformedLp& transLp,
   // tolerance, add it to the cutpool
   HighsInt cutindex = cutpool.addCut(lpRelaxation.getMipSolver(), inds_.data(),
                                      vals_.data(), inds_.size(), rhs_,
-                                     integralSupport && integralCoefficients);
+                                     integralSupport && integralCoefficients,
+                                     true, true, false, origin);
 
   // only return true if cut was accepted by the cutpool, i.e. not a duplicate
   // of a cut already in the pool
@@ -1283,7 +1286,8 @@ bool HighsCutGeneration::generateConflict(const HighsDomain& localdomain,
 
   HighsInt cutindex = cutpool.addCut(lpRelaxation.getMipSolver(),
                                      proofinds.data(), proofvals.data(), rowlen,
-                                     proofrhs, cutintegral, true, true, true);
+                                     proofrhs, cutintegral, true, true, true,
+                                     HighsCutOrigin::kConflict);
 
   // only return true if cut was accepted by the cutpool, i.e. not a duplicate
   // of a cut already in the pool
@@ -1341,7 +1345,8 @@ bool HighsCutGeneration::finalizeAndAddCut(const HighsDomain& globaldom,
   // tolerance, add it to the cutpool
   HighsInt cutindex = cutpool.addCut(lpRelaxation.getMipSolver(), inds_.data(),
                                      vals_.data(), inds_.size(), rhs_,
-                                     integralSupport && integralCoefficients);
+                                     integralSupport && integralCoefficients,
+                                     true, true, false, origin);
 
   // only return true if cut was accepted by the cutpool, i.e. not a duplicate
   // of a cut already in the pool

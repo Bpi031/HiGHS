@@ -287,6 +287,28 @@ enum PresolveRuleType : int {
   kPresolveRuleCount
 };
 
+// Coarse, bounded attribution for both LP and MIP presolve. Unlike
+// PresolveRuleType, these phases describe top-level work allocation and do not
+// require every nested reduction to participate in rule logging.
+enum PresolvePhaseType : int {
+  kPresolvePhaseInitialSweep = 0,
+  kPresolvePhaseFastLoop,
+  kPresolvePhaseConflictSubstitution,
+  kPresolvePhaseAggregator,
+  kPresolvePhaseSparsify,
+  kPresolvePhaseParallelRowsAndCols,
+  kPresolvePhaseInequalityStrengthening,
+  kPresolvePhaseDominatedColumns,
+  kPresolvePhaseEnumeration,
+  kPresolvePhaseProbing,
+  kPresolvePhaseDependentEquations,
+  kPresolvePhaseDependentFreeCols,
+  kPresolvePhaseRemoveSlacks,
+  kPresolvePhaseScaleMip,
+  kPresolvePhaseUnattributed,
+  kPresolvePhaseCount
+};
+
 enum IisStrategy : int {
   kIisStrategyMin = 0,
   kIisStrategyLight = kIisStrategyMin,  // 0

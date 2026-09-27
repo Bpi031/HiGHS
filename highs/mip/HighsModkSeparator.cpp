@@ -61,7 +61,7 @@ void HighsModkSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
       skipRow[lp.a_matrix_.index_[i]] = true;
   }
 
-  HighsCutGeneration cutGen(lpRelaxation, cutpool);
+  HighsCutGeneration cutGen(lpRelaxation, cutpool, HighsCutOrigin::kModK);
 
   std::vector<std::pair<HighsInt, double>> integralScales;
   std::vector<int64_t> intSystemValue;
@@ -90,6 +90,7 @@ void HighsModkSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
   HighsInt maxIntRowLen = 1000 + 0.1 * lp.num_col_;
 
   for (HighsInt row = 0; row != lp.num_row_; ++row) {
+    if (!lpAggregator.acceptsRow(row)) continue;
     if (skipRow[row]) continue;
 
     bool leqRow;

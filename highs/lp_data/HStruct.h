@@ -141,8 +141,27 @@ struct HighsPresolveRuleLog {
   HighsInt row_removed;
 };
 
+struct HighsPresolvePhaseLog {
+  HighsInt call = 0;
+  HighsInt col_removed = 0;
+  HighsInt row_removed = 0;
+  HighsInt nonzero_delta = 0;
+  HighsInt fill_added = 0;
+  double wall_time = 0.0;
+};
+
 struct HighsPresolveLog {
   std::vector<HighsPresolveRuleLog> rule;
+  std::vector<HighsPresolvePhaseLog> phase;
+  HighsInt original_num_col = 0;
+  HighsInt original_num_row = 0;
+  HighsInt original_num_nz = 0;
+  HighsInt reduced_num_col = 0;
+  HighsInt reduced_num_row = 0;
+  HighsInt reduced_num_nz = 0;
+  HighsInt postsolve_reductions = 0;
+  bool complete = false;
+  bool reconciled = false;
   void clear();
 };
 

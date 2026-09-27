@@ -67,6 +67,7 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
       TestModelProperties.cpp
       TestMultiObjective.cpp
       TestNames.cpp
+      TestNodeSeparation.cpp
       TestOptions.cpp
       TestPdlp.cpp
       TestPdlpHi.cpp

@@ -52,7 +52,8 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
   HighsInt numRow = lpRelaxation.numRows();
   HighsInt numCol = lpRelaxation.numCols();
 
-  HighsCutGeneration cutGen(lpRelaxation, cutpool);
+  HighsCutGeneration cutGen(lpRelaxation, cutpool,
+                            HighsCutOrigin::kTableau);
 
   std::vector<HighsInt> baseRowInds;
   std::vector<double> baseRowVals;
@@ -195,6 +196,12 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
     if (fracvar.score <
         bestScoreFac[cutpool.getNumCuts() - numCuts >= 50] * bestScore)
       break;
+
+    if (std::any_of(fracvar.row_ep.begin(), fracvar.row_ep.end(),
+                    [&](const std::pair<HighsInt, double>& rowWeight) {
+                      return !lpAggregator.acceptsRow(rowWeight.first);
+                    }))
+      continue;
 
     assert(lpAggregator.isEmpty());
     for (const auto& rowWeight : fracvar.row_ep)

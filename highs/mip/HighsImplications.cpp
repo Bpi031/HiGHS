@@ -657,7 +657,7 @@ void HighsImplications::separateImpliedBounds(
         vals[0] = 1.0;
         inds[0] = col;
         cutpool.addCut(mipsolver, inds.data(), vals.data(), 1, 0.0, false, true,
-                       false);
+                       false, false, HighsCutOrigin::kImplication);
         continue;
       }
 
@@ -694,7 +694,7 @@ void HighsImplications::separateImpliedBounds(
           // printf("added implied bound cut to pool\n");
           cutpool.addCut(mipsolver, inds.data(), vals.data(), 2, rhs,
                          !mipsolver.isColContinuous(implics[i].column), false,
-                         false, false);
+                         false, false, HighsCutOrigin::kImplication);
         }
       }
     }
@@ -708,7 +708,7 @@ void HighsImplications::separateImpliedBounds(
         vals[0] = -1.0;
         inds[0] = col;
         cutpool.addCut(mipsolver, inds.data(), vals.data(), 1, -1.0, false,
-                       true, false);
+                       true, false, false, HighsCutOrigin::kImplication);
         continue;
       }
 
@@ -744,7 +744,7 @@ void HighsImplications::separateImpliedBounds(
           // printf("added implied bound cut to pool\n");
           cutpool.addCut(mipsolver, inds.data(), vals.data(), 2, rhs,
                          !mipsolver.isColContinuous(implics[i].column), false,
-                         false, false);
+                         false, false, HighsCutOrigin::kImplication);
         }
       }
     }

@@ -686,7 +686,63 @@ restart:
     if (options_mip_->mip_allow_cut_separation_at_nodes) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockNodeSearchSeparation);
-      worker.sepa_ptr_->separate(worker.search_ptr_->getLocalDomain());
+      HighsNodeSeparationConfig node_separation_config;
+      node_separation_config.enabled =
+          options_mip_->mip_node_separation_controller;
+      node_separation_config.mode = HighsNodeSeparationController::modeFromInt(
+          options_mip_->mip_node_cut_mode);
+      node_separation_config.maximum_depth =
+          options_mip_->mip_node_cut_maximum_depth;
+      node_separation_config.node_frequency =
+          options_mip_->mip_node_cut_frequency;
+      node_separation_config.max_rounds =
+          options_mip_->mip_node_max_separation_rounds;
+      node_separation_config.max_seconds =
+          options_mip_->mip_node_max_separation_time;
+      node_separation_config.max_lp_iterations =
+          options_mip_->mip_node_max_separation_lp_iterations;
+      node_separation_config.max_added_rows =
+          options_mip_->mip_node_max_cut_rows;
+      node_separation_config.max_added_nonzeros =
+          options_mip_->mip_node_max_cut_nonzeros;
+      node_separation_config.max_selected_per_origin =
+          options_mip_->mip_node_max_cuts_per_family;
+      node_separation_config.max_row_growth_ratio =
+          options_mip_->mip_node_max_row_growth;
+      node_separation_config.max_nonzero_growth_ratio =
+          options_mip_->mip_node_max_nonzero_growth;
+      node_separation_config.low_value_patience =
+          options_mip_->mip_node_cut_low_value_patience;
+      node_separation_config.min_dual_gain_per_second =
+          options_mip_->mip_node_cut_min_gain_per_second;
+      node_separation_config.min_dual_gain_per_1000_iterations =
+          options_mip_->mip_node_cut_min_gain_per_1000_iterations;
+      node_separation_config.base_model_rows_only =
+          options_mip_->mip_node_cut_base_model_rows_only;
+
+      HighsNodeSeparationContext node_separation_context;
+      node_separation_context.opportunity_sequence =
+          worker.sepa_ptr_->nextNodeSeparationOpportunity();
+      node_separation_context.tree_nodes_processed =
+          mipdata_->num_nodes + worker.search_ptr_->nnodes;
+      node_separation_context.depth =
+          worker.search_ptr_->getCurrentDepth();
+      node_separation_context.model_rows = numRow();
+      node_separation_context.model_nonzeros = numNonzero();
+      node_separation_context.active_rows =
+          worker.getLpRelaxation().numRows();
+      node_separation_context.active_nonzeros =
+          worker.getLpRelaxation().numNonzeros();
+      node_separation_context.lp_iterations =
+          worker.getLpRelaxation().getNumLpIterations();
+      node_separation_context.time = timer_.read();
+      node_separation_context.objective =
+          worker.getLpRelaxation().getObjective();
+      node_separation_context.fractional_integers =
+          worker.getLpRelaxation().getFractionalIntegers().size();
+      worker.sepa_ptr_->separate(worker.search_ptr_->getLocalDomain(),
+                                 node_separation_config,
+                                 node_separation_context);
       if (!mipdata_->parallelLockActive())
         profiling_->stop(kMipClockNodeSearchSeparation);
     } else {
@@ -1226,6 +1282,10 @@ HighsPresolveStatus HighsMipSolver::getPresolveStatus() const {
 
 presolve::HighsPostsolveStack HighsMipSolver::getPostsolveStack() const {
   return mipdata_->postSolveStack;
+}
+
+const HighsPresolveLog& HighsMipSolver::getPresolveLog() const {
+  return mipdata_->presolve_log;
 }
 
 void HighsMipSolver::callbackGetCutPool() const {

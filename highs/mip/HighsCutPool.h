@@ -9,6 +9,7 @@
 #define HIGHS_CUTPOOL_H_
 
 #include <atomic>
+#include <array>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -19,9 +20,25 @@
 
 class HighsLpRelaxation;
 
+enum class HighsCutOrigin : uint8_t {
+  kUnknown = 0,
+  kImplication,
+  kClique,
+  kTableau,
+  kPath,
+  kModK,
+  kConflict,
+  kHeuristic,
+  kCount,
+};
+
+constexpr size_t kHighsCutOriginCount =
+    static_cast<size_t>(HighsCutOrigin::kCount);
+
 struct HighsCutSet {
   std::vector<HighsInt> cutindices;
   std::vector<HighsInt> cutpools;
+  std::vector<HighsCutOrigin> origins;
   std::vector<HighsInt> ARstart_;
   std::vector<HighsInt> ARindex_;
   std::vector<double> ARvalue_;
@@ -42,6 +59,7 @@ struct HighsCutSet {
   void clear() {
     cutindices.clear();
     cutpools.clear();
+    origins.clear();
     upper_.clear();
     ARstart_.clear();
     ARindex_.clear();
@@ -63,6 +81,8 @@ class HighsCutPool {
   std::vector<double> rownormalization_;
   std::vector<double> maxabscoef_;
   std::vector<uint8_t> rowintegral;
+  std::vector<HighsCutOrigin> origins_;
+  std::array<int64_t, kHighsCutOriginCount> accepted_origin_counts_{};
   std::unordered_multimap<uint64_t, HighsInt> hashToCutMap;
   std::vector<HighsDomain::CutpoolPropagation*> propagationDomains;
   std::set<std::pair<HighsInt, HighsInt>> propRows;
@@ -155,7 +175,11 @@ class HighsCutPool {
   void separate(const std::vector<double>& sol, const HighsDomain& domprop,
                 HighsCutSet& cutset, double feastol,
                 const std::deque<HighsCutPool>& cutpools,
-                bool thread_safe = false);
+                bool thread_safe = false,
+                HighsInt max_selected_cuts = -1,
+                int64_t max_selected_nonzeros = -1,
+                const std::array<HighsInt, kHighsCutOriginCount>*
+                    max_selected_by_origin = nullptr);
 
   void separateLpCutsAfterRestart(HighsCutSet& cutset);
 
@@ -176,7 +200,17 @@ class HighsCutPool {
   HighsInt addCut(const HighsMipSolver& mipsolver, HighsInt* Rindex,
                   double* Rvalue, HighsInt Rlen, double rhs,
                   bool integral = false, bool propagate = true,
-                  bool extractCliques = true, bool isConflict = false);
+                  bool extractCliques = true, bool isConflict = false,
+                  HighsCutOrigin origin = HighsCutOrigin::kUnknown);
+
+  HighsCutOrigin getOrigin(HighsInt cut) const { return origins_[cut]; }
+
+  const std::array<int64_t, kHighsCutOriginCount>& getAcceptedOriginCounts()
+      const {
+    return accepted_origin_counts_;
+  }
+
+  static const char* originName(HighsCutOrigin origin);
 
   HighsInt getRowLength(HighsInt row) const {
     return matrix_.getRowEnd(row) - matrix_.getRowStart(row);

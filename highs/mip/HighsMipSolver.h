@@ -137,6 +137,7 @@ class HighsMipSolver {
   const HighsLp& getPresolvedModel() const;
   HighsPresolveStatus getPresolveStatus() const;
   presolve::HighsPostsolveStack getPostsolveStack() const;
+  const HighsPresolveLog& getPresolveLog() const;
 
   void callbackGetCutPool() const;
   bool solutionFeasible(const HighsLp* lp, const std::vector<double>& col_value,

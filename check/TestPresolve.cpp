@@ -12,6 +12,77 @@ bool doubleEqual(const double v0, const double v1) {
 void presolveSolvePostsolve(const std::string& model_file,
                             const bool solve_relaxation = false);
 
+void requirePresolvePhaseReconciliation(const HighsPresolveLog& log) {
+  REQUIRE(log.complete);
+  REQUIRE(log.reconciled);
+  REQUIRE(log.phase.size() == kPresolvePhaseCount);
+  HighsInt rows_removed = 0;
+  HighsInt columns_removed = 0;
+  HighsInt nonzero_delta = 0;
+  for (const HighsPresolvePhaseLog& phase : log.phase) {
+    REQUIRE(phase.call >= 0);
+    REQUIRE(phase.fill_added >= 0);
+    REQUIRE(phase.wall_time >= 0.0);
+    rows_removed += phase.row_removed;
+    columns_removed += phase.col_removed;
+    nonzero_delta += phase.nonzero_delta;
+  }
+  REQUIRE(rows_removed == log.original_num_row - log.reduced_num_row);
+  REQUIRE(columns_removed == log.original_num_col - log.reduced_num_col);
+  REQUIRE(nonzero_delta == log.reduced_num_nz - log.original_num_nz);
+}
+
+TEST_CASE("mip-presolve-phase-telemetry", "[highs_test_presolve]") {
+  const std::string model_file =
+      std::string(HIGHS_DIR) + "/check/instances/flugpl.mps";
+  Highs highs;
+  highs.setOptionValue("output_flag", false);
+  REQUIRE(highs.readModel(model_file) == HighsStatus::kOk);
+  const HighsLp original = highs.getLp();
+  REQUIRE(original.isMip());
+  REQUIRE(highs.presolve() == HighsStatus::kOk);
+  const HighsPresolveLog& log = highs.getPresolveLog();
+  requirePresolvePhaseReconciliation(log);
+  const HighsLp& reduced = highs.getPresolvedLp();
+  REQUIRE(log.original_num_col == original.num_col_);
+  REQUIRE(log.original_num_row == original.num_row_);
+  REQUIRE(log.original_num_nz == original.a_matrix_.numNz());
+  REQUIRE(log.reduced_num_col == reduced.num_col_);
+  REQUIRE(log.reduced_num_row == reduced.num_row_);
+  REQUIRE(log.reduced_num_nz == reduced.a_matrix_.numNz());
+  REQUIRE(log.phase[kPresolvePhaseInitialSweep].call == 1);
+  highs.resetGlobalScheduler(true);
+}
+
+TEST_CASE("mip-presolve-telemetry-does-not-change-solve",
+          "[highs_test_presolve]") {
+  const std::string model_file =
+      std::string(HIGHS_DIR) + "/check/instances/flugpl.mps";
+  double reference_objective = 0.0;
+  std::vector<double> reference_columns;
+  for (HighsInt logging = 0; logging < 2; ++logging) {
+    Highs highs;
+    highs.resetGlobalScheduler(true);
+    highs.setOptionValue("output_flag", false);
+    highs.setOptionValue("threads", 1);
+    highs.setOptionValue("random_seed", 17);
+    highs.setOptionValue("presolve_rule_logging", logging != 0);
+    REQUIRE(highs.readModel(model_file) == HighsStatus::kOk);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    requirePresolvePhaseReconciliation(highs.getPresolveLog());
+    if (logging == 0) {
+      reference_objective = highs.getInfo().objective_function_value;
+      reference_columns = highs.getSolution().col_value;
+    } else {
+      REQUIRE(highs.getInfo().objective_function_value ==
+              Approx(reference_objective).margin(1e-9));
+      REQUIRE(highs.getSolution().col_value == reference_columns);
+    }
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("presolve-solve-postsolve-lp", "[highs_test_presolve]") {
   std::string model_file =
       std::string(HIGHS_DIR) + "/check/instances/25fv47.mps";

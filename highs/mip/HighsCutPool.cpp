@@ -230,7 +230,11 @@ void HighsCutPool::separate(const std::vector<double>& sol,
                             const HighsDomain& domain, HighsCutSet& cutset,
                             double feastol,
                             const std::deque<HighsCutPool>& cutpools,
-                            bool thread_safe) {
+                            bool thread_safe, HighsInt max_selected_cuts,
+                            int64_t max_selected_nonzeros,
+                            const std::array<HighsInt, kHighsCutOriginCount>*
+                                max_selected_by_origin) {
+  if (max_selected_cuts == 0 || max_selected_nonzeros == 0) return;
   HighsInt nrows = matrix_.getNumRows();
   const HighsInt* ARindex = matrix_.getARindex();
   const double* ARvalue = matrix_.getARvalue();
@@ -394,8 +398,28 @@ void HighsCutPool::separate(const std::vector<double>& sol,
   HighsInt orignumcuts = cutset.numCuts();
   HighsInt origselectednnz = cutset.ARindex_.size();
   HighsInt selectednnz = origselectednnz;
+  std::array<HighsInt, kHighsCutOriginCount> selected_by_origin{};
+  for (HighsCutOrigin origin : cutset.origins)
+    ++selected_by_origin[static_cast<size_t>(origin)];
 
   for (const std::pair<double, HighsInt>& p : efficacious_cuts) {
+    if (max_selected_cuts >= 0 &&
+        cutset.numCuts() - orignumcuts >= max_selected_cuts)
+      break;
+
+    const HighsInt candidate_nnz = getRowLength(p.second);
+    const HighsCutOrigin candidate_origin = origins_[p.second];
+    const size_t origin_index = static_cast<size_t>(candidate_origin);
+    if (max_selected_by_origin != nullptr &&
+        (*max_selected_by_origin)[origin_index] >= 0 &&
+        selected_by_origin[origin_index] >=
+            (*max_selected_by_origin)[origin_index])
+      continue;
+    if (max_selected_nonzeros >= 0 &&
+        selectednnz - origselectednnz + candidate_nnz >
+            max_selected_nonzeros)
+      continue;
+
     bool discard = false;
     double maxpar = 0.1;
     for (HighsInt i = 0; i != static_cast<HighsInt>(cutset.cutindices.size());
@@ -431,7 +455,9 @@ void HighsCutPool::separate(const std::vector<double>& sol,
     }
     cutset.cutindices.push_back(p.second);
     cutset.cutpools.push_back(index_);
-    selectednnz += matrix_.getRowEnd(p.second) - matrix_.getRowStart(p.second);
+    cutset.origins.push_back(origins_[p.second]);
+    ++selected_by_origin[origin_index];
+    selectednnz += candidate_nnz;
   }
 
   cutset.resize(selectednnz);
@@ -466,7 +492,9 @@ void HighsCutPool::separateLpCutsAfterRestart(HighsCutSet& cutset) {
 
   cutset.cutindices.resize(numcuts);
   cutset.cutpools.resize(numcuts, index_);
+  cutset.origins.resize(numcuts);
   std::iota(cutset.cutindices.begin(), cutset.cutindices.end(), 0);
+  for (HighsInt i = 0; i != numcuts; ++i) cutset.origins[i] = origins_[i];
   cutset.resize(matrix_.nonzeroCapacity());
 
   HighsInt offset = 0;
@@ -503,7 +531,8 @@ void HighsCutPool::separateLpCutsAfterRestart(HighsCutSet& cutset) {
 HighsInt HighsCutPool::addCut(const HighsMipSolver& mipsolver, HighsInt* Rindex,
                               double* Rvalue, HighsInt Rlen, double rhs,
                               bool integral, bool propagate,
-                              bool extractCliques, bool isConflict) {
+                              bool extractCliques, bool isConflict,
+                              HighsCutOrigin origin) {
   mipsolver.mipdata_->debugSolution.checkCut(Rindex, Rvalue, Rlen, rhs);
 
   sortBuffer.resize(Rlen);
@@ -607,6 +636,7 @@ HighsInt HighsCutPool::addCut(const HighsMipSolver& mipsolver, HighsInt* Rindex,
     rownormalization_.resize(rowindex + 1);
     maxabscoef_.resize(rowindex + 1);
     rowintegral.resize(rowindex + 1);
+    origins_.resize(rowindex + 1);
   }
 
   // set the right hand side and reset the age
@@ -614,6 +644,8 @@ HighsInt HighsCutPool::addCut(const HighsMipSolver& mipsolver, HighsInt* Rindex,
   ages_[rowindex] = std::max(HighsInt{0}, agelim_ - 5);
   ++ageDistribution[ages_[rowindex]];
   rowintegral[rowindex] = integral;
+  origins_[rowindex] = origin;
+  ++accepted_origin_counts_[static_cast<size_t>(origin)];
   numLps_[rowindex] = 0;
   ageResetWhileLocked_[rowindex].store(0, std::memory_order_relaxed);
   hasSynced_[rowindex] = false;
@@ -656,10 +688,34 @@ void HighsCutPool::syncCutPool(const HighsMipSolver& mipsolver,
       idxs.assign(Rindex, Rindex + Rlen);
       vals.assign(Rvalue, Rvalue + Rlen);
       syncpool.addCut(mipsolver, idxs.data(), vals.data(), Rlen, rhs_[i],
-                      rowintegral[i]);
+                      rowintegral[i], true, true, false, origins_[i]);
       hasSynced_[i] = true;
     }
   }
 
   assert((HighsInt)propRows.size() == numPropRows);
+}
+
+const char* HighsCutPool::originName(HighsCutOrigin origin) {
+  switch (origin) {
+    case HighsCutOrigin::kUnknown:
+      return "unknown";
+    case HighsCutOrigin::kImplication:
+      return "implication";
+    case HighsCutOrigin::kClique:
+      return "clique";
+    case HighsCutOrigin::kTableau:
+      return "tableau";
+    case HighsCutOrigin::kPath:
+      return "path";
+    case HighsCutOrigin::kModK:
+      return "modk";
+    case HighsCutOrigin::kConflict:
+      return "conflict";
+    case HighsCutOrigin::kHeuristic:
+      return "heuristic";
+    case HighsCutOrigin::kCount:
+      break;
+  }
+  return "invalid";
 }

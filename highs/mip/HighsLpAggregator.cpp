@@ -10,13 +10,27 @@
 
 #include "mip/HighsLpRelaxation.h"
 
-HighsLpAggregator::HighsLpAggregator(const HighsLpRelaxation& lprelaxation)
-    : lprelaxation(lprelaxation) {
+HighsLpAggregator::HighsLpAggregator(const HighsLpRelaxation& lprelaxation,
+                                     bool model_rows_only)
+    : lprelaxation(lprelaxation), model_rows_only(model_rows_only) {
   vectorsum.setDimension(lprelaxation.getLp().num_row_ +
                          lprelaxation.getLp().num_col_);
 }
 
-void HighsLpAggregator::addRow(HighsInt row, double weight) {
+bool HighsLpAggregator::acceptsRow(HighsInt row) const {
+  return !model_rows_only || lprelaxation.isModelRow(row);
+}
+
+bool HighsLpAggregator::addRow(HighsInt row, double weight) {
+  if (lprelaxation.isModelRow(row))
+    ++model_row_uses;
+  else {
+    ++cut_pool_row_uses;
+    if (model_rows_only) {
+      ++rejected_cut_pool_row_uses;
+      return false;
+    }
+  }
   HighsInt len;
   const double* vals;
   const HighsInt* inds;
@@ -25,6 +39,7 @@ void HighsLpAggregator::addRow(HighsInt row, double weight) {
   for (HighsInt i = 0; i != len; ++i) vectorsum.add(inds[i], weight * vals[i]);
 
   vectorsum.add(lprelaxation.getLp().num_col_ + row, -weight);
+  return true;
 }
 
 void HighsLpAggregator::getCurrentAggregation(std::vector<HighsInt>& inds,

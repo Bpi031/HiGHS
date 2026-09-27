@@ -34,6 +34,10 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
   std::vector<RowType> rowtype;
   rowtype.resize(lp.num_row_);
   for (HighsInt i = 0; i != lp.num_row_; ++i) {
+    if (!lpAggregator.acceptsRow(i)) {
+      rowtype[i] = RowType::kUnusuable;
+      continue;
+    }
     if (lp.row_lower_[i] == lp.row_upper_[i]) {
       rowtype[i] = RowType::kEq;
       continue;
@@ -164,7 +168,7 @@ void HighsPathSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
     colOutArcs[col].second = outArcRows.size();
   }
 
-  HighsCutGeneration cutGen(lpRelaxation, cutpool);
+  HighsCutGeneration cutGen(lpRelaxation, cutpool, HighsCutOrigin::kPath);
   std::vector<HighsInt> baseRowInds;
   std::vector<double> baseRowVals;
   constexpr HighsInt maxPathLen = 6;

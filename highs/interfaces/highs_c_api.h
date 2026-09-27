@@ -2197,6 +2197,30 @@ HighsInt Highs_getPresolvedNumRow(const void* highs);
 HighsInt Highs_getPresolvedNumNz(const void* highs);
 
 /**
+ * Return the bounded native presolve summary retained by the latest solve.
+ * This is diagnostic evidence and does not certify feasibility or optimality.
+ */
+HighsInt Highs_getPresolveSummary(
+    const void* highs, HighsInt* original_num_col,
+    HighsInt* original_num_row, HighsInt* original_num_nz,
+    HighsInt* reduced_num_col, HighsInt* reduced_num_row,
+    HighsInt* reduced_num_nz, HighsInt* postsolve_reductions,
+    HighsInt* complete, HighsInt* reconciled);
+
+/** Return the fixed number of native presolve phase records. */
+HighsInt Highs_getPresolvePhaseCount(const void* highs);
+
+/** Copy the stable name of one native presolve phase. */
+HighsInt Highs_getPresolvePhaseName(const void* highs,
+                                    const HighsInt phase, char* name);
+
+/** Return one cumulative native presolve phase record. */
+HighsInt Highs_getPresolvePhaseLog(
+    const void* highs, const HighsInt phase, HighsInt* calls,
+    HighsInt* columns_removed, HighsInt* rows_removed,
+    HighsInt* nonzero_delta, HighsInt* fill_added, double* wall_time);
+
+/**
  * Get the data from a HiGHS model.
  *
  * The input arguments have the same meaning (in a different order) to those

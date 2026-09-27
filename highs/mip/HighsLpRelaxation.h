@@ -165,6 +165,13 @@ class HighsLpRelaxation {
     lprows[row].get(mipsolver, len, inds, vals);
   }
 
+  bool isModelRow(HighsInt row) const {
+    assert(row >= 0 && row < static_cast<HighsInt>(lprows.size()));
+    return lprows[row].origin == LpRow::Origin::kModel;
+  }
+
+  bool isCutPoolRow(HighsInt row) const { return !isModelRow(row); }
+
   bool isRowIntegral(HighsInt row) const {
     assert(row < (HighsInt)lprows.size());
     return lprows[row].isIntegral(mipsolver);
