@@ -725,12 +725,10 @@ restart:
           worker.sepa_ptr_->nextNodeSeparationOpportunity();
       node_separation_context.tree_nodes_processed =
           mipdata_->num_nodes + worker.search_ptr_->nnodes;
-      node_separation_context.depth =
-          worker.search_ptr_->getCurrentDepth();
+      node_separation_context.depth = worker.search_ptr_->getCurrentDepth();
       node_separation_context.model_rows = numRow();
       node_separation_context.model_nonzeros = numNonzero();
-      node_separation_context.active_rows =
-          worker.getLpRelaxation().numRows();
+      node_separation_context.active_rows = worker.getLpRelaxation().numRows();
       node_separation_context.active_nonzeros =
           worker.getLpRelaxation().numNonzeros();
       node_separation_context.lp_iterations =
@@ -834,7 +832,8 @@ restart:
           profiling_->start(kMipClockDiveRens);
         mipdata_->heuristics.RENS(
             worker,
-            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+            worker.getLpRelaxation().getLpSolver().getSolution().col_value,
+            kHighsInf, HighsSubMipOrigin::kTreeRens);
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRens);
       }

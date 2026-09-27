@@ -130,6 +130,15 @@ std::string HighsMipSolverData::solutionSourceToString(
   } else if (solution_source == kSolutionSourceSubMip) {
     if (code) return "L";
     return "Sub-MIP";
+  } else if (solution_source == kSolutionSourceRootReducedCost) {
+    if (code) return "D";
+    return "Root reduced-cost sub-MIP";
+  } else if (solution_source == kSolutionSourceRens) {
+    if (code) return "E";
+    return "RENS sub-MIP";
+  } else if (solution_source == kSolutionSourceRins) {
+    if (code) return "N";
+    return "RINS sub-MIP";
   } else if (solution_source == kSolutionSourceEmptyMip) {
     if (code) return "P";
     return "Empty MIP";
@@ -2742,7 +2751,8 @@ restart:
       profiling->start(kMipClockRootHeuristicsRens);
       heuristics.RENS(worker, rootlpsol,
                       root_work.optionalAllowance(HighsRootWorkPhase::kRens,
-                                                  heuristic_started.time));
+                                                  heuristic_started.time),
+                      HighsSubMipOrigin::kRootRens);
       profiling->stop(kMipClockRootHeuristicsRens);
       completeRootWork(HighsRootWorkPhase::kRens, heuristic_started);
       heuristics.flushStatistics(mipsolver, worker);

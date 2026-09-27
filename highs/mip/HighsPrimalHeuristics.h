@@ -8,6 +8,8 @@
 #ifndef HIGHS_PRIMAL_HEURISTICS_H_
 #define HIGHS_PRIMAL_HEURISTICS_H_
 
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 #include "lp_data/HStruct.h"
@@ -17,6 +19,13 @@
 class HighsMipSolver;
 class HighsMipWorker;
 class HighsLpRelaxation;
+
+enum class HighsSubMipOrigin {
+  kRootReducedCost,
+  kRootRens,
+  kTreeRens,
+  kTreeRins,
+};
 
 class HighsPrimalHeuristics {
  private:
@@ -28,6 +37,7 @@ class HighsPrimalHeuristics {
   HighsInt numInfeasObservations;
 
   HighsRandom randgen;
+  std::atomic<int64_t> nextSubMipInvocation{0};
 
  public:
   HighsPrimalHeuristics(HighsMipSolver& mipsolver);
@@ -38,7 +48,11 @@ class HighsPrimalHeuristics {
                    const HighsBasis& basis, double fixingRate,
                    std::vector<double> colLower, std::vector<double> colUpper,
                    HighsInt maxleaves, HighsInt maxnodes, HighsInt stallnodes,
-                   double max_time = kHighsInf);
+                   HighsSubMipOrigin origin, double max_time = kHighsInf);
+
+  static const char* subMipMethodName(HighsSubMipOrigin origin);
+
+  static const char* subMipParentPhaseName(HighsSubMipOrigin origin);
 
   double determineTargetFixingRate(HighsMipWorker& worker);
 
@@ -46,7 +60,8 @@ class HighsPrimalHeuristics {
                        double max_submip_time = kHighsInf);
 
   void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol,
-            double max_submip_time = kHighsInf);
+            double max_submip_time = kHighsInf,
+            HighsSubMipOrigin origin = HighsSubMipOrigin::kTreeRens);
 
   void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
 

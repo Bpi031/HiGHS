@@ -51,6 +51,9 @@ enum MipSolutionSource : int {
   kSolutionSourceShifting,            // I
   kSolutionSourceFeasibilityJump,     // J
   kSolutionSourceSubMip,              // L
+  kSolutionSourceRootReducedCost,     // D
+  kSolutionSourceRens,                // E
+  kSolutionSourceRins,                // N
   kSolutionSourceEmptyMip,            // P
   kSolutionSourceRandomizedRounding,  // R
   kSolutionSourceSolveLp,             // S

@@ -4,7 +4,21 @@
 #include "HCheckConfig.h"
 #include "Highs.h"
 #include "catch.hpp"
+#include "mip/HighsPrimalHeuristics.h"
 #include "mip/HighsRootWork.h"
+
+TEST_CASE("sub-MIP provenance names are exact", "[highs_incumbent]") {
+  REQUIRE(std::string(HighsPrimalHeuristics::subMipMethodName(
+              HighsSubMipOrigin::kRootReducedCost)) == "root_reduced_cost");
+  REQUIRE(std::string(HighsPrimalHeuristics::subMipMethodName(
+              HighsSubMipOrigin::kRootRens)) == "rens");
+  REQUIRE(std::string(HighsPrimalHeuristics::subMipMethodName(
+              HighsSubMipOrigin::kTreeRins)) == "rins");
+  REQUIRE(std::string(HighsPrimalHeuristics::subMipParentPhaseName(
+              HighsSubMipOrigin::kRootRens)) == "root");
+  REQUIRE(std::string(HighsPrimalHeuristics::subMipParentPhaseName(
+              HighsSubMipOrigin::kTreeRens)) == "tree");
+}
 
 TEST_CASE("root-work-disabled", "[highs_root_work]") {
   HighsRootWorkController controller;

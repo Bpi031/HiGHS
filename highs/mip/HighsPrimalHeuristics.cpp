@@ -40,6 +40,45 @@ HighsPrimalHeuristics::HighsPrimalHeuristics(HighsMipSolver& mipsolver)
       numInfeasObservations(0),
       randgen(mipsolver.options_mip_->random_seed) {}
 
+const char* HighsPrimalHeuristics::subMipMethodName(HighsSubMipOrigin origin) {
+  switch (origin) {
+    case HighsSubMipOrigin::kRootReducedCost:
+      return "root_reduced_cost";
+    case HighsSubMipOrigin::kRootRens:
+    case HighsSubMipOrigin::kTreeRens:
+      return "rens";
+    case HighsSubMipOrigin::kTreeRins:
+      return "rins";
+  }
+  return "unknown";
+}
+
+const char* HighsPrimalHeuristics::subMipParentPhaseName(
+    HighsSubMipOrigin origin) {
+  switch (origin) {
+    case HighsSubMipOrigin::kRootReducedCost:
+    case HighsSubMipOrigin::kRootRens:
+      return "root";
+    case HighsSubMipOrigin::kTreeRens:
+    case HighsSubMipOrigin::kTreeRins:
+      return "tree";
+  }
+  return "unknown";
+}
+
+static int subMipSolutionSource(HighsSubMipOrigin origin) {
+  switch (origin) {
+    case HighsSubMipOrigin::kRootReducedCost:
+      return kSolutionSourceRootReducedCost;
+    case HighsSubMipOrigin::kRootRens:
+    case HighsSubMipOrigin::kTreeRens:
+      return kSolutionSourceRens;
+    case HighsSubMipOrigin::kTreeRins:
+      return kSolutionSourceRins;
+  }
+  return kSolutionSourceSubMip;
+}
+
 void HighsPrimalHeuristics::setupIntCols() {
   intcols = mipsolver.mipdata_->integer_cols;
 
@@ -78,7 +117,7 @@ bool HighsPrimalHeuristics::solveSubMip(
     HighsMipWorker& worker, const HighsLp& lp, const HighsBasis& basis,
     double fixingRate, std::vector<double> colLower,
     std::vector<double> colUpper, HighsInt maxleaves, HighsInt maxnodes,
-    HighsInt stallnodes, double max_time) {
+    HighsInt stallnodes, HighsSubMipOrigin origin, double max_time) {
   HighsOptions submipoptions = *mipsolver.options_mip_;
   HighsLp submip = lp;
 
@@ -110,6 +149,28 @@ bool HighsPrimalHeuristics::solveSubMip(
     submipoptions.time_limit = std::min(submipoptions.time_limit, max_time);
   submipoptions.time_limit = std::max(0.0, submipoptions.time_limit);
   submipoptions.objective_bound = worker.upper_limit;
+
+  const bool log_provenance =
+      !mipsolver.submip && mipsolver.options_mip_->mip_root_work_budget;
+  const int64_t invocation =
+      log_provenance
+          ? nextSubMipInvocation.fetch_add(1, std::memory_order_relaxed) + 1
+          : 0;
+  const double invocation_started =
+      log_provenance ? mipsolver.timer_.read() : 0.0;
+  if (log_provenance)
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Incumbent: schema=rost/highs-incumbent/v1 event=submip_start "
+        "invocation=%lld method=%s parent_phase=%s recursion_depth=%lld "
+        "fixing_rate=%.17g max_leaves=%lld max_nodes=%lld stall_nodes=%lld "
+        "max_time=%.17g primal_before=%.17g\n",
+        static_cast<long long>(invocation), subMipMethodName(origin),
+        subMipParentPhaseName(origin),
+        static_cast<long long>(mipsolver.submip_level), fixingRate,
+        static_cast<long long>(maxleaves), static_cast<long long>(maxnodes),
+        static_cast<long long>(stallnodes), submipoptions.time_limit,
+        worker.upper_limit);
 
   if (!mipsolver.submip) {
     double curr_abs_gap = worker.upper_limit - mipsolver.mipdata_->lower_bound;
@@ -205,8 +266,32 @@ bool HighsPrimalHeuristics::solveSubMip(
         "nullptr\n");
     assert(submipsolver.mipdata_);
   }
+  const auto log_submip_end = [&](bool candidate_proposed,
+                                  bool candidate_accepted,
+                                  bool candidate_improved) {
+    if (!log_provenance) return;
+    const int64_t lp_iterations =
+        submipsolver.mipdata_ ? submipsolver.mipdata_->total_lp_iterations : 0;
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Incumbent: schema=rost/highs-incumbent/v1 event=submip_end "
+        "invocation=%lld method=%s parent_phase=%s recursion_depth=%lld "
+        "status=%d elapsed=%.17g nodes=%lld lp_iterations=%lld "
+        "candidate_proposed=%d candidate_accepted=%d candidate_improved=%d "
+        "primal_before=%.17g primal_after=%.17g\n",
+        static_cast<long long>(invocation), subMipMethodName(origin),
+        subMipParentPhaseName(origin),
+        static_cast<long long>(mipsolver.submip_level),
+        static_cast<int>(submipsolver.modelstatus_),
+        mipsolver.timer_.read() - invocation_started,
+        static_cast<long long>(submipsolver.node_count_),
+        static_cast<long long>(lp_iterations), candidate_proposed ? 1 : 0,
+        candidate_accepted ? 1 : 0, candidate_improved ? 1 : 0,
+        submipoptions.objective_bound, worker.upper_limit);
+  };
   if (submipsolver.termination_status_ != HighsModelStatus::kNotset) {
     worker.setHeurTerminationStatus(submipsolver.termination_status_);
+    log_submip_end(false, false, false);
     return false;
   }
   if (submipsolver.mipdata_) {
@@ -233,18 +318,27 @@ bool HighsPrimalHeuristics::solveSubMip(
     worker.updateHeurStatsInfeasObservations(fixingRate);
   }
   if (submipsolver.node_count_ <= 1 &&
-      submipsolver.modelstatus_ == HighsModelStatus::kInfeasible)
+      submipsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
+    log_submip_end(false, false, false);
     return false;
+  }
   double oldUpperLimit = worker.upper_limit;
+  bool candidate_proposed = false;
+  bool candidate_accepted = false;
   if (submipsolver.modelstatus_ != HighsModelStatus::kInfeasible &&
       !submipsolver.solution_.empty()) {
-    trySolution(submipsolver.solution_, kSolutionSourceSubMip, worker);
+    candidate_proposed = true;
+    candidate_accepted = trySolution(submipsolver.solution_,
+                                     subMipSolutionSource(origin), worker);
   }
 
-  if (worker.upper_limit < oldUpperLimit) {
+  const bool candidate_improved = worker.upper_limit < oldUpperLimit;
+  if (candidate_improved) {
     // remember fixing rate as good
     worker.updateHeurStatsSuccessObservations(fixingRate);
   }
+
+  log_submip_end(candidate_proposed, candidate_accepted, candidate_improved);
 
   return true;
 }
@@ -375,7 +469,7 @@ void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker,
               500,  // std::max(50, int(0.05 *
                     // (mipsolver.mipdata_->num_leaves))),
               200 + static_cast<HighsInt>(mipsolver.mipdata_->num_nodes / 20),
-              12, max_submip_time);
+              12, HighsSubMipOrigin::kRootReducedCost, max_submip_time);
 }
 
 static double calcFixVal(double rootchange, double fracval, double cost) {
@@ -397,7 +491,8 @@ static double calcFixVal(double rootchange, double fracval, double cost) {
 
 void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
                                  const std::vector<double>& tmp,
-                                 double max_submip_time) {
+                                 double max_submip_time,
+                                 HighsSubMipOrigin origin) {
   // return if domain is infeasible
   if (worker.getGlobalDomain().infeasible()) return;
 
@@ -635,7 +730,7 @@ retry:
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
       200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
-      max_submip_time);
+      origin, max_submip_time);
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =
@@ -946,7 +1041,8 @@ retry:
       localdom.col_lower_, localdom.col_upper_,
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
-      200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12);
+      200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
+      HighsSubMipOrigin::kTreeRins);
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =
