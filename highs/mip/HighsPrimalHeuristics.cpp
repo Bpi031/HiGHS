@@ -117,7 +117,14 @@ bool HighsPrimalHeuristics::solveSubMip(
     HighsMipWorker& worker, const HighsLp& lp, const HighsBasis& basis,
     double fixingRate, std::vector<double> colLower,
     std::vector<double> colUpper, HighsInt maxleaves, HighsInt maxnodes,
-    HighsInt stallnodes, HighsSubMipOrigin origin, double max_time) {
+    HighsInt stallnodes, HighsSubMipOrigin origin, double max_time,
+    const HighsSubMipCallBudget* call_budget,
+    HighsPrimalHeuristicOutcome* outcome) {
+  if (outcome != nullptr) {
+    *outcome = HighsPrimalHeuristicOutcome{};
+    outcome->started = true;
+    outcome->fixing_rate = fixingRate;
+  }
   HighsOptions submipoptions = *mipsolver.options_mip_;
   HighsLp submip = lp;
 
@@ -128,6 +135,17 @@ bool HighsPrimalHeuristics::solveSubMip(
   submip.offset_ = 0;
 
   // set limits
+  if (call_budget != nullptr) {
+    if (call_budget->max_leaves >= 0)
+      maxleaves = std::min<int64_t>(maxleaves, call_budget->max_leaves);
+    if (call_budget->max_nodes >= 0)
+      maxnodes = std::min<int64_t>(maxnodes, call_budget->max_nodes);
+    if (call_budget->max_stall_nodes >= 0)
+      stallnodes = std::min<int64_t>(stallnodes,
+                                     call_budget->max_stall_nodes);
+    if (std::isfinite(call_budget->max_time))
+      max_time = std::min(max_time, call_budget->max_time);
+  }
   submipoptions.mip_max_leaves = maxleaves;
   submipoptions.output_flag = false;
 
@@ -143,6 +161,10 @@ bool HighsPrimalHeuristics::solveSubMip(
 
   submipoptions.mip_max_nodes = maxnodes;
   submipoptions.mip_max_stall_nodes = stallnodes;
+  if (call_budget != nullptr && call_budget->max_lp_iterations >= 0)
+    submipoptions.simplex_iteration_limit = std::min<int64_t>(
+        submipoptions.simplex_iteration_limit,
+        call_budget->max_lp_iterations);
   submipoptions.mip_pscost_minreliable = 0;
   submipoptions.time_limit -= mipsolver.timer_.read();
   if (max_time >= 0.0)
@@ -157,7 +179,7 @@ bool HighsPrimalHeuristics::solveSubMip(
           ? nextSubMipInvocation.fetch_add(1, std::memory_order_relaxed) + 1
           : 0;
   const double invocation_started =
-      log_provenance ? mipsolver.timer_.read() : 0.0;
+      (log_provenance || outcome != nullptr) ? mipsolver.timer_.read() : 0.0;
   if (log_provenance)
     highsLogUser(
         mipsolver.options_mip_->log_options, HighsLogType::kInfo,
@@ -269,9 +291,21 @@ bool HighsPrimalHeuristics::solveSubMip(
   const auto log_submip_end = [&](bool candidate_proposed,
                                   bool candidate_accepted,
                                   bool candidate_improved) {
-    if (!log_provenance) return;
     const int64_t lp_iterations =
         submipsolver.mipdata_ ? submipsolver.mipdata_->total_lp_iterations : 0;
+    if (outcome != nullptr) {
+      outcome->completed = true;
+      outcome->candidate_proposed = candidate_proposed;
+      outcome->candidate_accepted = candidate_accepted;
+      outcome->candidate_improved = candidate_improved;
+      outcome->elapsed = mipsolver.timer_.read() - invocation_started;
+      outcome->nodes = submipsolver.node_count_;
+      outcome->leaves = submipsolver.mipdata_
+                            ? submipsolver.mipdata_->num_leaves
+                            : 0;
+      outcome->lp_iterations = lp_iterations;
+    }
+    if (!log_provenance) return;
     highsLogUser(
         mipsolver.options_mip_->log_options, HighsLogType::kInfo,
         "MIP-Incumbent: schema=rost/highs-incumbent/v1 event=submip_end "
@@ -759,8 +793,11 @@ retry:
   worker.getHeurLpIterations() += heur.getLocalLpIterations();
 }
 
-void HighsPrimalHeuristics::RINS(HighsMipWorker& worker,
-                                 const std::vector<double>& relaxationsol) {
+void HighsPrimalHeuristics::RINS(
+    HighsMipWorker& worker, const std::vector<double>& relaxationsol,
+    const HighsSubMipCallBudget* call_budget,
+    HighsPrimalHeuristicOutcome* outcome) {
+  if (outcome != nullptr) *outcome = HighsPrimalHeuristicOutcome{};
   // return if domain is infeasible
   if (worker.getGlobalDomain().infeasible()) return;
 
@@ -802,7 +839,8 @@ void HighsPrimalHeuristics::RINS(HighsMipWorker& worker,
   // determine the initial number of unfixed variables fixing rate to decide if
   // the problem is restricted enough to be considered for solving a submip
   double maxfixingrate = determineTargetFixingRate(worker);
-  double minfixingrate = 0.25;
+  double minfixingrate =
+      call_budget == nullptr ? 0.25 : call_budget->min_fixing_rate;
   double fixingrate = 0.0;
   bool stop = false;
   HighsInt nbacktracks = -1;
@@ -1042,7 +1080,7 @@ retry:
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
       200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
-      HighsSubMipOrigin::kTreeRins);
+      HighsSubMipOrigin::kTreeRins, kHighsInf, call_budget, outcome);
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =

@@ -23,7 +23,7 @@ if(NOT FAST_BUILD)
   add_library(libhighs ${sources} ${headers} ${win_version_file})
   target_include_directories(libhighs PRIVATE ${include_dirs})
 
-  if(APPLE)
+  if(APPLE AND ROST_HIGHS_UNITY_BUILD)
     # linker was taking ~1 hour, unity build reduces it to ~1 minute
     set_target_properties(libhighs PROPERTIES
       UNITY_BUILD ON
@@ -145,7 +145,7 @@ else()
   add_library(highs)
   add_library(${PROJECT_NAMESPACE}::highs ALIAS highs)
 
-  if(APPLE)
+  if(APPLE AND ROST_HIGHS_UNITY_BUILD)
     # linker was taking ~1 hour, unity build reduces it to ~1 minute
     set_target_properties(highs PROPERTIES
       UNITY_BUILD ON

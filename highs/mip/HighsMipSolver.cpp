@@ -28,6 +28,29 @@
 
 using std::fabs;
 
+namespace {
+uint64_t rinsNeighbourhoodSignature(
+    const HighsMipSolverData& mipdata,
+    const std::vector<double>& relaxation_solution) {
+  if (mipdata.incumbent.size() != relaxation_solution.size()) return 0;
+  uint64_t signature = 1469598103934665603ULL;
+  size_t agreeing_columns = 0;
+  for (HighsInt col : mipdata.integral_cols) {
+    if (std::abs(relaxation_solution[col] - mipdata.incumbent[col]) >
+        mipdata.feastol)
+      continue;
+    ++agreeing_columns;
+    const int64_t value = static_cast<int64_t>(
+        HighsIntegers::nearestInteger(mipdata.incumbent[col]));
+    signature ^= static_cast<uint64_t>(col);
+    signature *= 1099511628211ULL;
+    signature ^= static_cast<uint64_t>(value);
+    signature *= 1099511628211ULL;
+  }
+  return agreeing_columns == 0 ? 0 : signature;
+}
+}  // namespace
+
 HighsMipSolver::HighsMipSolver(HighsCallback& callback,
                                const HighsOptions& options, const HighsLp& lp,
                                const HighsSolution& solution, bool submip,
@@ -841,9 +864,42 @@ restart:
       if (options_mip_->mip_heuristic_run_rins) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
-        mipdata_->heuristics.RINS(
-            worker,
-            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        const std::vector<double>& relaxation_solution =
+            worker.getLpRelaxation().getLpSolver().getSolution().col_value;
+        if (mipdata_->heuristic_manager.enabled() &&
+            !mipdata_->parallelLockActive()) {
+          HighsPrimalHeuristicContext context;
+          context.method = HighsPrimalHeuristicMethod::kRins;
+          context.node = mipdata_->num_nodes + worker.search_ptr_->nnodes;
+          context.main_lp_iterations = std::max<int64_t>(
+              0, mipdata_->total_lp_iterations -
+                     mipdata_->heuristic_lp_iterations);
+          context.heuristic_lp_iterations =
+              mipdata_->heuristic_lp_iterations;
+          context.incumbent_sequence = mipdata_->numImprovingSols;
+          context.recursion_depth = submip_level;
+          context.neighbourhood_signature =
+              rinsNeighbourhoodSignature(*mipdata_, relaxation_solution);
+          context.has_incumbent = !mipdata_->incumbent.empty();
+          context.has_lp_solution =
+              relaxation_solution.size() ==
+              static_cast<size_t>(numCol());
+          const HighsPrimalHeuristicDecision decision =
+              mipdata_->heuristic_manager.before(context);
+          if (decision.run) {
+            HighsPrimalHeuristicOutcome outcome;
+            const HighsSubMipCallBudget* budget =
+                mipdata_->heuristic_manager.config().schedule ==
+                        HighsPrimalHeuristicSchedule::kManagedRins
+                    ? &decision.budget
+                    : nullptr;
+            mipdata_->heuristics.RINS(worker, relaxation_solution, budget,
+                                      &outcome);
+            mipdata_->heuristic_manager.record(context, outcome);
+          }
+        } else {
+          mipdata_->heuristics.RINS(worker, relaxation_solution);
+        }
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRins);
       }
@@ -1099,6 +1155,7 @@ void HighsMipSolver::cleanupSolve() {
 
   // Force a final logging line
   mipdata_->printDisplayLine(kSolutionSourceCleanup);
+  mipdata_->logPrimalHeuristicSummary();
   // Stop the solve clock - which won't be running if presolve
   // determines the model status
   if (profiling_->running(kSolveTime)) profiling_->stop(kSolveTime);

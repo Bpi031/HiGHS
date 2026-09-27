@@ -21,6 +21,7 @@
 #include "mip/HighsMipWorker.h"
 #include "mip/HighsNodeQueue.h"
 #include "mip/HighsObjectiveFunction.h"
+#include "mip/HighsPrimalHeuristicManager.h"
 #include "mip/HighsPrimalHeuristics.h"
 #include "mip/HighsPseudocost.h"
 #include "mip/HighsRedcostFixing.h"
@@ -82,6 +83,7 @@ struct HighsMipSolverData {
   bool parallel_lock;
 
   HighsPrimalHeuristics heuristics;
+  HighsPrimalHeuristicManager heuristic_manager;
   HighsCliqueTable cliquetable;
   HighsImplications implications;
   HighsRedcostFixing redcostfixing;
@@ -200,6 +202,7 @@ struct HighsMipSolverData {
   bool moreHeuristicsAllowed() const;
   void removeFixedIndices();
   void init();
+  void logPrimalHeuristicSummary() const;
   void basisTransfer();
   void checkObjIntegrality();
   void runMipPresolve(const HighsInt presolve_reduction_limit);

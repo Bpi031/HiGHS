@@ -40,6 +40,8 @@ if(EXISTS "${LOC_PATH}")
     Please make a build subdirectory. Feel free to remove CMakeCache.txt and CMakeFiles.")
 endif()
 option(FAST_BUILD "Fast build: " ON)
+option(ROST_HIGHS_UNITY_BUILD
+  "Use the upstream macOS unity build for HiGHS targets" ON)
 
 find_program(GIT git)
 

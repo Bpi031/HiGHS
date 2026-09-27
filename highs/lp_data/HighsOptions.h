@@ -508,6 +508,13 @@ struct HighsOptionsStruct {
   double mip_root_work_max_heuristic_time;
   double mip_root_work_max_single_helper_time;
   double mip_root_work_tree_reserve_time;
+  std::string mip_primal_heuristic_schedule;
+  HighsInt mip_rins_max_calls;
+  HighsInt mip_rins_max_nodes;
+  HighsInt mip_rins_max_lp_iterations;
+  HighsInt mip_rins_cooldown_nodes;
+  double mip_rins_min_fixing_rate;
+  double mip_heuristic_proof_work_reserve;
 #ifdef HIGHS_DEBUGSOL
   std::string mip_debug_solution_file;
 #endif
@@ -699,6 +706,13 @@ struct HighsOptionsStruct {
         mip_root_work_max_heuristic_time(-1.0),
         mip_root_work_max_single_helper_time(-1.0),
         mip_root_work_tree_reserve_time(-1.0),
+        mip_primal_heuristic_schedule("off"),
+        mip_rins_max_calls(-1),
+        mip_rins_max_nodes(-1),
+        mip_rins_max_lp_iterations(-1),
+        mip_rins_cooldown_nodes(0),
+        mip_rins_min_fixing_rate(0.25),
+        mip_heuristic_proof_work_reserve(0.0),
 #ifdef HIGHS_DEBUGSOL
         mip_debug_solution_file(""),
 #endif
@@ -1326,6 +1340,48 @@ class HighsOptions : public HighsOptionsStruct {
         "Requested global-time reserve before starting more optional root "
         "work; -1 disables the reserve",
         advanced, &mip_root_work_tree_reserve_time, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_string = new OptionRecordString(
+        "mip_primal_heuristic_schedule",
+        "Experimental incumbent manager: off, compatibility, or managed-rins",
+        advanced, &mip_primal_heuristic_schedule, "off");
+    records.push_back(record_string);
+
+    record_int = new OptionRecordInt(
+        "mip_rins_max_calls",
+        "Maximum managed top-level RINS calls; -1 is unlimited", advanced,
+        &mip_rins_max_calls, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_rins_max_nodes",
+        "Maximum nodes in one managed RINS sub-MIP; -1 keeps its native limit",
+        advanced, &mip_rins_max_nodes, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_rins_max_lp_iterations",
+        "Cumulative managed RINS LP-work budget; -1 is unlimited", advanced,
+        &mip_rins_max_lp_iterations, -1, -1, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_rins_cooldown_nodes",
+        "Main-tree nodes between equivalent managed RINS calls", advanced,
+        &mip_rins_cooldown_nodes, 0, 0, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_rins_min_fixing_rate",
+        "Minimum managed RINS integer-variable fixing rate", advanced,
+        &mip_rins_min_fixing_rate, 0.0, 0.25, 1.0);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_heuristic_proof_work_reserve",
+        "Minimum fraction of LP work reserved for the main proof search",
+        advanced, &mip_heuristic_proof_work_reserve, 0.0, 0.0, 1.0);
     records.push_back(record_double);
 
     record_bool = new OptionRecordBool(

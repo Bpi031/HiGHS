@@ -389,6 +389,7 @@ set(highs_sources
     mip/HighsNodeQueue.cpp
     mip/HighsObjectiveFunction.cpp
     mip/HighsPathSeparator.cpp
+    mip/HighsPrimalHeuristicManager.cpp
     mip/HighsPrimalHeuristics.cpp
     mip/HighsPseudocost.cpp
     mip/HighsRedcostFixing.cpp
@@ -523,6 +524,7 @@ set(highs_headers
     mip/HighsNodeQueue.h
     mip/HighsObjectiveFunction.h
     mip/HighsPathSeparator.h
+    mip/HighsPrimalHeuristicManager.h
     mip/HighsPrimalHeuristics.h
     mip/HighsPseudocost.h
     mip/HighsRedcostFixing.h

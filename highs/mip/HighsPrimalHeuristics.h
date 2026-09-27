@@ -14,6 +14,7 @@
 
 #include "lp_data/HStruct.h"
 #include "lp_data/HighsLp.h"
+#include "mip/HighsPrimalHeuristicManager.h"
 #include "util/HighsRandom.h"
 
 class HighsMipSolver;
@@ -48,7 +49,9 @@ class HighsPrimalHeuristics {
                    const HighsBasis& basis, double fixingRate,
                    std::vector<double> colLower, std::vector<double> colUpper,
                    HighsInt maxleaves, HighsInt maxnodes, HighsInt stallnodes,
-                   HighsSubMipOrigin origin, double max_time = kHighsInf);
+                   HighsSubMipOrigin origin, double max_time = kHighsInf,
+                   const HighsSubMipCallBudget* call_budget = nullptr,
+                   HighsPrimalHeuristicOutcome* outcome = nullptr);
 
   static const char* subMipMethodName(HighsSubMipOrigin origin);
 
@@ -63,7 +66,9 @@ class HighsPrimalHeuristics {
             double max_submip_time = kHighsInf,
             HighsSubMipOrigin origin = HighsSubMipOrigin::kTreeRens);
 
-  void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
+  void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol,
+            const HighsSubMipCallBudget* call_budget = nullptr,
+            HighsPrimalHeuristicOutcome* outcome = nullptr);
 
   void feasibilityPump(HighsMipWorker& worker);
 

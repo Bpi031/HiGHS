@@ -792,6 +792,37 @@ void HighsMipSolverData::init() {
   heuristic_effort = mipsolver.options_mip_->mip_heuristic_effort;
   detectSymmetries = mipsolver.options_mip_->mip_detect_symmetry;
 
+  HighsPrimalHeuristicManagerConfig heuristic_manager_config;
+  const std::string& heuristic_schedule =
+      mipsolver.options_mip_->mip_primal_heuristic_schedule;
+  if (heuristic_schedule == "compatibility") {
+    heuristic_manager_config.schedule =
+        HighsPrimalHeuristicSchedule::kCompatibility;
+  } else if (heuristic_schedule == "managed-rins") {
+    heuristic_manager_config.schedule =
+        HighsPrimalHeuristicSchedule::kManagedRins;
+  } else {
+    heuristic_manager_config.schedule = HighsPrimalHeuristicSchedule::kOff;
+    if (heuristic_schedule != "off")
+      highsLogUser(mipsolver.options_mip_->log_options,
+                   HighsLogType::kWarning,
+                   "Unknown mip_primal_heuristic_schedule '%s'; using off\n",
+                   heuristic_schedule.c_str());
+  }
+  heuristic_manager_config.rins_max_calls =
+      mipsolver.options_mip_->mip_rins_max_calls;
+  heuristic_manager_config.rins_cooldown_nodes =
+      mipsolver.options_mip_->mip_rins_cooldown_nodes;
+  heuristic_manager_config.proof_work_reserve =
+      mipsolver.options_mip_->mip_heuristic_proof_work_reserve;
+  heuristic_manager_config.rins_budget.max_nodes =
+      mipsolver.options_mip_->mip_rins_max_nodes;
+  heuristic_manager_config.rins_budget.max_lp_iterations =
+      mipsolver.options_mip_->mip_rins_max_lp_iterations;
+  heuristic_manager_config.rins_budget.min_fixing_rate =
+      mipsolver.options_mip_->mip_rins_min_fixing_rate;
+  heuristic_manager.initialise(heuristic_manager_config);
+
   firstlpsolobj = -kHighsInf;
   rootlpsolobj = -kHighsInf;
   analyticCenterComputed = false;
@@ -835,6 +866,57 @@ void HighsMipSolverData::init() {
     dispfreq = 2000;
   else
     dispfreq = 100;
+}
+
+void HighsMipSolverData::logPrimalHeuristicSummary() const {
+  if (!heuristic_manager.enabled() || mipsolver.submip) return;
+  for (HighsPrimalHeuristicMethod method :
+       {HighsPrimalHeuristicMethod::kRootReducedCost,
+        HighsPrimalHeuristicMethod::kRens,
+        HighsPrimalHeuristicMethod::kRins}) {
+    const HighsPrimalHeuristicAccount& account =
+        heuristic_manager.account(method);
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Heuristic-Summary: schema=rost/highs-heuristic-summary/v1 "
+        "schedule=%s method=%s considered=%lld scheduled=%lld started=%lld "
+        "completed=%lld proposed=%lld accepted=%lld improved=%lld nodes=%lld "
+        "leaves=%lld lp_iterations=%lld elapsed=%.17g allowed=%lld "
+        "denied_no_incumbent=%lld denied_no_lp=%lld denied_recursive=%lld "
+        "denied_call_limit=%lld denied_cooldown=%lld denied_duplicate=%lld "
+        "denied_lp_work=%lld denied_proof_reserve=%lld\n",
+        HighsPrimalHeuristicManager::scheduleName(
+            heuristic_manager.config().schedule),
+        HighsPrimalHeuristicManager::methodName(method),
+        static_cast<long long>(account.considered),
+        static_cast<long long>(account.scheduled),
+        static_cast<long long>(account.started),
+        static_cast<long long>(account.completed),
+        static_cast<long long>(account.proposed),
+        static_cast<long long>(account.accepted),
+        static_cast<long long>(account.improved),
+        static_cast<long long>(account.nodes),
+        static_cast<long long>(account.leaves),
+        static_cast<long long>(account.lp_iterations), account.elapsed,
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kAllowed)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kNoIncumbent)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kNoLpSolution)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kRecursiveSubMip)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kCallLimit)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kCooldown)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kDuplicateNeighbourhood)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kLpWorkLimit)]),
+        static_cast<long long>(account.decisions[static_cast<size_t>(
+            HighsPrimalHeuristicDecisionReason::kProofReserve)]));
+  }
 }
 
 void HighsMipSolverData::runMipPresolve(
