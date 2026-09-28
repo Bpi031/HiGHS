@@ -86,6 +86,7 @@ HighsMipSolverData::HighsMipSolverData(HighsMipSolver& mipsolver)
       sb_lp_iterations_before_run(0),
       num_disp_lines(0),
       numImprovingSols(0),
+      incumbent_callback_sequence(0),
       lower_bound(-kHighsInf),
       upper_bound(kHighsInf),
       upper_limit(kHighsInf),
@@ -831,6 +832,7 @@ void HighsMipSolverData::init() {
   numRestarts = 0;
   numRestartsRoot = 0;
   numImprovingSols = 0;
+  incumbent_callback_sequence = 0;
   pruned_treeweight = 0;
   avgrootlpiters = 0;
   num_nodes = 0;
@@ -992,7 +994,7 @@ void HighsMipSolverData::runSetup() {
 
       double new_upper_limit = computeNewUpperLimit(solobj, 0.0, 0.0);
 
-      saveReportMipSolution(new_upper_limit);
+      saveReportMipSolution(new_upper_limit, kSolutionSourceHighsSolution);
       if (new_upper_limit < upper_limit) {
         upper_limit = new_upper_limit;
         optimality_limit =
@@ -1673,7 +1675,7 @@ bool HighsMipSolverData::addIncumbent(const std::vector<double>& sol,
     double new_upper_limit = computeNewUpperLimit(solobj, 0.0, 0.0);
 
     if (!is_user_solution && !mipsolver.submip)
-      saveReportMipSolution(new_upper_limit);
+      saveReportMipSolution(new_upper_limit, solution_source);
     if (new_upper_limit < upper_limit) {
       ++numImprovingSols;
       upper_limit = new_upper_limit;
@@ -3174,15 +3176,20 @@ void HighsMipSolverData::setupDomainPropagation() {
   getDomain().computeRowActivities();
 }
 
-void HighsMipSolverData::saveReportMipSolution(const double new_upper_limit) {
+void HighsMipSolverData::saveReportMipSolution(const double new_upper_limit,
+                                               const int solution_source) {
   const bool non_improving = new_upper_limit >= upper_limit;
   if (mipsolver.submip) return;
   if (non_improving) return;
+
+  const int64_t callback_sequence = incumbent_callback_sequence++;
 
   if (mipsolver.callback_->user_callback) {
     if (mipsolver.callback_->active[kCallbackMipImprovingSolution]) {
       mipsolver.callback_->clearHighsCallbackOutput();
       mipsolver.callback_->data_out.mip_solution = mipsolver.solution_;
+      mipsolver.callback_->data_out.mip_solution_source = solution_source;
+      mipsolver.callback_->data_out.mip_solution_sequence = callback_sequence;
       const bool interrupt = interruptFromCallbackWithData(
           kCallbackMipImprovingSolution, mipsolver.solution_objective_,
           "Improving solution");

@@ -1650,6 +1650,12 @@ const void* Highs_getCallbackDataOutItem(const HighsCallbackDataOut* data_out,
     return (void*)(&data_out->mip_gap);
   } else if (!strcmp(item_name, kHighsCallbackDataOutMipSolutionName)) {
     return (void*)(data_out->mip_solution);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionSourceName)) {
+    return (void*)(&data_out->mip_solution_source);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionSequenceName)) {
+    return (void*)(&data_out->mip_solution_sequence);
   } else if (!strcmp(item_name, kHighsCallbackDataOutCutpoolNumColName)) {
     return (void*)(&data_out->cutpool_num_col);
   } else if (!strcmp(item_name, kHighsCallbackDataOutCutpoolNumCutName)) {

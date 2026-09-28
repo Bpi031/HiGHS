@@ -30,6 +30,8 @@ void HighsCallback::clearHighsCallbackOutput() {
   this->data_out.mip_dual_bound = -kHighsInf;
   this->data_out.mip_gap = -1;
   this->data_out.mip_solution.clear();
+  this->data_out.mip_solution_source = -1;
+  this->data_out.mip_solution_sequence = -1;
   this->data_out.cutpool_start.clear();
   this->data_out.cutpool_index.clear();
   this->data_out.cutpool_value.clear();
@@ -114,6 +116,8 @@ HighsCallbackOutput::operator HighsCallbackDataOut() const {
   data.mip_solution_size = mip_solution.size();
   data.mip_solution =
       mip_solution.empty() ? nullptr : const_cast<double*>(mip_solution.data());
+  data.mip_solution_source = mip_solution_source;
+  data.mip_solution_sequence = mip_solution_sequence;
 
   data.cutpool_num_col = cutpool_num_col;
   data.cutpool_num_cut = cutpool_lower.size();

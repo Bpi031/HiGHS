@@ -127,6 +127,10 @@ static const char* const kHighsCallbackDataOutMipDualBoundName =
     "mip_dual_bound";
 static const char* const kHighsCallbackDataOutMipGapName = "mip_gap";
 static const char* const kHighsCallbackDataOutMipSolutionName = "mip_solution";
+static const char* const kHighsCallbackDataOutMipSolutionSourceName =
+    "mip_solution_source";
+static const char* const kHighsCallbackDataOutMipSolutionSequenceName =
+    "mip_solution_sequence";
 static const char* const kHighsCallbackDataOutCutpoolNumColName =
     "cutpool_num_col";
 static const char* const kHighsCallbackDataOutCutpoolNumCutName =

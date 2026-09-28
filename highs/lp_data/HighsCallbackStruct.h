@@ -36,6 +36,8 @@ typedef struct HighsCallbackDataOut {
   double mip_gap;
   double* mip_solution;
   HighsInt mip_solution_size;
+  HighsInt mip_solution_source;
+  int64_t mip_solution_sequence;
   HighsInt cutpool_num_col;
   HighsInt cutpool_num_cut;
   HighsInt cutpool_num_nz;

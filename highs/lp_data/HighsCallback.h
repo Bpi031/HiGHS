@@ -47,6 +47,8 @@ struct HighsCallbackOutput {
   double mip_dual_bound;
   double mip_gap;
   std::vector<double> mip_solution;
+  HighsInt mip_solution_source;
+  int64_t mip_solution_sequence;
   HighsInt cutpool_num_col;
   HighsInt cutpool_num_cut;
   std::vector<HighsInt> cutpool_start;

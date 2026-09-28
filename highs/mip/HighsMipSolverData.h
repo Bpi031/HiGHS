@@ -153,6 +153,7 @@ struct HighsMipSolverData {
   int64_t num_disp_lines;
 
   HighsInt numImprovingSols;
+  int64_t incumbent_callback_sequence;
   double lower_bound;
   double upper_bound;
   double upper_limit;
@@ -207,7 +208,9 @@ struct HighsMipSolverData {
   void checkObjIntegrality();
   void runMipPresolve(const HighsInt presolve_reduction_limit);
   void setupDomainPropagation();
-  void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
+  void saveReportMipSolution(
+      const double new_upper_limit = -kHighsInf,
+      const int solution_source = kSolutionSourceNone);
   void runSetup();
   double transformNewIntegerFeasibleSolution(
       const std::vector<double>& sol,

@@ -117,6 +117,8 @@ HighsCallbackFunctionType userInterruptCallback =
               callback_type, local_callback_data, message.c_str(),
               data_out->objective_function_value, data_out->mip_solution[0]);
         REQUIRE(local_callback_data >= data_out->objective_function_value);
+        REQUIRE(data_out->mip_solution_source >= 0);
+        REQUIRE(data_out->mip_solution_sequence >= 0);
         // Update the double value pointed to from void* user_callback_data
         *(double*)user_callback_data = data_out->objective_function_value;
       } else {
