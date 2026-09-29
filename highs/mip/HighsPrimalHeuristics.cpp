@@ -53,6 +53,24 @@ const char* HighsPrimalHeuristics::subMipMethodName(HighsSubMipOrigin origin) {
   return "unknown";
 }
 
+void HighsPrimalHeuristics::configureSubMipOptions(
+    HighsOptions& options, HighsSubMipOrigin origin) {
+  if (origin != HighsSubMipOrigin::kRootReducedCost &&
+      origin != HighsSubMipOrigin::kRootRens)
+    return;
+
+  options.mip_heuristic_run_rens = false;
+  options.mip_heuristic_run_rins = false;
+  options.mip_heuristic_run_root_reduced_cost = false;
+}
+
+double HighsPrimalHeuristics::remainingHeuristicTime(double started,
+                                                     double now,
+                                                     double allowance) {
+  if (!std::isfinite(allowance)) return kHighsInf;
+  return std::max(0.0, allowance - std::max(0.0, now - started));
+}
+
 const char* HighsPrimalHeuristics::subMipParentPhaseName(
     HighsSubMipOrigin origin) {
   switch (origin) {
@@ -214,6 +232,7 @@ bool HighsPrimalHeuristics::solveSubMip(
     submipoptions.presolve = kHighsOnString;
   submipoptions.mip_detect_symmetry = false;
   submipoptions.mip_heuristic_effort = 0.8;
+  configureSubMipOptions(submipoptions, origin);
   // setup solver and run it
 
   HighsSolution solution;
@@ -243,24 +262,13 @@ bool HighsPrimalHeuristics::solveSubMip(
   // sub-MIP are timed independently
   const bool was_running_solve = mipsolver.profiling_->running(kSolveTime);
   if (was_running_solve) mipsolver.profiling_->stop(kSolveTime);
-  // Only start timing the submip if the calling MIP isn't a sub-MIP
-  if (mipsolver.profiling_->sub_solver_)
-    printf(
-        "\nHighsPrimalHeuristics::solveSubMip Before run() for %sMIP at depth "
-        "%2d on thread %2d\n",
-        mipsolver.submip ? "sub-" : "    ", int(mipsolver.submip_level),
-        int(mipsolver.profiling_->myThread()));
+  // Only start timing the submip if the calling MIP isn't a sub-MIP.
+  // Do not write directly to stdout here: output_flag=false is a public
+  // embedding contract and callers retain structured provenance separately.
   if (!mipsolver.submip) mipsolver.profiling_->start(kSubSolverSubMip);
   // Ensure that sub-solver call time data accumulate in the sub-MIP record
   mipsolver.profiling_->setSubMip(true);
   submipsolver.run();
-  if (mipsolver.profiling_->sub_solver_)
-    printf(
-        "HighsPrimalHeuristics::solveSubMip After  run() for %sMIP at depth "
-        "%2d "
-        "on thread %2d\n\n",
-        mipsolver.submip ? "sub-" : "    ", int(mipsolver.submip_level),
-        int(mipsolver.profiling_->myThread()));
   // Ensure that further sub-solver call time data accumulate in the
   // MIP or sub-MIP record, according to whether the calling MIP is a
   // sub-MIP
@@ -444,6 +452,11 @@ class HeuristicNeighbourhood {
 
 void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker,
                                             double max_submip_time) {
+  const double heuristic_started = mipsolver.timer_.read();
+  const auto remaining_time = [&]() {
+    return remainingHeuristicTime(heuristic_started, mipsolver.timer_.read(),
+                                  max_submip_time);
+  };
   std::vector<std::pair<double, HighsDomainChange>> lurkingBounds =
       mipsolver.mipdata_->redcostfixing.getLurkingBounds(
           mipsolver, worker.getGlobalDomain());
@@ -464,6 +477,7 @@ void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker,
       mipsolver.mipdata_->lower_bound + mipsolver.mipdata_->feastol;
 
   for (const std::pair<double, HighsDomainChange>& domchg : lurkingBounds) {
+    if (remaining_time() <= 0.0) return;
     currCutoff = domchg.first;
 
     if (currCutoff <= lower_bound) break;
@@ -498,12 +512,15 @@ void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker,
   double fixingRate = neighbourhood.getFixingRate();
   if (fixingRate < 0.3) return;
 
+  const double submip_time = remaining_time();
+  if (submip_time <= 0.0) return;
+
   solveSubMip(worker, *mipsolver.model_, mipsolver.mipdata_->firstrootbasis,
               fixingRate, localdom.col_lower_, localdom.col_upper_,
               500,  // std::max(50, int(0.05 *
                     // (mipsolver.mipdata_->num_leaves))),
               200 + static_cast<HighsInt>(mipsolver.mipdata_->num_nodes / 20),
-              12, HighsSubMipOrigin::kRootReducedCost, max_submip_time);
+              12, HighsSubMipOrigin::kRootReducedCost, submip_time);
 }
 
 static double calcFixVal(double rootchange, double fracval, double cost) {
@@ -527,6 +544,11 @@ void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
                                  const std::vector<double>& tmp,
                                  double max_submip_time,
                                  HighsSubMipOrigin origin) {
+  const double heuristic_started = mipsolver.timer_.read();
+  const auto remaining_time = [&]() {
+    return remainingHeuristicTime(heuristic_started, mipsolver.timer_.read(),
+                                  max_submip_time);
+  };
   // return if domain is infeasible
   if (worker.getGlobalDomain().infeasible()) return;
 
@@ -575,6 +597,10 @@ void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
   HighsInt nbacktracks = -1;
   HeuristicNeighbourhood neighbourhood(mipsolver, localdom);
 retry:
+  if (remaining_time() <= 0.0) {
+    worker.getHeurLpIterations() += heur.getLocalLpIterations();
+    return;
+  }
   ++nbacktracks;
   neighbourhood.backtracked();
   // printf("current depth : %" HIGHSINT_FORMAT
@@ -590,6 +616,10 @@ retry:
   // printf("fixingrate before loop is %g\n", fixingrate);
   assert(heur.hasNode());
   while (true) {
+    if (remaining_time() <= 0.0) {
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
     // printf("evaluating node\n");
     heur.evaluateNode();
     // printf("done evaluating node\n");
@@ -758,13 +788,18 @@ retry:
                 HighsInt{1},
                 static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
           : 1;
+  const double submip_time = remaining_time();
+  if (submip_time <= 0.0) {
+    worker.getHeurLpIterations() += heur.getLocalLpIterations();
+    return;
+  }
   const bool solve_sub_mip_return = solveSubMip(
       worker, heurlp.getLp(), heurlp.getLpSolver().getBasis(), fixingrate,
       localdom.col_lower_, localdom.col_upper_,
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
       200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
-      origin, max_submip_time);
+      origin, submip_time);
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =

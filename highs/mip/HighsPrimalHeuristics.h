@@ -20,6 +20,7 @@
 class HighsMipSolver;
 class HighsMipWorker;
 class HighsLpRelaxation;
+class HighsOptions;
 
 enum class HighsSubMipOrigin {
   kRootReducedCost,
@@ -56,6 +57,19 @@ class HighsPrimalHeuristics {
   static const char* subMipMethodName(HighsSubMipOrigin origin);
 
   static const char* subMipParentPhaseName(HighsSubMipOrigin origin);
+
+  // Bounded root helpers are terminal neighbourhood searches. Allowing them
+  // to launch RENS/RINS/reduced-cost sub-MIPs recursively defeats the root
+  // controller's work budget and delays entry into the main tree. Preserve
+  // the existing tree-heuristic behavior outside this reviewed boundary.
+  static void configureSubMipOptions(HighsOptions& options,
+                                     HighsSubMipOrigin origin);
+
+  // Return the remaining wall-clock allowance for one complete heuristic
+  // call. The same deadline is shared by preprocessing, retries, and the
+  // terminal sub-MIP rather than being renewed for every retry.
+  static double remainingHeuristicTime(double started, double now,
+                                       double allowance);
 
   double determineTargetFixingRate(HighsMipWorker& worker);
 

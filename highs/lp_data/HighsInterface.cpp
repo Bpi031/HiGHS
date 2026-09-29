@@ -4388,10 +4388,6 @@ void HighsProfiling::start(const HighsInt profiling_clock, const bool restart) {
   HighsProfilingRecord* thread_record = this->getHighsProfilingRecord();
   double time_start = timer->read();
 
-  if (profiling_clock == kMipClockSubMipSolve) {
-    printf("HighsProfiling::start SubMipSolve on thread %2d with submip = %s\n",
-           int(thread), this->submip[thread] ? "T" : "F");
-  }
   const bool clock_running =
       std::signbit(thread_record->start_time[profiling_clock]);
   if (clock_running && profiling_clock != kSubSolverHipoAc &&

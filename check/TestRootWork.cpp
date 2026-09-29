@@ -4,6 +4,7 @@
 #include "HCheckConfig.h"
 #include "Highs.h"
 #include "catch.hpp"
+#include "lp_data/HighsOptions.h"
 #include "mip/HighsPrimalHeuristics.h"
 #include "mip/HighsRootWork.h"
 
@@ -18,6 +19,46 @@ TEST_CASE("sub-MIP provenance names are exact", "[highs_incumbent]") {
               HighsSubMipOrigin::kRootRens)) == "root");
   REQUIRE(std::string(HighsPrimalHeuristics::subMipParentPhaseName(
               HighsSubMipOrigin::kTreeRens)) == "tree");
+}
+
+TEST_CASE("bounded root helper sub-MIPs cannot recurse",
+          "[highs_incumbent]") {
+  HighsOptions options;
+  options.mip_heuristic_run_rens = true;
+  options.mip_heuristic_run_rins = true;
+  options.mip_heuristic_run_root_reduced_cost = true;
+
+  HighsPrimalHeuristics::configureSubMipOptions(
+      options, HighsSubMipOrigin::kRootRens);
+
+  REQUIRE_FALSE(options.mip_heuristic_run_rens);
+  REQUIRE_FALSE(options.mip_heuristic_run_rins);
+  REQUIRE_FALSE(options.mip_heuristic_run_root_reduced_cost);
+}
+
+TEST_CASE("tree heuristic sub-MIPs preserve the native portfolio",
+          "[highs_incumbent]") {
+  HighsOptions options;
+  options.mip_heuristic_run_rens = true;
+  options.mip_heuristic_run_rins = true;
+  options.mip_heuristic_run_root_reduced_cost = true;
+
+  HighsPrimalHeuristics::configureSubMipOptions(
+      options, HighsSubMipOrigin::kTreeRins);
+
+  REQUIRE(options.mip_heuristic_run_rens);
+  REQUIRE(options.mip_heuristic_run_rins);
+  REQUIRE(options.mip_heuristic_run_root_reduced_cost);
+}
+
+TEST_CASE("heuristic retries share one deadline", "[highs_incumbent]") {
+  REQUIRE(HighsPrimalHeuristics::remainingHeuristicTime(10.0, 12.0, 7.0) ==
+          Approx(5.0));
+  REQUIRE(HighsPrimalHeuristics::remainingHeuristicTime(10.0, 20.0, 7.0) ==
+          Approx(0.0));
+  REQUIRE(HighsPrimalHeuristics::remainingHeuristicTime(
+              10.0, 20.0, std::numeric_limits<double>::infinity()) ==
+          kHighsInf);
 }
 
 TEST_CASE("root-work-disabled", "[highs_root_work]") {
