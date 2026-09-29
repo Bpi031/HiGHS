@@ -14,7 +14,8 @@ HighsMipWorker::HighsMipWorker(const HighsMipSolver& mipsolver,
                                HighsLpRelaxation* lp, HighsDomain* domain,
                                HighsCutPool* cutpool,
                                HighsConflictPool* conflictpool,
-                               HighsPseudocost* pseudocost)
+                               HighsPseudocost* pseudocost,
+                               HighsInt worker_id)
     : mipsolver_(mipsolver),
       mipdata_(*mipsolver_.mipdata_),
       lp_(lp),
@@ -22,6 +23,7 @@ HighsMipWorker::HighsMipWorker(const HighsMipSolver& mipsolver,
       cutpool_(cutpool),
       conflictpool_(conflictpool),
       pseudocost_(pseudocost),
+      worker_id_(worker_id),
       randgen(mipsolver.options_mip_->random_seed) {
   upper_bound = mipdata_.upper_bound;
   upper_limit = mipdata_.upper_limit;
@@ -57,7 +59,8 @@ bool HighsMipWorker::addIncumbent(const std::vector<double>& sol, double solobj,
     // Get the transformed objective and solution if required
     const std::pair<bool, double> transformed_solobj =
         transformNewIntegerFeasibleSolution(sol);
-    if (transformed_solobj.first && transformed_solobj.second < upper_bound) {
+    if (!transformed_solobj.first) return false;
+    if (transformed_solobj.second < upper_bound) {
       upper_bound = transformed_solobj.second;
       double new_upper_limit =
           mipdata_.computeNewUpperLimit(upper_bound, 0.0, 0.0);
@@ -68,8 +71,24 @@ bool HighsMipWorker::addIncumbent(const std::vector<double>& sol, double solobj,
             mipsolver_.options_mip_->mip_rel_gap);
       }
     }
-    // Can't repair solutions locally, so also buffer infeasible ones
-    solutions_.emplace_back(sol, solobj, solution_source);
+    // The master remains the only authority that can admit an incumbent.
+    // Preserve every locally interesting candidate in a bounded, worker-owned
+    // mailbox until the deterministic synchronization point.
+    HighsWorkerCandidate candidate;
+    candidate.solution = sol;
+    candidate.native_objective = solobj;
+    candidate.solution_source = solution_source;
+    candidate.metadata.worker_id = worker_id_;
+    candidate.metadata.discovery_node =
+        mipdata_.num_nodes + (search_ptr_ ? search_ptr_->nnodes : 0);
+    candidate.metadata.discovery_lp_iterations =
+        mipdata_.total_lp_iterations +
+        (search_ptr_ ? search_ptr_->lpiterations : 0);
+    candidate.metadata.work_epoch = work_epoch_;
+    candidate.metadata.publication_sequence = publication_sequence_++;
+    candidate.metadata.discovery_time = mipsolver_.timer_.read();
+    candidate.metadata.publication_time = candidate.metadata.discovery_time;
+    if (!incumbent_mailbox_.publish(std::move(candidate))) return false;
   }
   return true;
 }

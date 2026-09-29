@@ -54,14 +54,17 @@ const char* HighsPrimalHeuristics::subMipMethodName(HighsSubMipOrigin origin) {
 }
 
 void HighsPrimalHeuristics::configureSubMipOptions(
-    HighsOptions& options, HighsSubMipOrigin origin) {
-  if (origin != HighsSubMipOrigin::kRootReducedCost &&
-      origin != HighsSubMipOrigin::kRootRens)
-    return;
-
+    HighsOptions& options, HighsSubMipOrigin /*origin*/) {
+  // Every neighborhood helper is terminal. A helper may use cheap local
+  // repair, but it must never launch another sub-MIP or a parallel portfolio.
   options.mip_heuristic_run_rens = false;
   options.mip_heuristic_run_rins = false;
   options.mip_heuristic_run_root_reduced_cost = false;
+  options.mip_incumbent_exchange = "off";
+  options.parallel = kHighsOffString;
+  options.threads = 1;
+  options.mip_detect_symmetry = false;
+  options.mip_heuristic_effort = 0.05;
 }
 
 double HighsPrimalHeuristics::remainingHeuristicTime(double started,
@@ -138,6 +141,15 @@ bool HighsPrimalHeuristics::solveSubMip(
     HighsInt stallnodes, HighsSubMipOrigin origin, double max_time,
     const HighsSubMipCallBudget* call_budget,
     HighsPrimalHeuristicOutcome* outcome) {
+  if (!subMipLaunchAllowed(mipsolver.submip, mipsolver.submip_level)) {
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kError,
+        "Nested heuristic sub-MIP rejected at recursion depth %lld\n",
+        static_cast<long long>(mipsolver.submip_level));
+    worker.setHeurTerminationStatus(HighsModelStatus::kSolveError);
+    if (outcome != nullptr) *outcome = HighsPrimalHeuristicOutcome{};
+    return false;
+  }
   if (outcome != nullptr) {
     *outcome = HighsPrimalHeuristicOutcome{};
     outcome->started = true;
@@ -230,8 +242,6 @@ bool HighsPrimalHeuristics::solveSubMip(
     submipoptions.presolve = kHighsOffString;
   else
     submipoptions.presolve = kHighsOnString;
-  submipoptions.mip_detect_symmetry = false;
-  submipoptions.mip_heuristic_effort = 0.8;
   configureSubMipOptions(submipoptions, origin);
   // setup solver and run it
 

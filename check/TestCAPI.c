@@ -152,6 +152,31 @@ static void userCallback(const int callback_type, const char* message,
                                   data_out->mip_dual_bound);
     checkGetCallbackDataOutDouble(data_out, kHighsCallbackDataOutMipGapName,
                                   data_out->mip_gap);
+    checkGetCallbackDataOutHighsInt(
+        data_out, kHighsCallbackDataOutMipSolutionWorkerIdName,
+        data_out->mip_solution_worker_id);
+    checkGetCallbackDataOutInt64(
+        data_out, kHighsCallbackDataOutMipSolutionDiscoveryNodeName,
+        data_out->mip_solution_discovery_node);
+    checkGetCallbackDataOutInt64(
+        data_out,
+        kHighsCallbackDataOutMipSolutionDiscoveryLpIterationsName,
+        data_out->mip_solution_discovery_lp_iterations);
+    checkGetCallbackDataOutInt64(
+        data_out, kHighsCallbackDataOutMipSolutionWorkEpochName,
+        data_out->mip_solution_work_epoch);
+    checkGetCallbackDataOutInt64(
+        data_out, kHighsCallbackDataOutMipSolutionWorkerSequenceName,
+        data_out->mip_solution_worker_sequence);
+    checkGetCallbackDataOutDouble(
+        data_out, kHighsCallbackDataOutMipSolutionDiscoveryTimeName,
+        data_out->mip_solution_discovery_time);
+    checkGetCallbackDataOutDouble(
+        data_out, kHighsCallbackDataOutMipSolutionPublicationTimeName,
+        data_out->mip_solution_publication_time);
+    checkGetCallbackDataOutDouble(
+        data_out, kHighsCallbackDataOutMipSolutionAdmissionTimeName,
+        data_out->mip_solution_admission_time);
     // Cutpool data structure is not assigned, so num_col, num_cut and
     // num_nz are unassigned
     //    checkGetCallbackDataOutHighsInt(data_out,

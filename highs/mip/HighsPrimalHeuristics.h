@@ -58,12 +58,16 @@ class HighsPrimalHeuristics {
 
   static const char* subMipParentPhaseName(HighsSubMipOrigin origin);
 
-  // Bounded root helpers are terminal neighbourhood searches. Allowing them
-  // to launch RENS/RINS/reduced-cost sub-MIPs recursively defeats the root
-  // controller's work budget and delays entry into the main tree. Preserve
-  // the existing tree-heuristic behavior outside this reviewed boundary.
+  // Every helper is a terminal neighbourhood search. Allowing it to launch
+  // RENS/RINS/reduced-cost sub-MIPs recursively defeats the parent's work
+  // budget and can indefinitely delay the proof search.
   static void configureSubMipOptions(HighsOptions& options,
                                      HighsSubMipOrigin origin);
+
+  static bool subMipLaunchAllowed(bool parent_is_submip,
+                                  HighsInt parent_submip_level) {
+    return !parent_is_submip && parent_submip_level == 0;
+  }
 
   // Return the remaining wall-clock allowance for one complete heuristic
   // call. The same deadline is shared by preprocessing, retries, and the

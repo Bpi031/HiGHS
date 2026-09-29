@@ -5,8 +5,10 @@
 #include "Highs.h"
 #include "catch.hpp"
 #include "lp_data/HighsOptions.h"
+#include "mip/HighsIncumbentMailbox.h"
 #include "mip/HighsPrimalHeuristics.h"
 #include "mip/HighsRootWork.h"
+#include "parallel/HighsHardwareTopology.h"
 
 TEST_CASE("sub-MIP provenance names are exact", "[highs_incumbent]") {
   REQUIRE(std::string(HighsPrimalHeuristics::subMipMethodName(
@@ -36,19 +38,129 @@ TEST_CASE("bounded root helper sub-MIPs cannot recurse",
   REQUIRE_FALSE(options.mip_heuristic_run_root_reduced_cost);
 }
 
-TEST_CASE("tree heuristic sub-MIPs preserve the native portfolio",
+TEST_CASE("tree heuristic sub-MIPs are terminal and single threaded",
           "[highs_incumbent]") {
   HighsOptions options;
   options.mip_heuristic_run_rens = true;
   options.mip_heuristic_run_rins = true;
   options.mip_heuristic_run_root_reduced_cost = true;
+  options.parallel = kHighsOnString;
+  options.threads = 4;
+  options.mip_detect_symmetry = true;
+  options.mip_heuristic_effort = 0.8;
 
   HighsPrimalHeuristics::configureSubMipOptions(
       options, HighsSubMipOrigin::kTreeRins);
 
-  REQUIRE(options.mip_heuristic_run_rens);
-  REQUIRE(options.mip_heuristic_run_rins);
-  REQUIRE(options.mip_heuristic_run_root_reduced_cost);
+  REQUIRE_FALSE(options.mip_heuristic_run_rens);
+  REQUIRE_FALSE(options.mip_heuristic_run_rins);
+  REQUIRE_FALSE(options.mip_heuristic_run_root_reduced_cost);
+  REQUIRE(options.parallel == kHighsOffString);
+  REQUIRE(options.threads == 1);
+  REQUIRE_FALSE(options.mip_detect_symmetry);
+  REQUIRE(options.mip_heuristic_effort == 0.05);
+}
+
+TEST_CASE("nested heuristic sub-MIP launch is rejected",
+          "[highs_incumbent]") {
+  REQUIRE(HighsPrimalHeuristics::subMipLaunchAllowed(false, 0));
+  REQUIRE_FALSE(HighsPrimalHeuristics::subMipLaunchAllowed(true, 1));
+  REQUIRE_FALSE(HighsPrimalHeuristics::subMipLaunchAllowed(false, 1));
+}
+
+TEST_CASE("incumbent mailbox is bounded and preserves publication order",
+          "[highs_incumbent]") {
+  HighsIncumbentMailbox mailbox;
+  for (size_t i = 0; i != HighsIncumbentMailbox::kCapacity; ++i) {
+    HighsWorkerCandidate candidate;
+    candidate.native_objective = static_cast<double>(i);
+    candidate.metadata.publication_sequence = static_cast<int64_t>(i);
+    REQUIRE(mailbox.publish(std::move(candidate)));
+  }
+  HighsWorkerCandidate overflow;
+  REQUIRE_FALSE(mailbox.publish(std::move(overflow)));
+  REQUIRE(mailbox.overflowed());
+
+  std::vector<HighsWorkerCandidate> drained = mailbox.drain();
+  REQUIRE(drained.size() == HighsIncumbentMailbox::kCapacity);
+  for (size_t i = 0; i != drained.size(); ++i)
+    REQUIRE(drained[i].metadata.publication_sequence ==
+            static_cast<int64_t>(i));
+  REQUIRE(mailbox.size() == 0);
+}
+
+TEST_CASE("topology-aware worker allocation is conservative",
+          "[highs_incumbent]") {
+  HighsHardwareTopology server;
+  server.logical_cpus = 16;
+  server.physical_cores = 8;
+  server.numa_nodes = 1;
+  server.last_level_cache_domains = 1;
+  server.complete = true;
+  REQUIRE(highsTopologyAwareWorkerCount(12, server) == 8);
+
+  HighsHardwareTopology heterogeneous = server;
+  heterogeneous.logical_cpus = 10;
+  heterogeneous.physical_cores = 10;
+  heterogeneous.performance_cores = 4;
+  heterogeneous.heterogeneous_core_classes = 2;
+  REQUIRE(highsTopologyAwareWorkerCount(8, heterogeneous) == 4);
+
+  HighsHardwareTopology unknown;
+  REQUIRE(highsTopologyAwareWorkerCount(8, unknown) == 1);
+  REQUIRE(highsTopologyAwareWorkerCount(1, server) == 1);
+
+  const HighsHardwareTopology runtime = highsDetectHardwareTopology();
+  REQUIRE(runtime.logical_cpus >= 1);
+  REQUIRE(highsTopologyAwareWorkerCount(4, runtime) >= 1);
+  REQUIRE(highsTopologyAwareWorkerCount(4, runtime) <= 4);
+}
+
+TEST_CASE("deterministic incumbent epochs repeat at fixed work",
+          "[highs_incumbent]") {
+  const std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/rgn.mps";
+
+  struct Evidence {
+    HighsModelStatus status;
+    double objective;
+    int64_t nodes;
+    HighsInt simplex_iterations;
+    std::vector<double> solution;
+  };
+
+  auto solve = [&]() {
+    Highs highs;
+    REQUIRE(highs.setOptionValue("output_flag", false) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("parallel", kHighsOnString) ==
+            HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("threads", 2) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("random_seed", 42) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_rel_gap", 0.0) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_abs_gap", 0.0) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_max_nodes", 25) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_incumbent_exchange", "deterministic") ==
+            HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("mip_incumbent_epoch_nodes", 4) ==
+            HighsStatus::kOk);
+    REQUIRE(highs.readModel(filename) == HighsStatus::kOk);
+    REQUIRE(highs.run() != HighsStatus::kError);
+    const HighsInfo& info = highs.getInfo();
+    Evidence evidence{highs.getModelStatus(),
+                      info.objective_function_value, info.mip_node_count,
+                      info.simplex_iteration_count,
+                      highs.getSolution().col_value};
+    highs.resetGlobalScheduler(true);
+    return evidence;
+  };
+
+  const Evidence first = solve();
+  const Evidence second = solve();
+  REQUIRE(first.status == second.status);
+  REQUIRE(first.objective == second.objective);
+  REQUIRE(first.nodes == second.nodes);
+  REQUIRE(first.simplex_iterations == second.simplex_iterations);
+  REQUIRE(first.solution == second.solution);
 }
 
 TEST_CASE("heuristic retries share one deadline", "[highs_incumbent]") {

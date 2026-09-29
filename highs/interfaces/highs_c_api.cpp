@@ -1656,6 +1656,31 @@ const void* Highs_getCallbackDataOutItem(const HighsCallbackDataOut* data_out,
   } else if (!strcmp(item_name,
                      kHighsCallbackDataOutMipSolutionSequenceName)) {
     return (void*)(&data_out->mip_solution_sequence);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionWorkerIdName)) {
+    return (void*)(&data_out->mip_solution_worker_id);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionDiscoveryNodeName)) {
+    return (void*)(&data_out->mip_solution_discovery_node);
+  } else if (!strcmp(
+                 item_name,
+                 kHighsCallbackDataOutMipSolutionDiscoveryLpIterationsName)) {
+    return (void*)(&data_out->mip_solution_discovery_lp_iterations);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionWorkEpochName)) {
+    return (void*)(&data_out->mip_solution_work_epoch);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionWorkerSequenceName)) {
+    return (void*)(&data_out->mip_solution_worker_sequence);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionDiscoveryTimeName)) {
+    return (void*)(&data_out->mip_solution_discovery_time);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionPublicationTimeName)) {
+    return (void*)(&data_out->mip_solution_publication_time);
+  } else if (!strcmp(item_name,
+                     kHighsCallbackDataOutMipSolutionAdmissionTimeName)) {
+    return (void*)(&data_out->mip_solution_admission_time);
   } else if (!strcmp(item_name, kHighsCallbackDataOutCutpoolNumColName)) {
     return (void*)(&data_out->cutpool_num_col);
   } else if (!strcmp(item_name, kHighsCallbackDataOutCutpoolNumCutName)) {

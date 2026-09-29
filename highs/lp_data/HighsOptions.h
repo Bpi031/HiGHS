@@ -508,6 +508,8 @@ struct HighsOptionsStruct {
   double mip_root_work_max_heuristic_time;
   double mip_root_work_max_single_helper_time;
   double mip_root_work_tree_reserve_time;
+  std::string mip_incumbent_exchange;
+  HighsInt mip_incumbent_epoch_nodes;
   std::string mip_primal_heuristic_schedule;
   HighsInt mip_rins_max_calls;
   HighsInt mip_rins_max_nodes;
@@ -706,6 +708,8 @@ struct HighsOptionsStruct {
         mip_root_work_max_heuristic_time(-1.0),
         mip_root_work_max_single_helper_time(-1.0),
         mip_root_work_tree_reserve_time(-1.0),
+        mip_incumbent_exchange("off"),
+        mip_incumbent_epoch_nodes(64),
         mip_primal_heuristic_schedule("off"),
         mip_rins_max_calls(-1),
         mip_rins_max_nodes(-1),
@@ -1341,6 +1345,18 @@ class HighsOptions : public HighsOptionsStruct {
         "work; -1 disables the reserve",
         advanced, &mip_root_work_tree_reserve_time, -1.0, -1.0, kHighsInf);
     records.push_back(record_double);
+
+    record_string = new OptionRecordString(
+        "mip_incumbent_exchange",
+        "Worker incumbent exchange: off, observe, or deterministic", advanced,
+        &mip_incumbent_exchange, "off");
+    records.push_back(record_string);
+
+    record_int = new OptionRecordInt(
+        "mip_incumbent_epoch_nodes",
+        "Maximum nodes per worker before deterministic incumbent admission",
+        advanced, &mip_incumbent_epoch_nodes, 1, 64, 4096);
+    records.push_back(record_int);
 
     record_string = new OptionRecordString(
         "mip_primal_heuristic_schedule",

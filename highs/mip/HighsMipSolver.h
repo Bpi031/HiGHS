@@ -11,6 +11,7 @@
 #include "Highs.h"
 #include "lp_data/HighsCallback.h"
 #include "lp_data/HighsOptions.h"
+#include "parallel/HighsHardwareTopology.h"
 #include "parallel/HighsParallel.h"
 
 struct HighsMipSolverData;
@@ -159,11 +160,16 @@ class HighsMipSolver {
   }
   void setParallelLock(bool lock) const;
   void setProfiling(HighsProfiling* profiling);
+  bool deterministicIncumbentExchange() const {
+    return options_mip_->mip_incumbent_exchange == "deterministic";
+  }
   HighsInt getMaxNumWorkers() const {
     if (highs::parallel::num_threads() == 1 ||
         options_mip_->parallel != kHighsOnString || submip) {
       return 1;
     }
+    if (deterministicIncumbentExchange())
+      return highsTopologyAwareWorkerCount(highs::parallel::num_threads());
     return static_cast<HighsInt>(
         std::ceil(1.7 * highs::parallel::num_threads()));
   }

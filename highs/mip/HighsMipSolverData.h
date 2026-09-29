@@ -210,7 +210,8 @@ struct HighsMipSolverData {
   void setupDomainPropagation();
   void saveReportMipSolution(
       const double new_upper_limit = -kHighsInf,
-      const int solution_source = kSolutionSourceNone);
+      const int solution_source = kSolutionSourceNone,
+      const HighsWorkerCandidateMetadata* candidate_metadata = nullptr);
   void runSetup();
   double transformNewIntegerFeasibleSolution(
       const std::vector<double>& sol,
@@ -231,7 +232,9 @@ struct HighsMipSolverData {
   bool addIncumbent(const std::vector<double>& sol, double solobj,
                     const int solution_source,
                     const bool print_display_line = true,
-                    const bool is_user_solution = false);
+                    const bool is_user_solution = false,
+                    const HighsWorkerCandidateMetadata* candidate_metadata =
+                        nullptr);
 
   const std::vector<double>& getSolution() const;
 

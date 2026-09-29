@@ -49,6 +49,14 @@ struct HighsCallbackOutput {
   std::vector<double> mip_solution;
   HighsInt mip_solution_source;
   int64_t mip_solution_sequence;
+  HighsInt mip_solution_worker_id;
+  int64_t mip_solution_discovery_node;
+  int64_t mip_solution_discovery_lp_iterations;
+  int64_t mip_solution_work_epoch;
+  int64_t mip_solution_worker_sequence;
+  double mip_solution_discovery_time;
+  double mip_solution_publication_time;
+  double mip_solution_admission_time;
   HighsInt cutpool_num_col;
   HighsInt cutpool_num_cut;
   std::vector<HighsInt> cutpool_start;

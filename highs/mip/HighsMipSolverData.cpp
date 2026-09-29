@@ -1614,7 +1614,9 @@ const std::vector<double>& HighsMipSolverData::getSolution() const {
 bool HighsMipSolverData::addIncumbent(const std::vector<double>& sol,
                                       double solobj, const int solution_source,
                                       const bool print_display_line,
-                                      const bool is_user_solution) {
+                                      const bool is_user_solution,
+                                      const HighsWorkerCandidateMetadata*
+                                          candidate_metadata) {
   assert(!parallelLockActive());
   const bool execute_mip_solution_callback =
       !is_user_solution && !mipsolver.submip &&
@@ -1675,7 +1677,8 @@ bool HighsMipSolverData::addIncumbent(const std::vector<double>& sol,
     double new_upper_limit = computeNewUpperLimit(solobj, 0.0, 0.0);
 
     if (!is_user_solution && !mipsolver.submip)
-      saveReportMipSolution(new_upper_limit, solution_source);
+      saveReportMipSolution(new_upper_limit, solution_source,
+                            candidate_metadata);
     if (new_upper_limit < upper_limit) {
       ++numImprovingSols;
       upper_limit = new_upper_limit;
@@ -3177,12 +3180,32 @@ void HighsMipSolverData::setupDomainPropagation() {
 }
 
 void HighsMipSolverData::saveReportMipSolution(const double new_upper_limit,
-                                               const int solution_source) {
+                                               const int solution_source,
+                                               const HighsWorkerCandidateMetadata*
+                                                   candidate_metadata) {
   const bool non_improving = new_upper_limit >= upper_limit;
   if (mipsolver.submip) return;
   if (non_improving) return;
 
   const int64_t callback_sequence = incumbent_callback_sequence++;
+  const double admission_time = mipsolver.timer_.read();
+  if (candidate_metadata != nullptr) {
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Incumbent-Exchange: schema=rost/highs-incumbent-exchange/v1 "
+        "event=admit worker=%" HIGHSINT_FORMAT
+        " epoch=%lld worker_sequence=%lld discovery_node=%lld "
+        "discovery_lp_iterations=%lld discovery_time=%.17g "
+        "publication_time=%.17g admission_time=%.17g lag=%.17g\n",
+        candidate_metadata->worker_id,
+        static_cast<long long>(candidate_metadata->work_epoch),
+        static_cast<long long>(candidate_metadata->publication_sequence),
+        static_cast<long long>(candidate_metadata->discovery_node),
+        static_cast<long long>(candidate_metadata->discovery_lp_iterations),
+        candidate_metadata->discovery_time,
+        candidate_metadata->publication_time, admission_time,
+        admission_time - candidate_metadata->discovery_time);
+  }
 
   if (mipsolver.callback_->user_callback) {
     if (mipsolver.callback_->active[kCallbackMipImprovingSolution]) {
@@ -3190,6 +3213,24 @@ void HighsMipSolverData::saveReportMipSolution(const double new_upper_limit,
       mipsolver.callback_->data_out.mip_solution = mipsolver.solution_;
       mipsolver.callback_->data_out.mip_solution_source = solution_source;
       mipsolver.callback_->data_out.mip_solution_sequence = callback_sequence;
+      if (candidate_metadata != nullptr) {
+        mipsolver.callback_->data_out.mip_solution_worker_id =
+            candidate_metadata->worker_id;
+        mipsolver.callback_->data_out.mip_solution_discovery_node =
+            candidate_metadata->discovery_node;
+        mipsolver.callback_->data_out.mip_solution_discovery_lp_iterations =
+            candidate_metadata->discovery_lp_iterations;
+        mipsolver.callback_->data_out.mip_solution_work_epoch =
+            candidate_metadata->work_epoch;
+        mipsolver.callback_->data_out.mip_solution_worker_sequence =
+            candidate_metadata->publication_sequence;
+        mipsolver.callback_->data_out.mip_solution_discovery_time =
+            candidate_metadata->discovery_time;
+        mipsolver.callback_->data_out.mip_solution_publication_time =
+            candidate_metadata->publication_time;
+      }
+      mipsolver.callback_->data_out.mip_solution_admission_time =
+          admission_time;
       const bool interrupt = interruptFromCallbackWithData(
           kCallbackMipImprovingSolution, mipsolver.solution_objective_,
           "Improving solution");

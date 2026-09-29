@@ -8,9 +8,12 @@
 #ifndef HIGHS_MIP_WORKER_H_
 #define HIGHS_MIP_WORKER_H_
 
+#include <cassert>
+
 #include "mip/HighsConflictPool.h"
 #include "mip/HighsCutPool.h"
 #include "mip/HighsImplications.h"
+#include "mip/HighsIncumbentMailbox.h"
 #include "mip/HighsLpRelaxation.h"
 #include "mip/HighsMipSolver.h"
 #include "mip/HighsNodeQueue.h"
@@ -66,6 +69,9 @@ class HighsMipWorker {
   bool heuristics_allowed;
   HeurStatistics heur_stats;
   SepaStatistics sepa_stats;
+  HighsInt worker_id_;
+  int64_t work_epoch_ = -1;
+  int64_t publication_sequence_ = 0;
 
  public:
   std::unique_ptr<HighsSearch> search_ptr_;
@@ -76,7 +82,7 @@ class HighsMipWorker {
   double upper_limit;
   double optimality_limit;
 
-  std::vector<std::tuple<std::vector<double>, double, int>> solutions_;
+  HighsIncumbentMailbox incumbent_mailbox_;
 
   HighsRandom randgen;
 
@@ -84,7 +90,8 @@ class HighsMipWorker {
 
   HighsMipWorker(const HighsMipSolver& mipsolver, HighsLpRelaxation* lp,
                  HighsDomain* domain, HighsCutPool* cutpool,
-                 HighsConflictPool* conflictpool, HighsPseudocost* pseudocost);
+                 HighsConflictPool* conflictpool, HighsPseudocost* pseudocost,
+                 HighsInt worker_id);
 
   ~HighsMipWorker() {
     search_ptr_.reset();
@@ -119,6 +126,10 @@ class HighsMipWorker {
 
   bool addIncumbent(const std::vector<double>& sol, double solobj,
                     int solution_source);
+
+  HighsInt workerId() const { return worker_id_; }
+  int64_t workEpoch() const { return work_epoch_; }
+  void setWorkEpoch(int64_t work_epoch) { work_epoch_ = work_epoch; }
 
   std::pair<bool, double> transformNewIntegerFeasibleSolution(
       const std::vector<double>& sol) const;

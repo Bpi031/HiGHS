@@ -32,6 +32,14 @@ void HighsCallback::clearHighsCallbackOutput() {
   this->data_out.mip_solution.clear();
   this->data_out.mip_solution_source = -1;
   this->data_out.mip_solution_sequence = -1;
+  this->data_out.mip_solution_worker_id = -1;
+  this->data_out.mip_solution_discovery_node = -1;
+  this->data_out.mip_solution_discovery_lp_iterations = -1;
+  this->data_out.mip_solution_work_epoch = -1;
+  this->data_out.mip_solution_worker_sequence = -1;
+  this->data_out.mip_solution_discovery_time = -1.0;
+  this->data_out.mip_solution_publication_time = -1.0;
+  this->data_out.mip_solution_admission_time = -1.0;
   this->data_out.cutpool_start.clear();
   this->data_out.cutpool_index.clear();
   this->data_out.cutpool_value.clear();
@@ -118,6 +126,15 @@ HighsCallbackOutput::operator HighsCallbackDataOut() const {
       mip_solution.empty() ? nullptr : const_cast<double*>(mip_solution.data());
   data.mip_solution_source = mip_solution_source;
   data.mip_solution_sequence = mip_solution_sequence;
+  data.mip_solution_worker_id = mip_solution_worker_id;
+  data.mip_solution_discovery_node = mip_solution_discovery_node;
+  data.mip_solution_discovery_lp_iterations =
+      mip_solution_discovery_lp_iterations;
+  data.mip_solution_work_epoch = mip_solution_work_epoch;
+  data.mip_solution_worker_sequence = mip_solution_worker_sequence;
+  data.mip_solution_discovery_time = mip_solution_discovery_time;
+  data.mip_solution_publication_time = mip_solution_publication_time;
+  data.mip_solution_admission_time = mip_solution_admission_time;
 
   data.cutpool_num_col = cutpool_num_col;
   data.cutpool_num_cut = cutpool_lower.size();

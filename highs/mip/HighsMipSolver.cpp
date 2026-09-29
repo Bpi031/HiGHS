@@ -117,6 +117,15 @@ void HighsMipSolver::runTask(F&& f, highs::parallel::TaskGroup& tg,
 
 void HighsMipSolver::run() {
   modelstatus_ = HighsModelStatus::kNotset;
+  if (options_mip_->mip_incumbent_exchange != "off" &&
+      options_mip_->mip_incumbent_exchange != "observe" &&
+      options_mip_->mip_incumbent_exchange != "deterministic") {
+    highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                 "Unknown mip_incumbent_exchange '%s'\n",
+                 options_mip_->mip_incumbent_exchange.c_str());
+    modelstatus_ = HighsModelStatus::kModelError;
+    return;
+  }
   max_submip_level = std::max(submip_level, max_submip_level);
   // Start the timer local to HighsMipSolver - independent of the
   // timer passed from Highs as a pointer that's used in
@@ -191,7 +200,7 @@ void HighsMipSolver::run() {
   mipdata_->workers.emplace_back(
       *this, &mipdata_->getLp(), &mipdata_->getDomain(),
       &mipdata_->getCutPool(), &mipdata_->getConflictPool(),
-      &mipdata_->getPseudoCost());
+      &mipdata_->getPseudoCost(), 0);
 
   HighsMipWorker& master_worker = mipdata_->workers[0];
 
@@ -267,6 +276,22 @@ restart:
   mipdata_->printDisplayLine();
 
   const HighsInt max_num_workers = getMaxNumWorkers();
+  if (deterministicIncumbentExchange() && !submip) {
+    const HighsHardwareTopology topology = highsDetectHardwareTopology();
+    highsLogUser(
+        options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Incumbent-Exchange: schema=rost/highs-incumbent-exchange/v1 "
+        "mode=deterministic configured_threads=%" HIGHSINT_FORMAT
+        " workers=%" HIGHSINT_FORMAT " epoch_nodes=%" HIGHSINT_FORMAT
+        " logical_cpus=%" HIGHSINT_FORMAT " physical_cores=%" HIGHSINT_FORMAT
+        " performance_cores=%" HIGHSINT_FORMAT " numa_nodes=%" HIGHSINT_FORMAT
+        " llc_domains=%" HIGHSINT_FORMAT " topology_complete=%d\n",
+        highs::parallel::num_threads(), max_num_workers,
+        options_mip_->mip_incumbent_epoch_nodes, topology.logical_cpus,
+        topology.physical_cores, topology.performance_cores,
+        topology.numa_nodes, topology.last_level_cache_domains,
+        topology.complete ? 1 : 0);
+  }
   HighsInt num_workers = 1;
   highs::parallel::TaskGroup tg;
 
@@ -319,7 +344,7 @@ restart:
       mipdata_->workers.emplace_back(
           *this, &mipdata_->lps.back(), &mipdata_->domains.back(),
           &mipdata_->cutpools.back(), &mipdata_->conflictpools.back(),
-          &mipdata_->pseudocosts.back());
+          &mipdata_->pseudocosts.back(), mipdata_->workers.size());
       mipdata_->lps.back().setMipWorker(mipdata_->workers.back());
       mipdata_->lps.back().notifyCutPoolsLpCopied(1);
       mipdata_->workers.back().randgen.initialise(options_mip_->random_seed +
@@ -355,15 +380,52 @@ restart:
     worker.nodequeue.setNumCol(numCol());
   };
 
-  auto syncSolutions = [&]() -> void {
+  auto syncSolutions = [&]() -> bool {
     // Note: Upper bound / limit of workers updated via addIncumbent
+    std::vector<HighsWorkerCandidate> candidates;
+    bool mailbox_overflow = false;
     for (HighsMipWorker& worker : mipdata_->workers) {
-      for (auto& sol : worker.solutions_) {
-        mipdata_->addIncumbent(std::get<0>(sol), std::get<1>(sol),
-                               std::get<2>(sol));
+      if (worker.incumbent_mailbox_.overflowed()) {
+        highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                     "Incumbent mailbox overflow on worker %" HIGHSINT_FORMAT
+                     "; terminating without a trusted result\n",
+                     worker.workerId());
+        mailbox_overflow = true;
       }
-      worker.solutions_.clear();
     }
+    if (mailbox_overflow) {
+      modelstatus_ = HighsModelStatus::kSolveError;
+      mipdata_->nodequeue.clear();
+      for (HighsMipWorker& worker : mipdata_->workers) {
+        worker.incumbent_mailbox_.drain();
+        worker.incumbent_mailbox_.clearOverflow();
+      }
+      return false;
+    }
+    for (HighsMipWorker& worker : mipdata_->workers) {
+      std::vector<HighsWorkerCandidate> worker_candidates =
+          worker.incumbent_mailbox_.drain();
+      candidates.insert(candidates.end(),
+                        std::make_move_iterator(worker_candidates.begin()),
+                        std::make_move_iterator(worker_candidates.end()));
+      worker.incumbent_mailbox_.clearOverflow();
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const HighsWorkerCandidate& left,
+                        const HighsWorkerCandidate& right) {
+                       return std::tie(left.metadata.work_epoch,
+                                       left.metadata.worker_id,
+                                       left.metadata.publication_sequence) <
+                              std::tie(right.metadata.work_epoch,
+                                       right.metadata.worker_id,
+                                       right.metadata.publication_sequence);
+                     });
+    for (HighsWorkerCandidate& candidate : candidates) {
+      mipdata_->addIncumbent(candidate.solution, candidate.native_objective,
+                             candidate.solution_source, true, false,
+                             &candidate.metadata);
+    }
+    return true;
   };
 
   auto syncPools = [&](std::vector<HighsInt>& indices) -> void {
@@ -954,7 +1016,9 @@ restart:
       worker.getLpRelaxation().setIterationLimit(iterlimit);
       bool considerHeuristics = true;
       while (true) {
-        if (considerHeuristics && (skip_separation || nodeLim == kHighsIInf) &&
+        if (considerHeuristics &&
+            (skip_separation || nodeLim == kHighsIInf ||
+             deterministicIncumbentExchange()) &&
             worker.getAllowHeuristics() && mipdata_->moreHeuristicsAllowed()) {
           if (runHeuristics(i)) break;
         }
@@ -999,6 +1063,7 @@ restart:
                                               RestartVote::kNoCheck);
   bool root_node = true;  // Don't separate the root node again
   HighsInt nodeLim = max_num_workers > 1 ? 1 : kHighsIInf;  // for ramp up
+  int64_t work_epoch = 0;
   while (!mipdata_->nodequeue.empty()) {
     // Possibly query existence of an external solution
     if (!submip)
@@ -1028,10 +1093,17 @@ restart:
       if (num_workers >= max_num_workers) {
         nodeLim = std::max(HighsInt{20}, 2 * nodeLim);
       }
-      if (nodeLim > 100) {
+      if (deterministicIncumbentExchange()) {
+        nodeLim = std::min(nodeLim,
+                           options_mip_->mip_incumbent_epoch_nodes);
+      } else if (nodeLim > 100) {
         nodeLim = kHighsIInf;
       }
     }
+
+    for (HighsInt i : search_indices)
+      mipdata_->workers[i].setWorkEpoch(work_epoch);
+    ++work_epoch;
 
     // Process nodes (separation / heuristics / dives)
     processNodes(search_indices, workerRestartVotes, root_node, nodeLim, 100,
@@ -1071,7 +1143,7 @@ restart:
     mipdata_->updateLowerBound(std::min(
         mipdata_->upper_bound, mipdata_->nodequeue.getBestLowerBound()));
 
-    syncSolutions();
+    if (!syncSolutions()) break;
 
     limit_reached = mipdata_->checkLimits();
     if (limit_reached) {
@@ -1112,7 +1184,8 @@ restart:
                               mipdata_->nodequeue.numNodes() > num_workers;
     resetGlobalDomain(spawn_more_workers, mipdata_->hasMultipleWorkers());
 
-    if (nodeLim == kHighsIInf && checkWorkerRestartVotes(workerRestartVotes))
+    if ((nodeLim == kHighsIInf || deterministicIncumbentExchange()) &&
+        checkWorkerRestartVotes(workerRestartVotes))
       goto restart;
 
     if (spawn_more_workers) {
@@ -1127,7 +1200,7 @@ restart:
       num_workers = new_max_num_workers;
     }
   }
-  syncSolutions();
+  if (modelstatus_ != HighsModelStatus::kSolveError) syncSolutions();
   profiling_->stop(kMipClockSearch);
 
   cleanupSolve();
@@ -1135,7 +1208,7 @@ restart:
 
 void HighsMipSolver::cleanupSolve() {
   for (HighsMipWorker& worker : mipdata_->workers) {
-    assert(worker.solutions_.empty());
+    assert(worker.incumbent_mailbox_.size() == 0);
   }
   if (mipdata_->terminatorActive()) {
     if (mipdata_->terminatorTerminated()) {

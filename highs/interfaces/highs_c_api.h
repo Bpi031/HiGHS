@@ -131,6 +131,23 @@ static const char* const kHighsCallbackDataOutMipSolutionSourceName =
     "mip_solution_source";
 static const char* const kHighsCallbackDataOutMipSolutionSequenceName =
     "mip_solution_sequence";
+static const char* const kHighsCallbackDataOutMipSolutionWorkerIdName =
+    "mip_solution_worker_id";
+static const char* const kHighsCallbackDataOutMipSolutionDiscoveryNodeName =
+    "mip_solution_discovery_node";
+static const char* const
+    kHighsCallbackDataOutMipSolutionDiscoveryLpIterationsName =
+        "mip_solution_discovery_lp_iterations";
+static const char* const kHighsCallbackDataOutMipSolutionWorkEpochName =
+    "mip_solution_work_epoch";
+static const char* const kHighsCallbackDataOutMipSolutionWorkerSequenceName =
+    "mip_solution_worker_sequence";
+static const char* const kHighsCallbackDataOutMipSolutionDiscoveryTimeName =
+    "mip_solution_discovery_time";
+static const char* const kHighsCallbackDataOutMipSolutionPublicationTimeName =
+    "mip_solution_publication_time";
+static const char* const kHighsCallbackDataOutMipSolutionAdmissionTimeName =
+    "mip_solution_admission_time";
 static const char* const kHighsCallbackDataOutCutpoolNumColName =
     "cutpool_num_col";
 static const char* const kHighsCallbackDataOutCutpoolNumCutName =
