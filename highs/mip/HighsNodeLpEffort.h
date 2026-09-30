@@ -26,6 +26,7 @@ struct HighsNodeLpEffortConfig {
 
 enum class HighsNodeLpEffortOutcome {
   kCompleted,
+  kLimitReached,
   kNumericalFailure,
 };
 
@@ -41,11 +42,13 @@ struct HighsNodeLpEffortObservation {
 
 struct HighsNodeLpEffortSummary {
   static constexpr size_t kHistogramBuckets = 32;
+  static constexpr size_t kDurationHistogramBuckets = 64;
 
   int64_t attempts = 0;
   int64_t completed = 0;
   int64_t yielded = 0;
   int64_t serial_completions = 0;
+  int64_t limit_stops = 0;
   int64_t numerical_failures = 0;
   int64_t total_iterations = 0;
   int64_t completed_iterations = 0;
@@ -58,7 +61,8 @@ struct HighsNodeLpEffortSummary {
   // work is right-censored evidence and is retained separately.
   std::array<int64_t, kHistogramBuckets> histogram{};
   std::array<int64_t, kHistogramBuckets> yielded_histogram{};
-  std::array<int64_t, kHistogramBuckets> task_lease_microseconds_histogram{};
+  std::array<int64_t, kDurationHistogramBuckets>
+      task_lease_microseconds_histogram{};
 };
 
 // Deterministic controller for limiting one node LP without changing the
@@ -84,6 +88,12 @@ class HighsNodeLpEffortController {
 
   HighsInt percentileIterations(double quantile, HighsInt depth = -1) const;
 
+  static double taskLeasePercentileUpperSeconds(
+      const std::array<int64_t,
+                       HighsNodeLpEffortSummary::kDurationHistogramBuckets>&
+          histogram,
+      double quantile);
+
  private:
   static constexpr size_t kDepthBuckets = 4;
   static constexpr size_t kRecentWindowSize = 256;
@@ -91,6 +101,8 @@ class HighsNodeLpEffortController {
 
   static size_t histogramBucket(HighsInt iterations);
   static HighsInt histogramUpperBound(size_t bucket);
+  static size_t durationHistogramBucket(uint64_t microseconds);
+  static double durationHistogramUpperSeconds(size_t bucket);
   static size_t depthBucket(HighsInt depth);
   void recordIterations(
       HighsInt iterations,

@@ -1252,6 +1252,7 @@ restart:
       aggregate.completed += summary.completed;
       aggregate.yielded += summary.yielded;
       aggregate.serial_completions += summary.serial_completions;
+      aggregate.limit_stops += summary.limit_stops;
       aggregate.numerical_failures += summary.numerical_failures;
       aggregate.total_iterations += summary.total_iterations;
       aggregate.completed_iterations += summary.completed_iterations;
@@ -1272,9 +1273,10 @@ restart:
         aggregate.task_lease_microseconds_histogram[i] +=
             summary.task_lease_microseconds_histogram[i];
     }
-    using EffortHistogram = std::array<
+    using IterationHistogram = std::array<
         int64_t, HighsNodeLpEffortSummary::kHistogramBuckets>;
-    auto percentile = [&](const EffortHistogram& histogram, double quantile) {
+    auto iteration_percentile = [&](const IterationHistogram& histogram,
+                                    double quantile) {
       int64_t samples = 0;
       for (int64_t count : histogram) samples += count;
       if (samples == 0) return HighsInt{0};
@@ -1291,18 +1293,16 @@ restart:
       return aggregate.maximum_iterations;
     };
     const double task_lease_p50_seconds =
-        static_cast<double>(percentile(
-            aggregate.task_lease_microseconds_histogram, 0.50)) /
-        1000000.0;
+        HighsNodeLpEffortController::taskLeasePercentileUpperSeconds(
+            aggregate.task_lease_microseconds_histogram, 0.50);
     const double task_lease_p95_seconds =
-        static_cast<double>(percentile(
-            aggregate.task_lease_microseconds_histogram, 0.95)) /
-        1000000.0;
+        HighsNodeLpEffortController::taskLeasePercentileUpperSeconds(
+            aggregate.task_lease_microseconds_histogram, 0.95);
     highsLogUser(
         options_mip_->log_options, HighsLogType::kInfo,
-        "MIP-NodeLpEffort: schema=rost/highs-node-lp-effort/v2 "
+        "MIP-NodeLpEffort: schema=rost/highs-node-lp-effort/v3 "
         "event=summary attempts=%lld completed=%lld yielded=%lld "
-        "serial_completions=%lld numerical_failures=%lld "
+        "serial_completions=%lld limit_stops=%lld numerical_failures=%lld "
         "lp_iterations=%lld completed_lp_iterations=%lld "
         "yielded_lp_iterations=%lld completed_p50=%" HIGHSINT_FORMAT
         " completed_p95=%" HIGHSINT_FORMAT
@@ -1310,19 +1310,21 @@ restart:
         " yielded_p95=%" HIGHSINT_FORMAT " max=%" HIGHSINT_FORMAT
         " task_leases=%lld task_lease_total=%.17g "
         "task_lease_p50=%.17g task_lease_p95=%.17g "
-        "task_lease_max=%.17g\n",
+        "task_lease_max=%.17g "
+        "task_lease_quantiles=histogram_upper_bounds\n",
         static_cast<long long>(aggregate.attempts),
         static_cast<long long>(aggregate.completed),
         static_cast<long long>(aggregate.yielded),
         static_cast<long long>(aggregate.serial_completions),
+        static_cast<long long>(aggregate.limit_stops),
         static_cast<long long>(aggregate.numerical_failures),
         static_cast<long long>(aggregate.total_iterations),
         static_cast<long long>(aggregate.completed_iterations),
         static_cast<long long>(aggregate.yielded_iterations),
-        percentile(aggregate.histogram, 0.50),
-        percentile(aggregate.histogram, 0.95),
-        percentile(aggregate.yielded_histogram, 0.50),
-        percentile(aggregate.yielded_histogram, 0.95),
+        iteration_percentile(aggregate.histogram, 0.50),
+        iteration_percentile(aggregate.histogram, 0.95),
+        iteration_percentile(aggregate.yielded_histogram, 0.50),
+        iteration_percentile(aggregate.yielded_histogram, 0.95),
         aggregate.maximum_iterations,
         static_cast<long long>(aggregate.task_leases),
         aggregate.task_lease_total_seconds, task_lease_p50_seconds,

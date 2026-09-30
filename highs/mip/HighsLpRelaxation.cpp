@@ -1104,11 +1104,13 @@ bool HighsLpRelaxation::computeDualInfProof(const HighsDomain& globaldomain,
   return true;
 }
 
-void HighsLpRelaxation::recoverBasis() {
-  if (basischeckpoint) {
-    lpsolver.setBasis(*basischeckpoint, "HighsLpRelaxation::recoverBasis");
-    currentbasisstored = true;
-  }
+bool HighsLpRelaxation::recoverBasis() {
+  if (!basischeckpoint) return false;
+  const HighsStatus status =
+      lpsolver.setBasis(*basischeckpoint, "HighsLpRelaxation::recoverBasis");
+  currentbasisstored = status == HighsStatus::kOk;
+  if (!currentbasisstored) basischeckpoint.reset();
+  return currentbasisstored;
 }
 
 void HighsLpRelaxation::setObjectiveLimit(double objlim) {

@@ -293,7 +293,7 @@ class HighsLpRelaxation {
     }
   }
 
-  void recoverBasis();
+  bool recoverBasis();
 
   void setObjectiveLimit(double objlim = kHighsInf);
 

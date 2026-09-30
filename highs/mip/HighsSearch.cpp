@@ -873,7 +873,7 @@ void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
   subrootsol.clear();
   depthoffset = node.depth - 1;
   if (node.basis &&
-      static_cast<HighsInt>(node.basis->row_status.size()) == lp->numRows()) {
+      resumableBasisMatches(*node.basis, lp->numRows(), lp->numCols())) {
     lp->setStoredBasis(std::move(node.basis));
     lp->recoverBasis();
   }
@@ -941,20 +941,25 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
              mipsolver.isColContinuous(i));
     }
 #endif
+    // Bounded node-LP effort is a tree-search control. Same-worker heuristic
+    // searches such as RINS and RENS require a completed relaxation and have
+    // separate budgets; their callers do not consume the tree-yield outcome.
+    const bool bounded_node_lp_effort = boundedNodeLpEffortApplies(
+        inheuristic, mipworker.nodeLpEffortEnabled());
     HighsInt effort_limit = kHighsIInf;
-    if (mipworker.nodeLpEffortEnabled()) {
+    if (bounded_node_lp_effort) {
       effort_limit = mipworker.nodeLpIterationLimit(getCurrentDepth(),
                                                     currnode.yield_count);
       lp->setIterationLimit(effort_limit);
       mipworker.recordNodeLpAttempt();
     }
-    const bool serial_completion = mipworker.nodeLpEffortEnabled() &&
+    const bool serial_completion = bounded_node_lp_effort &&
                                    currnode.yield_count > 0 &&
                                    effort_limit == kHighsIInf;
     int64_t oldnumiters = lp->getNumLpIterations();
     const double old_lower_bound = currnode.lower_bound;
     HighsLpRelaxation::Status status =
-        lp->resolveLp(&localdom, mipworker.nodeLpEffortEnabled());
+        lp->resolveLp(&localdom, bounded_node_lp_effort);
     const HighsInt node_lp_iterations = static_cast<HighsInt>(std::max<int64_t>(
         0, lp->getNumLpIterations() - oldnumiters));
     lpiterations += node_lp_iterations;
@@ -971,16 +976,22 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
     currnode.lower_bound =
         std::max(localdom.getObjectiveLowerBound(), currnode.lower_bound);
 
-    if (mipworker.nodeLpEffortEnabled()) {
+    if (bounded_node_lp_effort) {
       HighsNodeLpEffortObservation effort_observation;
       effort_observation.depth = getCurrentDepth();
       effort_observation.iteration_count = node_lp_iterations;
       effort_observation.row_count = lp->numRows();
       effort_observation.column_count = lp->numCols();
-      effort_observation.outcome =
-          status == HighsLpRelaxation::Status::kError
-              ? HighsNodeLpEffortOutcome::kNumericalFailure
-              : HighsNodeLpEffortOutcome::kCompleted;
+      if (status == HighsLpRelaxation::Status::kError) {
+        const HighsModelStatus model_status = lp->getLpSolver().getModelStatus();
+        effort_observation.outcome =
+            model_status == HighsModelStatus::kTimeLimit ||
+                    model_status == HighsModelStatus::kIterationLimit
+                ? HighsNodeLpEffortOutcome::kLimitReached
+                : HighsNodeLpEffortOutcome::kNumericalFailure;
+      } else {
+        effort_observation.outcome = HighsNodeLpEffortOutcome::kCompleted;
+      }
       effort_observation.improved_bound =
           currnode.lower_bound > old_lower_bound;
       mipworker.recordNodeLpCompleted(effort_observation);

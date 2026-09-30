@@ -152,6 +152,18 @@ class HighsSearch {
  public:
   HighsSearch(HighsMipWorker& mipworker, HighsPseudocost& pseudocost);
 
+  static bool boundedNodeLpEffortApplies(bool heuristic_search,
+                                         bool controller_enabled) {
+    return controller_enabled && !heuristic_search;
+  }
+
+  static bool resumableBasisMatches(const HighsBasis& basis, HighsInt rows,
+                                    HighsInt columns) {
+    return basis.valid &&
+           static_cast<HighsInt>(basis.row_status.size()) == rows &&
+           static_cast<HighsInt>(basis.col_status.size()) == columns;
+  }
+
   void setRINSNeighbourhood(const std::vector<double>& basesol,
                             const std::vector<double>& relaxsol);
 

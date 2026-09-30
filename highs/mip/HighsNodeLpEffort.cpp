@@ -62,6 +62,10 @@ void HighsNodeLpEffortController::recordCompleted(
   summary_.total_iterations += iterations;
   summary_.maximum_iterations =
       std::max(summary_.maximum_iterations, iterations);
+  if (observation.outcome == HighsNodeLpEffortOutcome::kLimitReached) {
+    ++summary_.limit_stops;
+    return;
+  }
   if (observation.outcome == HighsNodeLpEffortOutcome::kNumericalFailure) {
     ++summary_.numerical_failures;
     return;
@@ -94,10 +98,32 @@ void HighsNodeLpEffortController::recordTaskLease(double seconds) {
       std::max(summary_.task_lease_max_seconds, seconds);
   const long double microseconds =
       std::ceil(static_cast<long double>(seconds) * 1000000.0L);
-  const HighsInt bounded_microseconds = static_cast<HighsInt>(std::min<
-      long double>(microseconds, std::numeric_limits<HighsInt>::max()));
+  const uint64_t bounded_microseconds =
+      microseconds >= static_cast<long double>(
+                          std::numeric_limits<uint64_t>::max())
+          ? std::numeric_limits<uint64_t>::max()
+          : static_cast<uint64_t>(microseconds);
   ++summary_.task_lease_microseconds_histogram[
-      histogramBucket(bounded_microseconds)];
+      durationHistogramBucket(bounded_microseconds)];
+}
+
+double HighsNodeLpEffortController::taskLeasePercentileUpperSeconds(
+    const std::array<
+        int64_t, HighsNodeLpEffortSummary::kDurationHistogramBuckets>&
+        histogram,
+    double quantile) {
+  quantile = std::max(0.0, std::min(1.0, quantile));
+  int64_t samples = 0;
+  for (int64_t count : histogram) samples += count;
+  if (samples == 0) return 0.0;
+  const int64_t target =
+      std::max<int64_t>(1, static_cast<int64_t>(std::ceil(quantile * samples)));
+  int64_t cumulative = 0;
+  for (size_t bucket = 0; bucket != histogram.size(); ++bucket) {
+    cumulative += histogram[bucket];
+    if (cumulative >= target) return durationHistogramUpperSeconds(bucket);
+  }
+  return durationHistogramUpperSeconds(histogram.size() - 1);
 }
 
 HighsInt HighsNodeLpEffortController::percentileIterations(
@@ -145,6 +171,27 @@ HighsInt HighsNodeLpEffortController::histogramUpperBound(size_t bucket) {
   return upper >= static_cast<uint64_t>(std::numeric_limits<HighsInt>::max())
              ? std::numeric_limits<HighsInt>::max()
              : static_cast<HighsInt>(upper);
+}
+
+size_t HighsNodeLpEffortController::durationHistogramBucket(
+    uint64_t microseconds) {
+  uint64_t value = std::max<uint64_t>(1, microseconds);
+  size_t bucket = 0;
+  while (value > 1 &&
+         bucket + 1 < HighsNodeLpEffortSummary::kDurationHistogramBuckets) {
+    value >>= 1;
+    ++bucket;
+  }
+  return bucket;
+}
+
+double HighsNodeLpEffortController::durationHistogramUpperSeconds(
+    size_t bucket) {
+  const uint64_t upper =
+      bucket + 1 >= HighsNodeLpEffortSummary::kDurationHistogramBuckets
+          ? std::numeric_limits<uint64_t>::max()
+          : uint64_t{1} << (bucket + 1);
+  return static_cast<double>(upper) / 1000000.0;
 }
 
 size_t HighsNodeLpEffortController::depthBucket(HighsInt depth) {

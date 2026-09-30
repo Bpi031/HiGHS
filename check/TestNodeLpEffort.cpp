@@ -7,6 +7,27 @@
 #include "catch.hpp"
 #include "mip/HighsNodeLpEffort.h"
 #include "mip/HighsNodeQueue.h"
+#include "mip/HighsSearch.h"
+
+TEST_CASE("node-lp-effort-applies-only-to-authoritative-tree-search",
+          "[highs_node_lp_effort]") {
+  REQUIRE(HighsSearch::boundedNodeLpEffortApplies(false, true));
+  REQUIRE_FALSE(HighsSearch::boundedNodeLpEffortApplies(true, true));
+  REQUIRE_FALSE(HighsSearch::boundedNodeLpEffortApplies(false, false));
+}
+
+TEST_CASE("node-lp-effort-resume-basis-requires-complete-dimensions",
+          "[highs_node_lp_effort]") {
+  HighsBasis basis;
+  basis.valid = true;
+  basis.row_status.resize(2, HighsBasisStatus::kBasic);
+  basis.col_status.resize(3, HighsBasisStatus::kLower);
+  REQUIRE(HighsSearch::resumableBasisMatches(basis, 2, 3));
+  REQUIRE_FALSE(HighsSearch::resumableBasisMatches(basis, 1, 3));
+  REQUIRE_FALSE(HighsSearch::resumableBasisMatches(basis, 2, 2));
+  basis.valid = false;
+  REQUIRE_FALSE(HighsSearch::resumableBasisMatches(basis, 2, 3));
+}
 
 TEST_CASE("node-lp-effort-disabled-is-an-identity",
           "[highs_node_lp_effort]") {
@@ -70,6 +91,8 @@ TEST_CASE("node-lp-effort-telemetry-is-bounded",
   controller.recordSerialCompletion();
   controller.recordTaskLease(1.5);
   controller.recordTaskLease(0.5);
+  controller.recordTaskLease(1100.0);
+  controller.recordTaskLease(2200.0);
   controller.recordTaskLease(-1.0);
 
   const HighsNodeLpEffortSummary& summary = controller.summary();
@@ -83,11 +106,23 @@ TEST_CASE("node-lp-effort-telemetry-is-bounded",
   REQUIRE(summary.maximum_iterations == 12000);
   REQUIRE(summary.histogram[12] == 1);
   REQUIRE(summary.yielded_histogram[13] == 1);
-  REQUIRE(summary.task_leases == 2);
-  REQUIRE(summary.task_lease_total_seconds == 2.0);
-  REQUIRE(summary.task_lease_max_seconds == 1.5);
+  REQUIRE(summary.task_leases == 4);
+  REQUIRE(summary.task_lease_total_seconds == 3302.0);
+  REQUIRE(summary.task_lease_max_seconds == 2200.0);
   REQUIRE(summary.task_lease_microseconds_histogram[18] == 1);
   REQUIRE(summary.task_lease_microseconds_histogram[20] == 1);
+  REQUIRE(summary.task_lease_microseconds_histogram[30] == 1);
+  REQUIRE(summary.task_lease_microseconds_histogram[31] == 1);
+  const double median_upper =
+      HighsNodeLpEffortController::taskLeasePercentileUpperSeconds(
+          summary.task_lease_microseconds_histogram, 0.50);
+  const double p95_upper =
+      HighsNodeLpEffortController::taskLeasePercentileUpperSeconds(
+          summary.task_lease_microseconds_histogram, 0.95);
+  REQUIRE(median_upper >= 1.5);
+  REQUIRE(median_upper < 2.1);
+  REQUIRE(p95_upper >= 2200.0);
+  REQUIRE(std::isfinite(p95_upper));
 }
 
 TEST_CASE("node-lp-effort-learns-only-from-recent-completions",
@@ -112,12 +147,18 @@ TEST_CASE("node-lp-effort-learns-only-from-recent-completions",
   failure.iteration_count = 200000;
   failure.outcome = HighsNodeLpEffortOutcome::kNumericalFailure;
   controller.recordCompleted(failure);
+  HighsNodeLpEffortObservation limit;
+  limit.depth = 40;
+  limit.iteration_count = 50000;
+  limit.outcome = HighsNodeLpEffortOutcome::kLimitReached;
+  controller.recordCompleted(limit);
 
   REQUIRE(controller.iterationLimit(1000000, 40, 0) == 600);
   REQUIRE(controller.summary().completed == 8);
   REQUIRE(controller.summary().yielded == 1);
   REQUIRE(controller.summary().numerical_failures == 1);
-  REQUIRE(controller.summary().total_iterations == 303600);
+  REQUIRE(controller.summary().limit_stops == 1);
+  REQUIRE(controller.summary().total_iterations == 353600);
   REQUIRE(controller.summary().completed_iterations == 3600);
   REQUIRE(controller.summary().yielded_iterations == 100000);
 }
