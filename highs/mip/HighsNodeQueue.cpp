@@ -362,7 +362,9 @@ double HighsNodeQueue::performBounding(double upper_limit) {
 double HighsNodeQueue::emplaceNode(std::vector<HighsDomainChange>&& domchgs,
                                    std::vector<HighsInt>&& branchPositions,
                                    double lower_bound, double estimate,
-                                   HighsInt depth) {
+                                   HighsInt depth,
+                                   std::shared_ptr<const HighsBasis> basis,
+                                   HighsInt yield_count) {
   int64_t pos;
 
   assert(estimate != kHighsInf);
@@ -370,17 +372,20 @@ double HighsNodeQueue::emplaceNode(std::vector<HighsDomainChange>&& domchgs,
   if (freeslots.empty()) {
     pos = nodes.size();
     nodes.emplace_back(std::move(domchgs), std::move(branchPositions),
-                       lower_bound, estimate, depth);
+                       lower_bound, estimate, depth, std::move(basis),
+                       yield_count);
   } else {
     pos = freeslots.top();
     freeslots.pop();
     nodes[pos] = OpenNode(std::move(domchgs), std::move(branchPositions),
-                          lower_bound, estimate, depth);
+                          lower_bound, estimate, depth, std::move(basis),
+                          yield_count);
   }
 
   assert(nodes[pos].lower_bound == lower_bound);
   assert(nodes[pos].estimate == estimate);
   assert(nodes[pos].depth == depth);
+  assert(nodes[pos].yield_count == yield_count);
 
   return link(pos);
 }

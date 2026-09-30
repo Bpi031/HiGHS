@@ -16,6 +16,7 @@
 #include "mip/HighsIncumbentMailbox.h"
 #include "mip/HighsLpRelaxation.h"
 #include "mip/HighsMipSolver.h"
+#include "mip/HighsNodeLpEffort.h"
 #include "mip/HighsNodeQueue.h"
 #include "mip/HighsPrimalHeuristics.h"
 #include "mip/HighsPseudocost.h"
@@ -72,6 +73,7 @@ class HighsMipWorker {
   HighsInt worker_id_;
   int64_t work_epoch_ = -1;
   int64_t publication_sequence_ = 0;
+  HighsNodeLpEffortController node_lp_effort_;
 
  public:
   std::unique_ptr<HighsSearch> search_ptr_;
@@ -130,6 +132,26 @@ class HighsMipWorker {
   HighsInt workerId() const { return worker_id_; }
   int64_t workEpoch() const { return work_epoch_; }
   void setWorkEpoch(int64_t work_epoch) { work_epoch_ = work_epoch; }
+
+  bool nodeLpEffortEnabled() const { return node_lp_effort_.enabled(); }
+  HighsInt nodeLpIterationLimit(HighsInt depth,
+                                HighsInt yield_count) const;
+  void recordNodeLpAttempt() { node_lp_effort_.recordAttempt(); }
+  void recordNodeLpCompleted(const HighsNodeLpEffortObservation& observation) {
+    node_lp_effort_.recordCompleted(observation);
+  }
+  void recordNodeLpYield(HighsInt iterations) {
+    node_lp_effort_.recordYield(iterations);
+  }
+  void recordNodeLpSerialCompletion() {
+    node_lp_effort_.recordSerialCompletion();
+  }
+  void recordTaskLease(double seconds) {
+    node_lp_effort_.recordTaskLease(seconds);
+  }
+  const HighsNodeLpEffortSummary& nodeLpEffortSummary() const {
+    return node_lp_effort_.summary();
+  }
 
   std::pair<bool, double> transformNewIntegerFeasibleSolution(
       const std::vector<double>& sol) const;

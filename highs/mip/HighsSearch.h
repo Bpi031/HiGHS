@@ -71,6 +71,7 @@ class HighsSearch {
     kLpInfeasible,
     kBranched,
     kSubOptimal,
+    kLpIterationLimit,
     kOpen,
   };
 
@@ -94,10 +95,12 @@ class HighsSearch {
     HighsInt domgchgStackPos;
     uint8_t skipDepthCount;
     uint8_t opensubtrees;
+    HighsInt yield_count;
 
     NodeData(double parentlb = -kHighsInf, double parentestimate = -kHighsInf,
              std::shared_ptr<const HighsBasis> parentBasis = nullptr,
-             std::shared_ptr<const StabilizerOrbits> stabilizerOrbits = nullptr)
+             std::shared_ptr<const StabilizerOrbits> stabilizerOrbits = nullptr,
+             HighsInt yield_count = 0)
         : lower_bound(parentlb),
           estimate(parentestimate),
           branching_point(0.0),
@@ -108,7 +111,8 @@ class HighsSearch {
           branchingdecision{0.0, -1, HighsBoundType::kLower},
           domgchgStackPos(-1),
           skipDepthCount(0),
-          opensubtrees(2) {}
+          opensubtrees(2),
+          yield_count(yield_count) {}
   };
 
   enum ReliableFlags {

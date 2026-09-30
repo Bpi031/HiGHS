@@ -1122,7 +1122,8 @@ void HighsLpRelaxation::setObjectiveLimit(double objlim) {
   lpsolver.setOptionValue("objective_bound", objlim + offset);
 }
 
-HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
+HighsLpRelaxation::Status HighsLpRelaxation::run(
+    bool resolve_on_error, bool yield_on_iteration_limit) {
   const HighsInfo& info = lpsolver.getInfo();
   const double this_time_limit =
       std::max(lpsolver.getRunTime() + mipsolver.options_mip_->time_limit -
@@ -1383,6 +1384,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
 
       return Status::kError;
     case HighsModelStatus::kIterationLimit: {
+      if (yield_on_iteration_limit) return Status::kIterationLimit;
       if (!mipsolver.submip && resolve_on_error) {
         // Highs instantiation
         Highs ipm;
@@ -1446,10 +1448,9 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
           ipm.optimizeLp();
         }
         lpsolver.setBasis(ipm.getBasis(), "HighsLpRelaxation::run IPM basis");
-        return run(false);
+        return run(false, false);
       }
 
-      // printf("error: lpsolver reached iteration limit\n");
       return Status::kError;
     }
     case HighsModelStatus::kTimeLimit:
@@ -1465,14 +1466,15 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
   }
 }
 
-HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
+HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(
+    HighsDomain* domain, bool yield_on_iteration_limit) {
   fractionalints.clear();
 
   bool solveagain;
   do {
     solveagain = false;
     if (domain) flushDomain(*domain);
-    status = run();
+    status = run(!yield_on_iteration_limit, yield_on_iteration_limit);
 
     switch (status) {
       case Status::kUnscaledInfeasible:

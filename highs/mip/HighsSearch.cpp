@@ -734,7 +734,8 @@ void HighsSearch::currentNodeToQueue(HighsNodeQueue& nodequeue) {
         std::move(domchgStack), std::move(branchPositions),
         std::max(nodestack.back().lower_bound,
                  localdom.getObjectiveLowerBound()),
-        nodestack.back().estimate, getCurrentDepth());
+        nodestack.back().estimate, getCurrentDepth(),
+        nodestack.back().nodeBasis, nodestack.back().yield_count);
     if (countTreeWeight) treeweight += tmpTreeWeight;
   } else {
     mipsolver.mipdata_->debugSolution.nodePruned(localdom);
@@ -775,7 +776,8 @@ void HighsSearch::openNodesToQueue(HighsNodeQueue& nodequeue) {
           std::move(domchgStack), std::move(branchPositions),
           std::max(nodestack.back().lower_bound,
                    localdom.getObjectiveLowerBound()),
-          nodestack.back().estimate, getCurrentDepth());
+          nodestack.back().estimate, getCurrentDepth(),
+          nodestack.back().nodeBasis, nodestack.back().yield_count);
       if (countTreeWeight) treeweight += tmpTreeWeight;
     } else {
       mipsolver.mipdata_->debugSolution.nodePruned(localdom);
@@ -865,10 +867,16 @@ void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
     }
   }
   nodestack.emplace_back(
-      node.lower_bound, node.estimate, nullptr,
-      globalSymmetriesValid ? mipsolver.mipdata_->globalOrbits : nullptr);
+      node.lower_bound, node.estimate, node.basis,
+      globalSymmetriesValid ? mipsolver.mipdata_->globalOrbits : nullptr,
+      node.yield_count);
   subrootsol.clear();
   depthoffset = node.depth - 1;
+  if (node.basis &&
+      static_cast<HighsInt>(node.basis->row_status.size()) == lp->numRows()) {
+    lp->setStoredBasis(std::move(node.basis));
+    lp->recoverBasis();
+  }
 }
 
 HighsSearch::NodeResult HighsSearch::evaluateNode() {
@@ -933,12 +941,51 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
              mipsolver.isColContinuous(i));
     }
 #endif
+    HighsInt effort_limit = kHighsIInf;
+    if (mipworker.nodeLpEffortEnabled()) {
+      effort_limit = mipworker.nodeLpIterationLimit(getCurrentDepth(),
+                                                    currnode.yield_count);
+      lp->setIterationLimit(effort_limit);
+      mipworker.recordNodeLpAttempt();
+    }
+    const bool serial_completion = mipworker.nodeLpEffortEnabled() &&
+                                   currnode.yield_count > 0 &&
+                                   effort_limit == kHighsIInf;
     int64_t oldnumiters = lp->getNumLpIterations();
-    HighsLpRelaxation::Status status = lp->resolveLp(&localdom);
-    lpiterations += lp->getNumLpIterations() - oldnumiters;
+    const double old_lower_bound = currnode.lower_bound;
+    HighsLpRelaxation::Status status =
+        lp->resolveLp(&localdom, mipworker.nodeLpEffortEnabled());
+    const HighsInt node_lp_iterations = static_cast<HighsInt>(std::max<int64_t>(
+        0, lp->getNumLpIterations() - oldnumiters));
+    lpiterations += node_lp_iterations;
+
+    if (status == HighsLpRelaxation::Status::kIterationLimit) {
+      const HighsBasis& basis = lp->getLpSolver().getBasis();
+      if (basis.valid)
+        currnode.nodeBasis = std::make_shared<const HighsBasis>(basis);
+      ++currnode.yield_count;
+      mipworker.recordNodeLpYield(node_lp_iterations);
+      return NodeResult::kLpIterationLimit;
+    }
 
     currnode.lower_bound =
         std::max(localdom.getObjectiveLowerBound(), currnode.lower_bound);
+
+    if (mipworker.nodeLpEffortEnabled()) {
+      HighsNodeLpEffortObservation effort_observation;
+      effort_observation.depth = getCurrentDepth();
+      effort_observation.iteration_count = node_lp_iterations;
+      effort_observation.row_count = lp->numRows();
+      effort_observation.column_count = lp->numCols();
+      effort_observation.outcome =
+          status == HighsLpRelaxation::Status::kError
+              ? HighsNodeLpEffortOutcome::kNumericalFailure
+              : HighsNodeLpEffortOutcome::kCompleted;
+      effort_observation.improved_bound =
+          currnode.lower_bound > old_lower_bound;
+      mipworker.recordNodeLpCompleted(effort_observation);
+      if (serial_completion) mipworker.recordNodeLpSerialCompletion();
+    }
 
     if (localdom.infeasible()) {
       result = NodeResult::kDomainInfeasible;
@@ -1082,6 +1129,7 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
     }
   }
 
+  if (result == NodeResult::kLpIterationLimit) return result;
   if (result != NodeResult::kOpen) {
     mipsolver.mipdata_->debugSolution.nodePruned(localdom);
     treeweight += std::ldexp(1.0, 1 - getCurrentDepth());
@@ -1779,7 +1827,8 @@ bool HighsSearch::backtrackPlunge(HighsNodeQueue& nodequeue) {
       auto domchgStack = localdom.getReducedDomainChangeStack(branchPositions);
       double tmpTreeWeight = nodequeue.emplaceNode(
           std::move(domchgStack), std::move(branchPositions), nodelb,
-          nodestack.back().estimate, getCurrentDepth() + 1);
+          nodestack.back().estimate, getCurrentDepth() + 1,
+          nodestack.back().nodeBasis, 0);
       if (countTreeWeight) treeweight += tmpTreeWeight;
       localdom.backtrack();
       localdom.clearChangedCols(numChangedCols);
@@ -1873,6 +1922,11 @@ HighsSearch::NodeResult HighsSearch::dive(int64_t nodeLim) {
   do {
     ++nnodes;
     NodeResult result = evaluateNode();
+
+    if (result == NodeResult::kLpIterationLimit) {
+      --nnodes;
+      return result;
+    }
 
     if (checkLimits(nnodes)) return result;
 

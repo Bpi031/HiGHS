@@ -508,6 +508,10 @@ struct HighsOptionsStruct {
   double mip_root_work_max_heuristic_time;
   double mip_root_work_max_single_helper_time;
   double mip_root_work_tree_reserve_time;
+  bool mip_node_lp_effort;
+  HighsInt mip_node_lp_effort_min_iterations;
+  HighsInt mip_node_lp_effort_max_iterations;
+  HighsInt mip_node_lp_effort_max_yields;
   std::string mip_incumbent_exchange;
   HighsInt mip_incumbent_epoch_nodes;
   std::string mip_primal_heuristic_schedule;
@@ -708,6 +712,10 @@ struct HighsOptionsStruct {
         mip_root_work_max_heuristic_time(-1.0),
         mip_root_work_max_single_helper_time(-1.0),
         mip_root_work_tree_reserve_time(-1.0),
+        mip_node_lp_effort(false),
+        mip_node_lp_effort_min_iterations(10000),
+        mip_node_lp_effort_max_iterations(250000),
+        mip_node_lp_effort_max_yields(3),
         mip_incumbent_exchange("off"),
         mip_incumbent_epoch_nodes(64),
         mip_primal_heuristic_schedule("off"),
@@ -1345,6 +1353,31 @@ class HighsOptions : public HighsOptionsStruct {
         "work; -1 disables the reserve",
         advanced, &mip_root_work_tree_reserve_time, -1.0, -1.0, kHighsInf);
     records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_node_lp_effort",
+        "Enable bounded, safely resumable tree-node LP work", advanced,
+        &mip_node_lp_effort, false);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_node_lp_effort_min_iterations",
+        "Minimum simplex iterations for one resumable tree-node LP lease",
+        advanced, &mip_node_lp_effort_min_iterations, 1, 10000, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_lp_effort_max_iterations",
+        "Maximum simplex iterations for one resumable tree-node LP lease",
+        advanced, &mip_node_lp_effort_max_iterations, 1, 250000,
+        kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_node_lp_effort_max_yields",
+        "Maximum bounded yields before uninterrupted serial completion",
+        advanced, &mip_node_lp_effort_max_yields, 0, 3, 64);
+    records.push_back(record_int);
 
     record_string = new OptionRecordString(
         "mip_incumbent_exchange",

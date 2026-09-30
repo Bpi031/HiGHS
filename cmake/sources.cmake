@@ -385,6 +385,7 @@ set(highs_sources
     mip/HighsMipSolverData.cpp
     mip/HighsMipWorker.cpp
     mip/HighsModkSeparator.cpp
+    mip/HighsNodeLpEffort.cpp
     mip/HighsNodeSeparation.cpp
     mip/HighsNodeQueue.cpp
     mip/HighsObjectiveFunction.cpp

@@ -7,6 +7,8 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipWorker.h"
 
+#include <algorithm>
+
 #include "mip/HighsMipSolverData.h"
 #include "mip/MipTimer.h"
 
@@ -29,11 +31,31 @@ HighsMipWorker::HighsMipWorker(const HighsMipSolver& mipsolver,
   upper_limit = mipdata_.upper_limit;
   optimality_limit = mipdata_.optimality_limit;
   heuristics_allowed = true;
+  HighsNodeLpEffortConfig node_lp_effort_config;
+  // Node effort and incumbent exchange are independent mechanisms. Keeping a
+  // separate switch is required for identity and interaction experiments.
+  node_lp_effort_config.enabled =
+      !mipsolver.submip && mipsolver.options_mip_->mip_node_lp_effort;
+  node_lp_effort_config.minimum_iterations =
+      mipsolver.options_mip_->mip_node_lp_effort_min_iterations;
+  node_lp_effort_config.maximum_iterations =
+      mipsolver.options_mip_->mip_node_lp_effort_max_iterations;
+  node_lp_effort_config.maximum_yields =
+      mipsolver.options_mip_->mip_node_lp_effort_max_yields;
+  node_lp_effort_.configure(node_lp_effort_config);
   search_ptr_ =
       std::unique_ptr<HighsSearch>(new HighsSearch(*this, getPseudocost()));
   sepa_ptr_ = std::unique_ptr<HighsSeparation>(new HighsSeparation(*this));
   search_ptr_->setLpRelaxation(lp_);
   sepa_ptr_->setLpRelaxation(lp_);
+}
+
+HighsInt HighsMipWorker::nodeLpIterationLimit(HighsInt depth,
+                                               HighsInt yield_count) const {
+  return node_lp_effort_.iterationLimit(
+      static_cast<HighsInt>(std::min<int64_t>(
+          kHighsIInf, std::max<int64_t>(0, mipdata_.firstrootlpiters))),
+      depth, yield_count);
 }
 
 const HighsMipSolver& HighsMipWorker::getMipSolver() const {

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "lp_data/HConst.h"
+#include "lp_data/HStruct.h"
 #include "mip/HighsDomainChange.h"
 #include "util/HighsCDouble.h"
 #include "util/HighsRbTree.h"
@@ -146,6 +147,8 @@ class HighsNodeQueue {
     double lower_bound;
     double estimate;
     HighsInt depth;
+    std::shared_ptr<const HighsBasis> basis;
+    HighsInt yield_count;
     highs::RbTreeLinks<int64_t> lowerLinks;
     highs::RbTreeLinks<int64_t> hybridEstimLinks;
 
@@ -156,17 +159,23 @@ class HighsNodeQueue {
           lower_bound(-kHighsInf),
           estimate(-kHighsInf),
           depth(0),
+          basis(nullptr),
+          yield_count(0),
           lowerLinks(),
           hybridEstimLinks() {}
 
     OpenNode(std::vector<HighsDomainChange>&& domchgstack,
              std::vector<HighsInt>&& branchings, double lower_bound,
-             double estimate, HighsInt depth)
+             double estimate, HighsInt depth,
+             std::shared_ptr<const HighsBasis> basis = nullptr,
+             HighsInt yield_count = 0)
         : domchgstack(std::move(domchgstack)),
           branchings(std::move(branchings)),
           lower_bound(lower_bound),
           estimate(estimate),
           depth(depth),
+          basis(std::move(basis)),
+          yield_count(yield_count),
           lowerLinks(),
           hybridEstimLinks() {}
 
@@ -240,7 +249,9 @@ class HighsNodeQueue {
 
   double emplaceNode(std::vector<HighsDomainChange>&& domchgs,
                      std::vector<HighsInt>&& branchings, double lower_bound,
-                     double estimate, HighsInt depth);
+                     double estimate, HighsInt depth,
+                     std::shared_ptr<const HighsBasis> basis = nullptr,
+                     HighsInt yield_count = 0);
 
   OpenNode&& popBestNode();
 

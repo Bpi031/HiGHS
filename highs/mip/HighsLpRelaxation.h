@@ -30,6 +30,7 @@ class HighsLpRelaxation {
     kUnscaledPrimalFeasible,
     kUnscaledInfeasible,
     kUnbounded,
+    kIterationLimit,
     kError,
   };
 
@@ -356,9 +357,11 @@ class HighsLpRelaxation {
                            std::vector<HighsInt>& inds,
                            std::vector<double>& vals, double& rhs) const;
 
-  Status resolveLp(HighsDomain* domain = nullptr);
+  Status resolveLp(HighsDomain* domain = nullptr,
+                   bool yield_on_iteration_limit = false);
 
-  Status run(bool resolve_on_error = true);
+  Status run(bool resolve_on_error = true,
+             bool yield_on_iteration_limit = false);
 
   Highs& getLpSolver() { return lpsolver; }
   const Highs& getLpSolver() const { return lpsolver; }

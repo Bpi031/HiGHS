@@ -276,16 +276,17 @@ restart:
   mipdata_->printDisplayLine();
 
   const HighsInt max_num_workers = getMaxNumWorkers();
-  if (deterministicIncumbentExchange() && !submip) {
+  if (options_mip_->mip_incumbent_exchange != "off" && !submip) {
     const HighsHardwareTopology topology = highsDetectHardwareTopology();
     highsLogUser(
         options_mip_->log_options, HighsLogType::kInfo,
         "MIP-Incumbent-Exchange: schema=rost/highs-incumbent-exchange/v1 "
-        "mode=deterministic configured_threads=%" HIGHSINT_FORMAT
+        "mode=%s configured_threads=%" HIGHSINT_FORMAT
         " workers=%" HIGHSINT_FORMAT " epoch_nodes=%" HIGHSINT_FORMAT
         " logical_cpus=%" HIGHSINT_FORMAT " physical_cores=%" HIGHSINT_FORMAT
         " performance_cores=%" HIGHSINT_FORMAT " numa_nodes=%" HIGHSINT_FORMAT
         " llc_domains=%" HIGHSINT_FORMAT " topology_complete=%d\n",
+        options_mip_->mip_incumbent_exchange.c_str(),
         highs::parallel::num_threads(), max_num_workers,
         options_mip_->mip_incumbent_epoch_nodes, topology.logical_cpus,
         topology.physical_cores, topology.performance_cores,
@@ -732,22 +733,24 @@ restart:
     }
   };
 
-  auto evaluateNode = [&](HighsInt i) -> bool {
+  auto evaluateNode = [&](HighsInt i) -> HighsSearch::NodeResult {
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockEvaluateNode1);
-    if (mipdata_->workers[i].search_ptr_->evaluateNode() ==
-        HighsSearch::NodeResult::kSubOptimal) {
+    const HighsSearch::NodeResult result =
+        mipdata_->workers[i].search_ptr_->evaluateNode();
+    if (result == HighsSearch::NodeResult::kSubOptimal ||
+        result == HighsSearch::NodeResult::kLpIterationLimit) {
       HighsNodeQueue& globalqueue = mipdata_->parallelLockActive()
                                         ? mipdata_->workers[i].nodequeue
                                         : mipdata_->nodequeue;
       mipdata_->workers[i].search_ptr_->currentNodeToQueue(globalqueue);
       if (!mipdata_->parallelLockActive())
         profiling_->stop(kMipClockEvaluateNode1);
-      return true;
+      return result;
     }
     if (!mipdata_->parallelLockActive())
       profiling_->stop(kMipClockEvaluateNode1);
-    return false;
+    return result;
   };
 
   auto pruneNode = [&](HighsInt i) -> bool {
@@ -891,7 +894,16 @@ restart:
     if (!mipdata_->parallelLockActive())
       profiling_->stop(kMipClockDiveEvaluateNode);
 
-    if (evaluate_node_result == HighsSearch::NodeResult::kSubOptimal) {
+    if (evaluate_node_result == HighsSearch::NodeResult::kSubOptimal ||
+        evaluate_node_result ==
+            HighsSearch::NodeResult::kLpIterationLimit) {
+      if (evaluate_node_result ==
+          HighsSearch::NodeResult::kLpIterationLimit) {
+        HighsNodeQueue& queue = mipdata_->parallelLockActive()
+                                   ? worker.nodequeue
+                                   : mipdata_->nodequeue;
+        worker.search_ptr_->currentNodeToQueue(queue);
+      }
       return true;
     }
 
@@ -986,6 +998,14 @@ restart:
       if (search_dive_result == HighsSearch::NodeResult::kSubOptimal) {
         return true;
       }
+      if (search_dive_result ==
+          HighsSearch::NodeResult::kLpIterationLimit) {
+        HighsNodeQueue& queue = mipdata_->parallelLockActive()
+                                   ? worker.nodequeue
+                                   : mipdata_->nodequeue;
+        worker.search_ptr_->currentNodeToQueue(queue);
+        return true;
+      }
       worker.search_ptr_->getLocalLeaves()++;
     }
     return nodeLim != kHighsIInf && worker.search_ptr_->nnodes >= diveNodeLim;
@@ -997,53 +1017,73 @@ restart:
                           const HighsInt plungeLimit, double avgiter) {
     auto processNode = [&](HighsInt i) {
       HighsMipWorker& worker = mipdata_->workers[i];
-      int64_t nodes_explored = 0;
-      if (!skip_separation) {
-        evaluateNode(i);
-        if (pruneNode(i)) return;
-        if (!mipdata_->parallelLockActive()) {
-          if (mipdata_->checkLimits()) return;
-          mipdata_->printDisplayLine();
-        } else {
-          if (worker.search_ptr_->checkLocalLimits()) return;
+      const double lease_started = timer_.read();
+      auto run_lease = [&]() {
+        int64_t nodes_explored = 0;
+        if (!skip_separation) {
+          const HighsSearch::NodeResult evaluate_result = evaluateNode(i);
+          if (evaluate_result ==
+              HighsSearch::NodeResult::kLpIterationLimit) {
+            // The node was requeued with its last certified lower bound and
+            // compatible basis. Remove the local search frame without
+            // recording a processed node or pruned leaf.
+            worker.search_ptr_->backtrack();
+            worker.getGlobalDomain().propagate();
+            return;
+          }
+          if (pruneNode(i)) return;
+          if (!mipdata_->parallelLockActive()) {
+            if (mipdata_->checkLimits()) return;
+            mipdata_->printDisplayLine();
+          } else {
+            if (worker.search_ptr_->checkLocalLimits()) return;
+          }
+          if (separateAndStoreBasis(i)) return;
         }
-        if (separateAndStoreBasis(i)) return;
-      }
-      worker.getConflictPool().performAging();
-      HighsInt iterlimit = 10 * std::max(avgiter, mipdata_->avgrootlpiters);
-      iterlimit = std::max({HighsInt{10000}, iterlimit,
-                            HighsInt((3 * mipdata_->firstrootlpiters) / 2)});
-      worker.getLpRelaxation().setIterationLimit(iterlimit);
-      bool considerHeuristics = true;
-      while (true) {
-        if (considerHeuristics &&
-            (skip_separation || nodeLim == kHighsIInf ||
-             deterministicIncumbentExchange()) &&
-            worker.getAllowHeuristics() && mipdata_->moreHeuristicsAllowed()) {
-          if (runHeuristics(i)) break;
+        worker.getConflictPool().performAging();
+        if (!worker.nodeLpEffortEnabled()) {
+          HighsInt iterlimit =
+              10 * std::max(avgiter, mipdata_->avgrootlpiters);
+          iterlimit = std::max(
+              {HighsInt{10000}, iterlimit,
+               HighsInt((3 * mipdata_->firstrootlpiters) / 2)});
+          worker.getLpRelaxation().setIterationLimit(iterlimit);
         }
-        considerHeuristics = false;
-        if (worker.getGlobalDomain().infeasible()) break;
-        if (dive(i, nodeLim)) break;
-        if (worker.search_ptr_->checkLimits(
-                worker.search_ptr_->getLocalNodes())) {
-          break;
-        }
+        bool considerHeuristics = true;
+        while (true) {
+          if (considerHeuristics &&
+              (skip_separation || nodeLim == kHighsIInf ||
+               deterministicIncumbentExchange()) &&
+              worker.getAllowHeuristics() &&
+              mipdata_->moreHeuristicsAllowed()) {
+            if (runHeuristics(i)) break;
+          }
+          considerHeuristics = false;
+          if (worker.getGlobalDomain().infeasible()) break;
+          if (dive(i, nodeLim)) break;
+          if (worker.search_ptr_->checkLimits(
+                  worker.search_ptr_->getLocalNodes())) {
+            break;
+          }
 
-        if (worker.search_ptr_->getLocalNodes() + nodes_explored >= plungeLimit)
-          break;
-        if (!mipdata_->parallelLockActive()) {
-          nodes_explored += worker.search_ptr_->getLocalNodes();
+          if (worker.search_ptr_->getLocalNodes() + nodes_explored >=
+              plungeLimit)
+            break;
+          if (!mipdata_->parallelLockActive()) {
+            nodes_explored += worker.search_ptr_->getLocalNodes();
+          }
+          if (backtrackPlunge(i)) break;
+          if (!mipdata_->parallelLockActive()) {
+            worker.search_ptr_->flushStatistics(*this);
+            mipdata_->printDisplayLine();
+          }
         }
-        if (backtrackPlunge(i)) break;
-        if (!mipdata_->parallelLockActive()) {
-          worker.search_ptr_->flushStatistics(*this);
-          mipdata_->printDisplayLine();
+        if (nodeLim == kHighsIInf) {
+          restarts[i] = checkRestart(worker, 1);
         }
-      }
-      if (nodeLim == kHighsIInf) {
-        restarts[i] = checkRestart(worker, 1);
-      }
+      };
+      run_lease();
+      worker.recordTaskLease(std::max(0.0, timer_.read() - lease_started));
     };
     runTask(processNode, tg, true, false, indices);
   };
@@ -1125,7 +1165,8 @@ restart:
             std::move(worker.nodequeue.popBestNode());
         mipdata_->nodequeue.emplaceNode(
             std::move(node.domchgstack), std::move(node.branchings),
-            node.lower_bound, node.estimate, node.depth);
+            node.lower_bound, node.estimate, node.depth, std::move(node.basis),
+            node.yield_count);
       }
       profiling_->stop(kMipClockOpenNodesToQueue0);
       worker.search_ptr_->flushStatistics(*this);
@@ -1202,6 +1243,92 @@ restart:
   }
   if (modelstatus_ != HighsModelStatus::kSolveError) syncSolutions();
   profiling_->stop(kMipClockSearch);
+
+  if (options_mip_->mip_node_lp_effort && !submip) {
+    HighsNodeLpEffortSummary aggregate;
+    for (const HighsMipWorker& worker : mipdata_->workers) {
+      const HighsNodeLpEffortSummary& summary = worker.nodeLpEffortSummary();
+      aggregate.attempts += summary.attempts;
+      aggregate.completed += summary.completed;
+      aggregate.yielded += summary.yielded;
+      aggregate.serial_completions += summary.serial_completions;
+      aggregate.numerical_failures += summary.numerical_failures;
+      aggregate.total_iterations += summary.total_iterations;
+      aggregate.completed_iterations += summary.completed_iterations;
+      aggregate.yielded_iterations += summary.yielded_iterations;
+      aggregate.maximum_iterations =
+          std::max(aggregate.maximum_iterations, summary.maximum_iterations);
+      aggregate.task_leases += summary.task_leases;
+      aggregate.task_lease_total_seconds +=
+          summary.task_lease_total_seconds;
+      aggregate.task_lease_max_seconds = std::max(
+          aggregate.task_lease_max_seconds, summary.task_lease_max_seconds);
+      for (size_t i = 0; i != aggregate.histogram.size(); ++i)
+        aggregate.histogram[i] += summary.histogram[i];
+      for (size_t i = 0; i != aggregate.yielded_histogram.size(); ++i)
+        aggregate.yielded_histogram[i] += summary.yielded_histogram[i];
+      for (size_t i = 0;
+           i != aggregate.task_lease_microseconds_histogram.size(); ++i)
+        aggregate.task_lease_microseconds_histogram[i] +=
+            summary.task_lease_microseconds_histogram[i];
+    }
+    using EffortHistogram = std::array<
+        int64_t, HighsNodeLpEffortSummary::kHistogramBuckets>;
+    auto percentile = [&](const EffortHistogram& histogram, double quantile) {
+      int64_t samples = 0;
+      for (int64_t count : histogram) samples += count;
+      if (samples == 0) return HighsInt{0};
+      const int64_t target = std::max<int64_t>(
+          1, static_cast<int64_t>(std::ceil(quantile * samples)));
+      int64_t cumulative = 0;
+      for (size_t bucket = 0; bucket != histogram.size(); ++bucket) {
+        cumulative += histogram[bucket];
+        if (cumulative >= target) {
+          if (bucket + 1 >= histogram.size()) return kHighsIInf;
+          return static_cast<HighsInt>(uint64_t{1} << (bucket + 1));
+        }
+      }
+      return aggregate.maximum_iterations;
+    };
+    const double task_lease_p50_seconds =
+        static_cast<double>(percentile(
+            aggregate.task_lease_microseconds_histogram, 0.50)) /
+        1000000.0;
+    const double task_lease_p95_seconds =
+        static_cast<double>(percentile(
+            aggregate.task_lease_microseconds_histogram, 0.95)) /
+        1000000.0;
+    highsLogUser(
+        options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-NodeLpEffort: schema=rost/highs-node-lp-effort/v2 "
+        "event=summary attempts=%lld completed=%lld yielded=%lld "
+        "serial_completions=%lld numerical_failures=%lld "
+        "lp_iterations=%lld completed_lp_iterations=%lld "
+        "yielded_lp_iterations=%lld completed_p50=%" HIGHSINT_FORMAT
+        " completed_p95=%" HIGHSINT_FORMAT
+        " yielded_p50=%" HIGHSINT_FORMAT
+        " yielded_p95=%" HIGHSINT_FORMAT " max=%" HIGHSINT_FORMAT
+        " task_leases=%lld task_lease_total=%.17g "
+        "task_lease_p50=%.17g task_lease_p95=%.17g "
+        "task_lease_max=%.17g\n",
+        static_cast<long long>(aggregate.attempts),
+        static_cast<long long>(aggregate.completed),
+        static_cast<long long>(aggregate.yielded),
+        static_cast<long long>(aggregate.serial_completions),
+        static_cast<long long>(aggregate.numerical_failures),
+        static_cast<long long>(aggregate.total_iterations),
+        static_cast<long long>(aggregate.completed_iterations),
+        static_cast<long long>(aggregate.yielded_iterations),
+        percentile(aggregate.histogram, 0.50),
+        percentile(aggregate.histogram, 0.95),
+        percentile(aggregate.yielded_histogram, 0.50),
+        percentile(aggregate.yielded_histogram, 0.95),
+        aggregate.maximum_iterations,
+        static_cast<long long>(aggregate.task_leases),
+        aggregate.task_lease_total_seconds, task_lease_p50_seconds,
+        task_lease_p95_seconds,
+        aggregate.task_lease_max_seconds);
+  }
 
   cleanupSolve();
 }
