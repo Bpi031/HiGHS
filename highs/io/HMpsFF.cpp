@@ -8,6 +8,9 @@
 
 #include "io/HMpsFF.h"
 
+#include <cmath>
+#include <cstdlib>
+
 #include "lp_data/HighsModelUtils.h"
 
 #ifdef ZLIB_FOUND
@@ -702,10 +705,9 @@ HMpsFF::Parsekey HMpsFF::parseRows(const HighsLogOptions& log_options,
     }
   }
 
-  // Hard to imagine how the following lines are executed
+  // EOF in a section is malformed external input, not an internal invariant.
   highsLogUser(log_options, HighsLogType::kError,
-               "Anomalous exit when parsing BOUNDS section of MPS file\n");
-  assert(1 == 0);
+               "Unexpected end of file in ROWS section of MPS file\n");
   // Update num_row in case there is free rows. They won't be added to the
   // constraint matrix.
   num_row = row_lower.size();
@@ -976,7 +978,11 @@ typename HMpsFF::Parsekey HMpsFF::parseCols(const HighsLogOptions& log_options,
       word = first_word(strline, end_marker);
       end = first_word_end(strline, end_marker);
 
-      assert(is_end(strline, end));
+      if (word.empty() || !is_end(strline, end)) {
+        highsLogUser(log_options, HighsLogType::kError,
+                     "Malformed row/value pair in COLUMNS section\n");
+        return HMpsFF::Parsekey::kFail;
+      }
 
       auto mit = rowname2idx.find(marker);
       if (mit == rowname2idx.end()) {
@@ -1214,7 +1220,11 @@ HMpsFF::Parsekey HMpsFF::parseRhs(const HighsLogOptions& log_options,
       word = first_word(strline, end_marker);
       end = first_word_end(strline, end_marker);
 
-      assert(is_end(strline, end));
+      if (word.empty() || !is_end(strline, end)) {
+        highsLogUser(log_options, HighsLogType::kError,
+                     "Malformed row/value pair in RHS section\n");
+        return HMpsFF::Parsekey::kFail;
+      }
 
       auto mit = rowname2idx.find(marker);
       if (mit == rowname2idx.end()) {
@@ -1499,9 +1509,8 @@ HMpsFF::Parsekey HMpsFF::parseBounds(const HighsLogOptions& log_options,
     if (is_integral) {
       assert(is_lb || is_ub || is_semi);
       // Must be LI, UI or SI, and value should be integer
-      HighsInt i_value = static_cast<HighsInt>(value);
-      double dl = value - i_value;
-      if (dl) {
+      // MPS bounds are doubles and may exceed the index type's range.
+      if (value != std::trunc(value)) {
         num_fractional_integer_bound++;
         if (num_fractional_integer_bound %
                 report_fractional_integer_bound_frequency ==
@@ -2100,14 +2109,12 @@ double HMpsFF::getValue(const std::string& word, bool& is_nan,
 
   std::string local_word = word;
   dD2e(local_word);
-  const double value = atof(local_word.c_str());
-  is_nan = false;
-  //  printf("value(%d) = %g\n", int(id), value);
-  //  if (std::isnan(value)) return true;
-  //  // atof('nan') yields 0 with some Windows compilers, so try a string
-  //  // comparison
-  //  std::string lower_word = word;
-  //  if (str_tolower(lower_word) == "nan") return true;
+  char* end = nullptr;
+  const char* start = local_word.c_str();
+  const double value = std::strtod(start, &end);
+  // The legacy flag also rejects malformed tokens instead of silently using
+  // atof's zero or a numeric prefix. Infinite bounds remain supported.
+  is_nan = end == start || end != start + local_word.size() || std::isnan(value);
   return value;
 }
 }  // namespace free_format_parser

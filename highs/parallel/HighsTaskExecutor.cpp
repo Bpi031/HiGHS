@@ -34,10 +34,12 @@ void HighsTaskExecutor::ExecutorHandle::dispose() {
     ptr->stopWorkerThreads(false);
   }
 
-  // check to see if we are the last handle and if so, delete the executor
-  if (--ptr->referenceCount == 0) {
-    cache_aligned::Deleter<HighsTaskExecutor>()(ptr);
-  }
-
+  HighsTaskExecutor* executor = ptr;
+  threadLocalWorkerDeque() = nullptr;
   ptr = nullptr;
+  isMain = false;
+  // Clear this thread's publication before releasing its lifetime reference.
+  if (--executor->referenceCount == 0) {
+    cache_aligned::Deleter<HighsTaskExecutor>()(executor);
+  }
 }

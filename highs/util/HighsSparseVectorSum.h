@@ -25,7 +25,15 @@ class HighsSparseVectorSum {
   HighsSparseVectorSum(HighsInt dimension) { setDimension(dimension); }
 
   void setDimension(HighsInt dimension) {
+    const bool shrinking = static_cast<size_t>(dimension) < values.size();
     values.resize(dimension);
+    if (shrinking) {
+      // Preserve prefix values and index order, but discard erased elements.
+      nonzeroinds.erase(
+          std::remove_if(nonzeroinds.begin(), nonzeroinds.end(),
+                         [dimension](HighsInt index) { return index >= dimension; }),
+          nonzeroinds.end());
+    }
     nonzeroinds.reserve(dimension);
   }
 

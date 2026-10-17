@@ -395,6 +395,10 @@ set(highs_sources
     mip/HighsPseudocost.cpp
     mip/HighsRedcostFixing.cpp
     mip/HighsRootWork.cpp
+    mip/HighsRootLpPortfolio.cpp
+    mip/HighsRootPrimalHelper.cpp
+    mip/HighsRootCutExchange.cpp
+    mip/HighsSearchCoordinator.cpp
     mip/HighsSearch.cpp
     mip/HighsSeparation.cpp
     mip/HighsSeparator.cpp
@@ -487,6 +491,7 @@ set(highs_headers
     lp_data/HConst.h
     lp_data/HighsAnalysis.h
     lp_data/HighsCallback.h
+    lp_data/HighsRefinementBudget.h
     lp_data/HighsCallbackStruct.h
     lp_data/HighsDebug.h
     lp_data/HighsIis.h
@@ -530,7 +535,14 @@ set(highs_headers
     mip/HighsPseudocost.h
     mip/HighsRedcostFixing.h
     mip/HighsRootWork.h
+    mip/HighsRootLpPortfolio.h
+    mip/HighsRootPrimalHelper.h
+    mip/HighsRootCutExchange.h
+    mip/HighsSolveCapacity.h
+    mip/HighsSearchCoordinator.h
+    mip/HighsProofFrontier.h
     mip/HighsSearch.h
+    mip/HighsSearchBatchAudit.h
     mip/HighsSeparation.h
     mip/HighsSeparator.h
     mip/HighsTableauSeparator.h

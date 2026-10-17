@@ -9,6 +9,7 @@
 #define HIGHS_SEARCH_H_
 
 #include <cstdint>
+#include <functional>
 #include <queue>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include "mip/HighsNodeQueue.h"
 #include "mip/HighsPseudocost.h"
 #include "mip/HighsSeparation.h"
+#include "mip/HighsSearchCoordinator.h"
 #include "presolve/HighsSymmetry.h"
 #include "util/HighsHash.h"
 
@@ -72,11 +74,16 @@ class HighsSearch {
     kBranched,
     kSubOptimal,
     kLpIterationLimit,
+    kLpSolveError,
+    kTaskWorkLimit,
+    kCandidateCheckpoint,
     kOpen,
   };
 
  private:
   ChildSelectionRule childselrule;
+  bool lp_recovery_failed_ = false;
+  std::function<bool(const HighsDetachedNode&)> donation_;
 
   struct NodeData {
     double lower_bound;
@@ -218,6 +225,11 @@ class HighsSearch {
 
   void openNodesToQueue(HighsNodeQueue& nodequeue);
 
+  void setDonationSink(std::function<bool(const HighsDetachedNode&)> sink) {
+    donation_ = std::move(sink);
+  }
+  bool donateReadySibling();
+
   void currentNodeToQueue(HighsNodeQueue& nodequeue);
 
   void flushStatistics(HighsMipSolver& mipsolver);
@@ -236,6 +248,13 @@ class HighsSearch {
   NodeResult evaluateNode();
 
   NodeResult branch();
+
+  // Failure is local to this search. Only the joined owner may stop the MIP.
+  NodeResult failLpRecovery() {
+    lp_recovery_failed_ = true;
+    return NodeResult::kLpSolveError;
+  }
+  bool lpRecoveryFailed() const { return lp_recovery_failed_; }
 
   /// backtrack one level in DFS manner
   bool backtrack(bool recoverBasis = true);

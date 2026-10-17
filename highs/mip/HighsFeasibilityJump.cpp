@@ -10,6 +10,8 @@
 #include "util/HighsSparseMatrix.h"
 
 HighsModelStatus HighsMipSolverData::feasibilityJump() {
+  if (mipsolver.callback_->refinement_budget && checkLimits())
+    return mipsolver.modelstatus_;
   // This is the (presolved) model being solved
   const HighsLp* model = this->mipsolver.model_;
   const HighsLogOptions& log_options = mipsolver.options_mip_->log_options;
@@ -24,6 +26,8 @@ HighsModelStatus HighsMipSolverData::feasibilityJump() {
 #else
 
   bool found_integer_feasible_solution = false;
+  const double fj_start = mipsolver.timer_.read();
+  size_t proposals = 0, total_effort = 0, stalled_effort = 0;
   std::vector<double> col_value(model->num_col_, 0.0);
   double objective_function_value;
 
@@ -109,15 +113,21 @@ HighsModelStatus HighsMipSolverData::feasibilityJump() {
 
   auto fjControlCallback =
       [=, &col_value, &found_integer_feasible_solution,
-       &objective_function_value](external_feasibilityjump::FJStatus status)
+       &objective_function_value, &proposals, &total_effort,
+       &stalled_effort](external_feasibilityjump::FJStatus status)
       -> external_feasibilityjump::CallbackControlFlow {
+    total_effort = status.totalEffort;
+    stalled_effort = status.effortSinceLastImprovement;
     if (status.solution != nullptr) {
+      ++proposals;
       found_integer_feasible_solution = true;
       col_value = std::vector<double>(status.solution,
                                       status.solution + status.numVars);
       objective_function_value =
           model->offset_ + sense_multiplier * status.solutionObjectiveValue;
     }
+    if (mipsolver.callback_->refinement_budget && checkLimits())
+      return external_feasibilityjump::CallbackControlFlow::Terminate;
     if (status.effortSinceLastImprovement > kMaxEffortSinceLastImprovement ||
         status.totalEffort > kMaxTotalEffort) {
       return external_feasibilityjump::CallbackControlFlow::Terminate;
@@ -128,12 +138,20 @@ HighsModelStatus HighsMipSolverData::feasibilityJump() {
 
   solver.solve(col_value.data(), fjControlCallback);
 
+  bool accepted = false;
   if (found_integer_feasible_solution) {
     // Initial assignments that violate integrality or column bounds can lead to
     // infeasible results. Even if those initial assignments should not occur,
     // use trySolution rather than addIncumbent for an explicit check.
-    trySolution(col_value, kSolutionSourceFeasibilityJump);
+    accepted = trySolution(col_value, kSolutionSourceFeasibilityJump);
   }
-  return HighsModelStatus::kNotset;
+  if (!mipsolver.submip)
+    highsLogUser(log_options, HighsLogType::kInfo,
+                 "MIP-FeasibilityJump: version=1 seeded=%d proposals=%zu "
+                 "accepted=%d effort=%zu stalled_effort=%zu elapsed=%.9g\n",
+                 int(use_incumbent), proposals, int(accepted), total_effort,
+                 stalled_effort, mipsolver.timer_.read() - fj_start);
+  return mipsolver.callback_->refinement_budget ? mipsolver.modelstatus_
+                                               : HighsModelStatus::kNotset;
 #endif
 }

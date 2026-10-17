@@ -37,6 +37,7 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
       TestDualize.cpp
       TestEkk.cpp
       TestFactor.cpp
+      TestFeasibilityJump.cpp
       TestFilereader.cpp
       TestHighsCDouble.cpp
       TestHighsExternalDeps.cpp
@@ -46,6 +47,7 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
       TestHighsIntegers.cpp
       TestHighsModel.cpp
       TestHighsParallel.cpp
+      TestHardwarePrimitives.cpp
       TestHighsRbTree.cpp
       TestHighsSparseMatrix.cpp
       TestHighsVersion.cpp
@@ -68,19 +70,29 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
       TestMultiObjective.cpp
       TestNames.cpp
       TestNodeLpEffort.cpp
+      TestNodeQueue.cpp
       TestNodeSeparation.cpp
       TestOptions.cpp
       TestPdlp.cpp
       TestPdlpHi.cpp
       TestPresolve.cpp
       TestPresolveRules.cpp
+      TestPresolveSparsify.cpp
       TestPrimalHeuristicManager.cpp
       TestQpSolver.cpp
       TestRanging.cpp
       TestRays.cpp
       TestRunData.cpp
       TestRootWork.cpp
+      TestRootLpPortfolio.cpp
+      TestProofFrontier.cpp
+      TestSearchCoordinator.cpp
+      TestRootCutExchange.cpp
+      TestRootPrimalHelper.cpp
+      TestRobustness.cpp
       TestSemiVariables.cpp
+      TestSearchLpWork.cpp
+      TestSearchBatchAudit.cpp
       TestSetup.cpp
       TestSort.cpp
       TestSpecialLps.cpp
@@ -166,6 +178,27 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
 
   add_test(NAME capi_unit_tests COMMAND capi_unit_tests)
 
+  # Fault injection needs one static binary: shared/DLL allocation ownership
+  # and symbol interposition differ by platform. No hooks enter the solver.
+  if (NOT BUILD_SHARED_LIBS)
+    add_executable(factor_allocation_check factor_allocation_check.cpp)
+    if (FAST_BUILD)
+      target_link_libraries(factor_allocation_check highs)
+    else()
+      target_link_libraries(factor_allocation_check libhighs)
+    endif()
+    add_test(NAME factor_allocation_check COMMAND factor_allocation_check)
+    set_tests_properties(factor_allocation_check PROPERTIES TIMEOUT 30)
+    add_executable(iterate_allocation_check iterate_allocation_check.cpp)
+    if (FAST_BUILD)
+      target_link_libraries(iterate_allocation_check highs)
+    else()
+      target_link_libraries(iterate_allocation_check libhighs)
+    endif()
+    add_test(NAME iterate_allocation_check COMMAND iterate_allocation_check)
+    set_tests_properties(iterate_allocation_check PROPERTIES TIMEOUT 30)
+  endif()
+
   # Check whether test executable builds OK.
   if ((NOT HIGHS_COVERAGE) AND
         (NOT BUILD_OPENBLAS OR
@@ -191,6 +224,22 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
   else()
     add_test(NAME unit_tests_all COMMAND unit_tests --success)
     set_tests_properties(unit_tests_all PROPERTIES TIMEOUT 10000) 
+  endif()
+
+  # The diagnostic capture sink currently supports POSIX absolute paths only.
+  # This environment-dependent test cannot run in unit_tests_all's process.
+  if (UNIX)
+    add_test(NAME construction_capture_io
+      COMMAND ${CMAKE_COMMAND}
+        "-DTEST_BINARY=$<TARGET_FILE:unit_tests>"
+        "-DCAPTURE_ROOT=${HIGHS_BINARY_DIR}/construction-capture"
+        -P "${PROJECT_SOURCE_DIR}/check/RunConstructionCaptureTest.cmake")
+    set_tests_properties(construction_capture_io PROPERTIES TIMEOUT 45)
+    if ((NOT HIGHS_COVERAGE) AND
+        (NOT BUILD_OPENBLAS OR
+        (LINUX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")))
+      set_tests_properties(construction_capture_io PROPERTIES DEPENDS unit-test-build)
+    endif()
   endif()
 
   # An individual test can be added with the command below but the approach

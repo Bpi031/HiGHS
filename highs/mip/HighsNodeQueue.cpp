@@ -8,6 +8,9 @@
 #include "mip/HighsNodeQueue.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <tuple>
 
 #include "lp_data/HConst.h"
@@ -216,21 +219,30 @@ void HighsNodeQueue::unlink(int64_t node) {
 }
 
 void HighsNodeQueue::setNumCol(HighsInt numCol) {
+  if (numCol < 0)
+    throw std::invalid_argument("Node queue column count must be nonnegative");
   if (this->numCol == numCol) return;
-  this->numCol = numCol;
-  allocatorState = std::unique_ptr<AllocatorState>(new AllocatorState());
+  // Parked nodes also own iterators into this arena and unresolved proof work.
+  if (numNodes() != 0)
+    throw std::logic_error("Cannot resize a node queue with outstanding nodes");
+  if (static_cast<uint64_t>(numCol) >
+      (std::numeric_limits<size_t>::max)() / sizeof(NodeSet))
+    throw std::length_error("Node queue column extent is out of range");
 
-  if (numCol == 0) return;
-  colLowerNodesPtr =
-      NodeSetArray((NodeSet*)::operator new(sizeof(NodeSet) * numCol));
-  colUpperNodesPtr =
-      NodeSetArray((NodeSet*)::operator new(sizeof(NodeSet) * numCol));
-
-  NodesetAllocator<std::pair<double, int64_t>> allocator(allocatorState.get());
+  // Prepare both indexes before committing any dimension or arena change.
+  std::unique_ptr<AllocatorState> nextState(new AllocatorState());
+  const size_t bytes = sizeof(NodeSet) * static_cast<size_t>(numCol);
+  NodeSetArray nextLower(numCol ? (NodeSet*)::operator new(bytes) : nullptr);
+  NodeSetArray nextUpper(numCol ? (NodeSet*)::operator new(bytes) : nullptr);
+  NodesetAllocator<std::pair<double, int64_t>> allocator(nextState.get());
   for (HighsInt i = 0; i < numCol; ++i) {
-    new (colLowerNodesPtr.get() + i) NodeSet(allocator);
-    new (colUpperNodesPtr.get() + i) NodeSet(allocator);
+    new (nextLower.get() + i) NodeSet(allocator);
+    new (nextUpper.get() + i) NodeSet(allocator);
   }
+  colLowerNodesPtr = std::move(nextLower);
+  colUpperNodesPtr = std::move(nextUpper);
+  allocatorState = std::move(nextState);
+  this->numCol = numCol;
 }
 
 void HighsNodeQueue::checkGlobalBounds(HighsInt col, double lb, double ub,
@@ -319,7 +331,8 @@ double HighsNodeQueue::pruneNode(int64_t nodeId) {
 double HighsNodeQueue::performBounding(double upper_limit) {
   NodeLowerRbTree lowerTree(this);
 
-  if (lowerTree.empty()) return 0.0;
+  // A tighter incumbent can exclude parked nodes even without active nodes.
+  if (lowerTree.empty() && numSuboptimal == 0) return 0.0;
 
   HighsCDouble treeweight = 0.0;
 
@@ -425,6 +438,17 @@ HighsInt HighsNodeQueue::getBestBoundDomchgStackSize() const {
 }
 
 void HighsNodeQueue::clear() {
+  // Never-populated indexes are already empty. Populated queues still release
+  // their arena, even when every slot has subsequently been freed.
+  if (nodes.empty() && freeslots.empty() &&
+      (numCol == 0 ||
+       (allocatorState && colLowerNodesPtr && colUpperNodesPtr))) {
+    lowerRoot = lowerMin = hybridEstimRoot = hybridEstimMin = -1;
+    suboptimalRoot = suboptimalMin = -1;
+    numSuboptimal = 0;
+    optimality_limit = kHighsInf;
+    return;
+  }
   const bool original = false;
   HighsNodeQueue nodequeue;
   nodequeue.setNumCol(numCol);

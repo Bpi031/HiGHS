@@ -97,8 +97,8 @@ class HighsSplitDeque {
   struct WorkerBunk {
     static constexpr uint64_t kAbaTagShift = 20;
     static constexpr uint64_t kIndexMask = (uint64_t{1} << kAbaTagShift) - 1;
-    alignas(64) std::atomic<int> haveJobs;
-    alignas(64) std::atomic<uint64_t> sleeperStack;
+    alignas(cache_aligned::alignment()) std::atomic<int> haveJobs;
+    alignas(cache_aligned::alignment()) std::atomic<uint64_t> sleeperStack;
 
     WorkerBunk() : haveJobs{0}, sleeperStack(0) {}
 
@@ -180,8 +180,10 @@ class HighsSplitDeque {
       }
     }
 
-    HighsTask* waitForNewTask(HighsSplitDeque* localDeque) {
+    HighsTask* waitForNewTask(HighsSplitDeque* localDeque,
+                            std::atomic<int>* startup_ready = nullptr) {
       pushSleeper(localDeque);
+      if (startup_ready) startup_ready->fetch_add(1, std::memory_order_release);
       localDeque->stealerData.semaphore.acquire();
 
       TSAN_ANNOTATE_HAPPENS_AFTER(&localDeque->stealerData.injectedTask);
@@ -191,18 +193,18 @@ class HighsSplitDeque {
   };
 
  private:
-  static_assert(sizeof(OwnerData) <= 64,
+  static_assert(sizeof(OwnerData) <= cache_aligned::alignment(),
                 "sizeof(OwnerData) exceeds cache line size");
-  static_assert(sizeof(StealerData) <= 64,
+  static_assert(sizeof(StealerData) <= cache_aligned::alignment(),
                 "sizeof(StealerData) exceeds cache line size");
-  static_assert(sizeof(WorkerBunkData) <= 64,
+  static_assert(sizeof(WorkerBunkData) <= cache_aligned::alignment(),
                 "sizeof(WorkerBunkData) exceeds cache line size");
 
-  alignas(64) OwnerData ownerData;
-  alignas(64) std::atomic<bool> splitRequest;
-  alignas(64) StealerData stealerData;
-  alignas(64) WorkerBunkData workerBunkData;
-  alignas(64) std::array<HighsTask, kTaskArraySize> taskArray;
+  alignas(cache_aligned::alignment()) OwnerData ownerData;
+  alignas(cache_aligned::alignment()) std::atomic<bool> splitRequest;
+  alignas(cache_aligned::alignment()) StealerData stealerData;
+  alignas(cache_aligned::alignment()) WorkerBunkData workerBunkData;
+  alignas(cache_aligned::alignment()) std::array<HighsTask, kTaskArraySize> taskArray;
 
   void growShared() {
     int haveJobs =
@@ -277,15 +279,15 @@ class HighsSplitDeque {
     ownerData.workerBunk = workerBunk;
     splitRequest.store(false, std::memory_order_relaxed);
 
-    assert((reinterpret_cast<uintptr_t>(this) & 63u) == 0);
-    static_assert(offsetof(HighsSplitDeque, splitRequest) == 64,
-                  "alignas failed to guarantee 64 byte alignment");
-    static_assert(offsetof(HighsSplitDeque, stealerData) == 128,
-                  "alignas failed to guarantee 64 byte alignment");
-    static_assert(offsetof(HighsSplitDeque, workerBunkData) == 192,
-                  "alignas failed to guarantee 64 byte alignment");
-    static_assert(offsetof(HighsSplitDeque, taskArray) == 256,
-                  "alignas failed to guarantee 64 byte alignment");
+    assert(reinterpret_cast<uintptr_t>(this) % cache_aligned::alignment() == 0);
+    static_assert(offsetof(HighsSplitDeque, splitRequest) == cache_aligned::alignment(),
+                  "split request must have a separate cache line");
+    static_assert(offsetof(HighsSplitDeque, stealerData) == 2 * cache_aligned::alignment(),
+                  "stealer data must have a separate cache line");
+    static_assert(offsetof(HighsSplitDeque, workerBunkData) == 3 * cache_aligned::alignment(),
+                  "worker data must have a separate cache line");
+    static_assert(offsetof(HighsSplitDeque, taskArray) == 4 * cache_aligned::alignment(),
+                  "tasks must have a separate cache line");
   }
 
   void checkInterrupt() {
@@ -520,7 +522,7 @@ class HighsSplitDeque {
         // from the stealer when it is finished and yield control to the
         // operating system until then.
         int numTries = HighsSchedulerConstants::kNumTryFac;
-        auto tStart = std::chrono::high_resolution_clock::now();
+        auto tStart = HighsSchedulerConstants::Clock::now();
 
         bool isFinished = popResult.second->isFinished();
 
@@ -534,11 +536,11 @@ class HighsSplitDeque {
           if (!isFinished) {
             auto numMicroSecs =
                 std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::high_resolution_clock::now() - tStart)
+                    HighsSchedulerConstants::Clock::now() - tStart)
                     .count();
 
             if (numMicroSecs < HighsSchedulerConstants::kMicroSecsBeforeSleep)
-              numTries *= 2;
+              numTries = HighsSchedulerConstants::nextSpinTries(numTries);
             else {
               waitForTaskToFinish(popResult.second, stealer);
               break;

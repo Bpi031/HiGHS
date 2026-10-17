@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <istream>
 #include <vector>
 
 #include "lp_data/HStruct.h"
@@ -21,12 +22,20 @@ class HighsMipSolver;
 class HighsMipWorker;
 class HighsLpRelaxation;
 class HighsOptions;
+struct HighsReplayContext;
 
 enum class HighsSubMipOrigin {
   kRootReducedCost,
   kRootRens,
   kTreeRens,
   kTreeRins,
+  kTreeLocalBranching,
+};
+
+struct HighsLocalBranchingRow {
+  std::vector<HighsInt> index;
+  std::vector<double> value;
+  double upper = 0;
 };
 
 class HighsPrimalHeuristics {
@@ -40,6 +49,8 @@ class HighsPrimalHeuristics {
 
   HighsRandom randgen;
   std::atomic<int64_t> nextSubMipInvocation{0};
+  bool portfolioCall(HighsMipWorker& worker, const std::vector<double>& relaxation,
+                     uint64_t burst_id, bool followup, bool at_root);
 
  public:
   HighsPrimalHeuristics(HighsMipSolver& mipsolver);
@@ -52,7 +63,43 @@ class HighsPrimalHeuristics {
                    HighsInt maxleaves, HighsInt maxnodes, HighsInt stallnodes,
                    HighsSubMipOrigin origin, double max_time = kHighsInf,
                    const HighsSubMipCallBudget* call_budget = nullptr,
-                   HighsPrimalHeuristicOutcome* outcome = nullptr);
+                   HighsPrimalHeuristicOutcome* outcome = nullptr,
+                   const std::vector<double>* starting_solution = nullptr,
+                   const HighsLocalBranchingRow* local_branching = nullptr,
+                   const HighsReplayContext* replay_context = nullptr,
+                   bool original_space = false);
+
+  // Candidate-only restrictions. Failure leaves the supplied bounds intact.
+  static bool buildRinsNeighbourhood(
+      const HighsLp& model, const std::vector<double>& relaxation,
+      const std::vector<double>& incumbent, double tolerance,
+      double min_fixing_rate, std::vector<double>& lower,
+      std::vector<double>& upper, double& fixing_rate);
+  static bool buildRensNeighbourhood(const HighsLp& model,
+      const std::vector<double>& relaxation, double tolerance,
+      std::vector<double>& lower, std::vector<double>& upper, double& fixing_rate);
+  static bool buildLocalBranchingRow(const HighsLp& model,
+      const std::vector<double>& incumbent, double tolerance, HighsInt radius,
+      HighsLocalBranchingRow& row);
+  static bool buildAssignmentLocalBranchingRow(const HighsLp& model,
+      const std::vector<double>& incumbent, const std::vector<HighsInt>& groups,
+      double tolerance, HighsInt radius, HighsLocalBranchingRow& row);
+  // Explicit caller-owned binary partition; non-support auxiliaries stay free.
+  // Bounds only: the caller must independently check seed rows and candidates.
+  static bool buildBinaryPartitionNeighbourhood(
+      const HighsLp& model, const std::vector<double>& incumbent,
+      const std::vector<HighsInt>& support,
+      const std::vector<HighsInt>& free_support, double tolerance,
+      std::vector<double>& lower, std::vector<double>& upper,
+      double& fixing_rate);
+  static bool readBinaryPartitionContract(std::istream& input,
+      const HighsLp& model, std::vector<HighsInt>& groups, HighsInt& free_groups);
+  static bool selectBinaryPartition(const HighsLp& model,
+      const std::vector<double>& incumbent, const std::vector<HighsInt>& groups,
+      HighsInt free_groups, int64_t ordinal, std::vector<HighsInt>& support,
+      std::vector<HighsInt>& free_support, int variant = 0);
+  void portfolio(HighsMipWorker& worker, const std::vector<double>& relaxation,
+                 bool at_root = false);
 
   static const char* subMipMethodName(HighsSubMipOrigin origin);
 
@@ -115,7 +162,8 @@ class HighsPrimalHeuristics {
                     const int solution_source, HighsMipWorker& worker);
 
   bool trySolution(const std::vector<double>& solution,
-                   const int solution_source, HighsMipWorker& worker);
+                   const int solution_source, HighsMipWorker& worker,
+                   HighsPrimalAdmissionReceipt* receipt = nullptr);
 
   HighsInt getNumSuccessObservations(HighsMipWorker& worker) const;
 

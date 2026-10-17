@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -37,6 +39,47 @@ struct HighsHardwareTopology {
   bool complete = false;
 };
 
+inline bool highsTopologySuffix(const std::string& name,
+                               const std::string& prefix, HighsInt& value) {
+  if (name.compare(0, prefix.size(), prefix) != 0 || name.size() == prefix.size())
+    return false;
+  HighsInt parsed = 0;
+  for (size_t i = prefix.size(); i < name.size(); ++i) {
+    if (name[i] < '0' || name[i] > '9') return false;
+    const HighsInt digit = name[i] - '0';
+    if (parsed > (std::numeric_limits<HighsInt>::max() - digit) / 10) return false;
+    parsed = 10 * parsed + digit;
+  }
+  value = parsed;
+  return true;
+}
+
+struct HighsCacheTopologyEntry {
+  HighsInt level = 0;
+  std::string type;
+  std::string shared_cpus;
+  HighsInt id = -1;
+};
+
+inline std::pair<HighsInt, std::string> highsLastLevelDataCache(
+    const std::vector<HighsCacheTopologyEntry>& entries) {
+  HighsInt level = 0;
+  for (const auto& entry : entries) {
+    if (entry.type == "Data" || entry.type == "Unified")
+      level = std::max(level, entry.level);
+  }
+  for (const auto& entry : entries) {
+    if (entry.level != level || level <= 0 ||
+        (entry.type != "Data" && entry.type != "Unified"))
+      continue;
+    if (!entry.shared_cpus.empty()) return {level, "cpus:" + entry.shared_cpus};
+    if (entry.id >= 0)
+      return {level, entry.type + ":id:" + std::to_string(entry.id)};
+  }
+  // Do not substitute a lower-level cache when the LLC identity is missing.
+  return {0, ""};
+}
+
 #if defined(__APPLE__)
 inline HighsInt highsReadSysctlInteger(const char* name) {
   int value = 0;
@@ -55,7 +98,6 @@ inline HighsHardwareTopology highsDetectHardwareTopology() {
   CPU_ZERO(&allowed);
   std::vector<HighsInt> cpus;
   if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-    topology.cpu_binding_available = true;
     for (HighsInt cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
       if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
     }
@@ -63,8 +105,9 @@ inline HighsHardwareTopology highsDetectHardwareTopology() {
   topology.logical_cpus = static_cast<HighsInt>(cpus.size());
 
   std::set<std::pair<HighsInt, HighsInt>> physical_cores;
-  std::set<HighsInt> cache_domains;
+  std::set<std::pair<HighsInt, std::string>> cache_domains;
   std::set<HighsInt> numa_nodes;
+  bool all_cpu_metadata = !cpus.empty();
   for (HighsInt cpu : cpus) {
     const std::string prefix =
         "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
@@ -72,38 +115,57 @@ inline HighsHardwareTopology highsDetectHardwareTopology() {
     std::ifstream core_input(prefix + "/topology/core_id");
     HighsInt package_id = -1;
     HighsInt core_id = -1;
-    if ((package_input >> package_id) && (core_input >> core_id))
+    if ((package_input >> package_id) && (core_input >> core_id) &&
+        package_id >= 0 && core_id >= 0)
       physical_cores.emplace(package_id, core_id);
+    else
+      all_cpu_metadata = false;
 
-    std::ifstream cache_input(prefix + "/cache/index3/id");
-    HighsInt cache_id = -1;
-    if (cache_input >> cache_id) cache_domains.insert(cache_id);
-
-    DIR* cpu_directory = opendir(prefix.c_str());
-    if (cpu_directory != nullptr) {
-      while (dirent* entry = readdir(cpu_directory)) {
+    std::vector<HighsCacheTopologyEntry> caches;
+    std::unique_ptr<DIR, decltype(&closedir)> cache_directory(
+        opendir((prefix + "/cache").c_str()), &closedir);
+    if (cache_directory != nullptr) {
+      while (dirent* entry = readdir(cache_directory.get())) {
         const std::string name(entry->d_name);
-        if (name.compare(0, 4, "node") != 0 || name.size() == 4) continue;
-        HighsInt node = 0;
-        bool numeric = true;
-        for (size_t i = 4; i != name.size(); ++i) {
-          if (name[i] < '0' || name[i] > '9') {
-            numeric = false;
-            break;
-          }
-          node = 10 * node + static_cast<HighsInt>(name[i] - '0');
-        }
-        if (numeric) numa_nodes.insert(node);
+        HighsInt index;
+        if (!highsTopologySuffix(name, "index", index)) continue;
+        const std::string cache_prefix = prefix + "/cache/" + name;
+        HighsCacheTopologyEntry cache;
+        std::ifstream(cache_prefix + "/level") >> cache.level;
+        std::ifstream(cache_prefix + "/type") >> cache.type;
+        std::ifstream(cache_prefix + "/shared_cpu_list") >> cache.shared_cpus;
+        std::ifstream(cache_prefix + "/id") >> cache.id;
+        caches.push_back(std::move(cache));
       }
-      closedir(cpu_directory);
     }
+    const auto cache = highsLastLevelDataCache(caches);
+    if (cache.first > 0)
+      cache_domains.insert(cache);
+    else
+      all_cpu_metadata = false;
+
+    bool cpu_numa_known = false;
+    std::unique_ptr<DIR, decltype(&closedir)> cpu_directory(
+        opendir(prefix.c_str()), &closedir);
+    if (cpu_directory != nullptr) {
+      while (dirent* entry = readdir(cpu_directory.get())) {
+        const std::string name(entry->d_name);
+        HighsInt node;
+        if (highsTopologySuffix(name, "node", node)) {
+          numa_nodes.insert(node);
+          cpu_numa_known = true;
+        }
+      }
+    }
+    all_cpu_metadata = all_cpu_metadata && cpu_numa_known;
   }
   topology.physical_cores = static_cast<HighsInt>(physical_cores.size());
   topology.last_level_cache_domains =
       static_cast<HighsInt>(cache_domains.size());
   topology.numa_nodes = static_cast<HighsInt>(numa_nodes.size());
-  topology.memory_binding_available = topology.numa_nodes > 0;
-  topology.complete = topology.logical_cpus > 0 && topology.physical_cores > 0 &&
+  // Discovering nodes is not evidence that a memory-binding operation works.
+  topology.complete = all_cpu_metadata && topology.logical_cpus > 0 &&
+                      topology.physical_cores > 0 &&
                       topology.numa_nodes > 0 &&
                       topology.last_level_cache_domains > 0;
 #elif defined(__APPLE__)
@@ -112,10 +174,7 @@ inline HighsHardwareTopology highsDetectHardwareTopology() {
   topology.performance_cores =
       highsReadSysctlInteger("hw.perflevel0.physicalcpu");
   topology.heterogeneous_core_classes = highsReadSysctlInteger("hw.nperflevels");
-  topology.numa_nodes = 1;
-  topology.last_level_cache_domains = 1;
-  topology.complete =
-      topology.logical_cpus > 0 && topology.physical_cores > 0;
+  // sysctl CPU counts do not establish NUMA or shared-cache domain counts.
 #else
   topology.logical_cpus =
       static_cast<HighsInt>(std::thread::hardware_concurrency());
@@ -134,14 +193,8 @@ inline HighsInt highsTopologyAwareWorkerCount(
   HighsInt workers = configured_threads;
   if (topology.logical_cpus > 0)
     workers = std::min(workers, topology.logical_cpus);
-  if (topology.heterogeneous_core_classes > 1 &&
-      topology.performance_cores > 0) {
-    workers = std::min(workers, topology.performance_cores);
-  } else if (topology.physical_cores > 0) {
-    workers = std::min(workers, topology.physical_cores);
-  } else if (!topology.complete) {
-    workers = 1;
-  }
+  // Core class and cache discovery are observations, not allocation authority.
+  // Missing metadata must not serialize an explicitly configured thread pool.
   return std::max(HighsInt{1}, workers);
 }
 

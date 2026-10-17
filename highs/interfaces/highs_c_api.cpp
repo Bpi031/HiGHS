@@ -763,6 +763,13 @@ HighsInt Highs_startCallback(void* highs, const HighsInt callback_type) {
   return (HighsInt)((Highs*)highs)->startCallback(callback_type);
 }
 
+HighsInt Highs_setPrimalServiceCallback(void* highs, HighsCCallbackType callback,
+                                      void* data) {
+  if (!highs) return static_cast<HighsInt>(HighsStatus::kError);
+  static_cast<Highs*>(highs)->setPrimalServiceCallback(callback, data);
+  return static_cast<HighsInt>(HighsStatus::kOk);
+}
+
 HighsInt Highs_stopCallback(void* highs, const HighsInt callback_type) {
   return (HighsInt)((Highs*)highs)->stopCallback(callback_type);
 }
@@ -1705,7 +1712,12 @@ HighsInt Highs_setCallbackSolution(HighsCallbackDataIn* data_in,
                                    HighsInt num_entries, const double* value) {
   if (data_in != nullptr && data_in->cbdata != nullptr) {
     HighsCallbackInput* obj = static_cast<HighsCallbackInput*>(data_in->cbdata);
-    return static_cast<int>(obj->setSolution(num_entries, value));
+    const HighsStatus status = obj->setSolution(num_entries, value);
+    // The C adapter copies this flag back after the callback returns. Do not
+    // overwrite user_interrupt: it may have been set by the C caller itself.
+    if (status != HighsStatus::kError && num_entries > 0)
+      data_in->user_has_solution = obj->user_has_solution ? 1 : 0;
+    return static_cast<int>(status);
   } else
     return static_cast<int>(HighsStatus::kError);
 }
@@ -1716,7 +1728,16 @@ HighsInt Highs_setCallbackSparseSolution(HighsCallbackDataIn* data_in,
                                          const double* value) {
   if (data_in != nullptr && data_in->cbdata != nullptr) {
     HighsCallbackInput* obj = static_cast<HighsCallbackInput*>(data_in->cbdata);
-    return static_cast<int>(obj->setSolution(num_entries, index, value));
+    HighsStatus status;
+    try {
+      status = obj->setSolution(num_entries, index, value);
+    } catch (...) {
+      // Sparse validation allocates scratch storage before touching the buffer.
+      return static_cast<int>(HighsStatus::kError);
+    }
+    if (status != HighsStatus::kError && num_entries > 0)
+      data_in->user_has_solution = obj->user_has_solution ? 1 : 0;
+    return static_cast<int>(status);
   } else
     return static_cast<int>(HighsStatus::kError);
 }
@@ -1724,9 +1745,73 @@ HighsInt Highs_setCallbackSparseSolution(HighsCallbackDataIn* data_in,
 HighsInt Highs_repairCallbackSolution(HighsCallbackDataIn* data_in) {
   if (data_in != nullptr && data_in->cbdata != nullptr) {
     HighsCallbackInput* obj = static_cast<HighsCallbackInput*>(data_in->cbdata);
-    return static_cast<int>(obj->repairSolution());
-  } else
+    HighsStatus status = HighsStatus::kError;
+    try {
+      status = obj->repairSolution();
+    } catch (...) {
+      obj->user_has_solution = false;
+    }
+    data_in->user_has_solution = obj->user_has_solution ? 1 : 0;
+    return static_cast<int>(status);
+  }
+  if (data_in) data_in->user_has_solution = 0;
+  return static_cast<int>(HighsStatus::kError);
+}
+
+HighsInt Highs_refineCallbackSolution(HighsCallbackDataIn* data_in,
+                                    double seconds, HighsInt nodes,
+                                    HighsInt lp_iterations,
+                                    HighsInt require_optimal) {
+  if (!data_in) return static_cast<int>(HighsStatus::kError);
+  if (!data_in->cbdata || (require_optimal != 0 && require_optimal != 1)) {
+    data_in->user_has_solution = 0;
+    if (data_in->cbdata)
+      static_cast<HighsCallbackInput*>(data_in->cbdata)->user_has_solution = false;
     return static_cast<int>(HighsStatus::kError);
+  }
+  auto* input = static_cast<HighsCallbackInput*>(data_in->cbdata);
+  HighsStatus status = HighsStatus::kError;
+  try {
+    status = input->refineSolution(seconds, nodes, lp_iterations,
+                                   require_optimal != 0);
+  } catch (...) {
+    // Helper allocation/model failures must never unwind across the C ABI.
+    input->user_has_solution = false;
+  }
+  *data_in = static_cast<HighsCallbackDataIn>(*input);
+  return static_cast<int>(status);
+}
+
+HighsInt Highs_getCallbackSolutionOutcome(const HighsCallbackDataIn* data_in,
+                                        HighsInt version,
+                                        HighsCallbackSolutionOutcome* outcome) {
+  if (!data_in || !data_in->cbdata || !outcome || version != 1)
+    return static_cast<HighsInt>(HighsStatus::kError);
+  *outcome = static_cast<const HighsCallbackInput*>(data_in->cbdata)->admission;
+  return static_cast<HighsInt>(HighsStatus::kOk);
+}
+
+HighsInt Highs_getLastCallbackSolutionOutcome(const void* highs, HighsInt version,
+                                            HighsCallbackSolutionOutcome* outcome) {
+  if (!highs || !outcome || version != 1)
+    return static_cast<HighsInt>(HighsStatus::kError);
+  *outcome = static_cast<const Highs*>(highs)->getCallbackSolutionOutcome();
+  return static_cast<HighsInt>(HighsStatus::kOk);
+}
+
+HighsInt Highs_tagCallbackSolution(HighsCallbackDataIn* data_in,
+                                 int64_t candidate_id, int64_t generation) {
+  if (!data_in || !data_in->cbdata || candidate_id <= 0 || generation <= 0)
+    return static_cast<HighsInt>(HighsStatus::kError);
+  auto* input = static_cast<HighsCallbackInput*>(data_in->cbdata);
+  input->candidate_id = candidate_id;
+  input->candidate_generation = generation;
+  return static_cast<HighsInt>(HighsStatus::kOk);
+}
+
+HighsInt Highs_getCallbackRefinementStatus(const HighsCallbackDataIn* data_in) {
+  if (!data_in || !data_in->cbdata) return -1;
+  return static_cast<const HighsCallbackInput*>(data_in->cbdata)->refinement_status;
 }
 
 // *********************

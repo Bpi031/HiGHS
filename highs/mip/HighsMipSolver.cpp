@@ -6,6 +6,7 @@
 /*                                                                       */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipSolver.h"
+#include <fstream>
 
 #include "lp_data/HighsLpUtils.h"
 #include "lp_data/HighsModelUtils.h"
@@ -24,6 +25,8 @@
 #include "presolve/HighsPostsolveStack.h"
 #include "presolve/PresolveComponent.h"
 #include "util/HighsCDouble.h"
+#include "mip/HighsCandidateVerifier.h"
+#include "mip/HighsPrimalService.h"
 #include "util/HighsIntegers.h"
 
 using std::fabs;
@@ -31,17 +34,18 @@ using std::fabs;
 namespace {
 uint64_t rinsNeighbourhoodSignature(
     const HighsMipSolverData& mipdata,
-    const std::vector<double>& relaxation_solution) {
-  if (mipdata.incumbent.size() != relaxation_solution.size()) return 0;
+    const std::vector<double>& relaxation_solution,
+    const std::vector<double>& incumbent) {
+  if (incumbent.size() != relaxation_solution.size()) return 0;
   uint64_t signature = 1469598103934665603ULL;
   size_t agreeing_columns = 0;
   for (HighsInt col : mipdata.integral_cols) {
-    if (std::abs(relaxation_solution[col] - mipdata.incumbent[col]) >
+    if (std::abs(relaxation_solution[col] - incumbent[col]) >
         mipdata.feastol)
       continue;
     ++agreeing_columns;
     const int64_t value = static_cast<int64_t>(
-        HighsIntegers::nearestInteger(mipdata.incumbent[col]));
+        HighsIntegers::nearestInteger(incumbent[col]));
     signature ^= static_cast<uint64_t>(col);
     signature *= 1099511628211ULL;
     signature ^= static_cast<uint64_t>(value);
@@ -116,10 +120,55 @@ void HighsMipSolver::runTask(F&& f, highs::parallel::TaskGroup& tg,
 }
 
 void HighsMipSolver::run() {
+  solve_capacity.reset(new HighsSolveCapacity(
+      std::max(1, highs::parallel::num_threads()),
+      size_t{256} * 1024 * 1024));
   modelstatus_ = HighsModelStatus::kNotset;
+  if (!submip && !options_mip_->mip_primal_partition_file.empty()) {
+    std::ifstream contract(options_mip_->mip_primal_partition_file);
+    std::string contract_kind;
+    contract >> contract_kind;
+    contract.clear();
+    contract.seekg(0);
+    const bool slot_contract = contract_kind == "ROST_ASSIGNMENT_SLOTS_V1";
+    if ((options_mip_->mip_primal_heuristic_schedule != "portfolio-cost-aware" &&
+         options_mip_->mip_primal_heuristic_schedule != "portfolio-assignment-adaptive" &&
+         options_mip_->mip_primal_heuristic_schedule != "portfolio-assignment-composed" &&
+         options_mip_->mip_primal_heuristic_schedule != "portfolio-assignment-progressive" &&
+         options_mip_->mip_primal_heuristic_schedule != "portfolio-assignment-opportunities") ||
+        (slot_contract ? (options_mip_->mip_primal_heuristic_schedule != "portfolio-cost-aware" ||
+                         !HighsAssignmentSupport::read(contract, *orig_model_, primal_assignment_slots)) :
+        !HighsPrimalHeuristics::readBinaryPartitionContract(
+            contract, *orig_model_, primal_partition_groups,
+            primal_partition_free_groups))) {
+      highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                   "Invalid original-column primal partition contract\n");
+      modelstatus_ = HighsModelStatus::kModelError;
+      return;
+    }
+  }
+  if (!submip && (options_mip_->mip_primal_heuristic_schedule == "portfolio-assignment-adaptive" ||
+                 options_mip_->mip_primal_heuristic_schedule == "portfolio-assignment-composed" ||
+                 options_mip_->mip_primal_heuristic_schedule == "portfolio-assignment-progressive" ||
+                 options_mip_->mip_primal_heuristic_schedule == "portfolio-assignment-opportunities") &&
+      primal_partition_groups.empty()) {
+    highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                 "Assignment-adaptive portfolio requires an original-column partition contract\n");
+    modelstatus_ = HighsModelStatus::kModelError;
+    return;
+  }
+  if (!submip) {
+    auto& input = callback_->data_in;
+    ++input.admission_generation;
+    input.incumbent_sequence = 0;
+    input.last_candidate_id = 0;
+    input.admission = {};
+    input.admission.generation = input.admission_generation;
+  }
   if (options_mip_->mip_incumbent_exchange != "off" &&
       options_mip_->mip_incumbent_exchange != "observe" &&
-      options_mip_->mip_incumbent_exchange != "deterministic") {
+      options_mip_->mip_incumbent_exchange != "deterministic" &&
+      options_mip_->mip_incumbent_exchange != "opportunistic") {
     highsLogUser(options_mip_->log_options, HighsLogType::kError,
                  "Unknown mip_incumbent_exchange '%s'\n",
                  options_mip_->mip_incumbent_exchange.c_str());
@@ -241,6 +290,10 @@ restart:
       }
     }
     // End of pre-root-node heuristics
+    if (callback_->refinement_budget && mipdata_->checkLimits()) {
+      cleanupSolve();
+      return;
+    }
     if (profiling_->mip_ && !submip)
       highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
                    "MIP-Timing: %11.2g - starting evaluate root node\n",
@@ -276,6 +329,12 @@ restart:
   mipdata_->printDisplayLine();
 
   const HighsInt max_num_workers = getMaxNumWorkers();
+  const bool primal_portfolio = !submip &&
+      mipdata_->heuristic_manager.portfolioEnabled();
+  const bool managed_rins_budget = !submip &&
+      (primal_portfolio || (mipdata_->heuristic_manager.config().schedule ==
+          HighsPrimalHeuristicSchedule::kManagedRins &&
+      mipdata_->heuristic_manager.config().rins_budget.max_lp_iterations > 0));
   if (options_mip_->mip_incumbent_exchange != "off" && !submip) {
     const HighsHardwareTopology topology = highsDetectHardwareTopology();
     highsLogUser(
@@ -324,9 +383,13 @@ restart:
     mipdata_->lps.emplace_back(mipdata_->getLp());
     // Have to set the global sub-solver call time pointer here for
     // new worker 0, since
-    // HighsLpRelaxation::removeWorkerSpecificRows(); solves an LP
+    // The new worker solves after installing its node/domain. It needs only
+    // the remapped model and basis here, not an extra cleanup solve.
     mipdata_->lps.back().setProfiling(this->profiling_);
-    mipdata_->lps.back().removeWorkerSpecificRows();
+    mipdata_->lps.back().removeWorkerSpecificRows(
+        opportunisticIncumbentExchange()
+            ? HighsLpRelaxation::CutRemovalMode::kModelAndBasisOnly
+            : HighsLpRelaxation::CutRemovalMode::kReoptimize);
     for (HighsInt i = 0; i != num_new_workers; ++i) {
       if (i != 0) {
         mipdata_->lps.emplace_back(mipdata_->lps.back());
@@ -381,10 +444,39 @@ restart:
     worker.nodequeue.setNumCol(numCol());
   };
 
+  int64_t candidate_checked = 0;
+  int64_t candidate_admitted = 0;
+  int64_t post_admission_queries = 0;
+  double candidate_wait_max = 0;
+  double candidate_check_seconds = 0;
+  int checkpoint_receipts = 0;
+  std::shared_ptr<const HighsPrimalSnapshot> joined_primal;
+  HighsCallbackInput joined_service_input;
+  bool service_failed = false;
+  bool service_had_owner = false;
+  uint64_t service_queries = 0, service_notifications = 0;
   auto syncSolutions = [&]() -> bool {
+    // Candidate-only admission already notified its distinct callback owner.
+    // Reconciliation must not emit older joined candidates as new incumbents.
+    struct RestoreSolutionCallbacks {
+      HighsCallback& cb;
+      bool solution, improving, logging;
+      ~RestoreSolutionCallbacks() {
+        cb.active[kCallbackMipSolution] = solution;
+        cb.active[kCallbackMipImprovingSolution] = improving;
+        cb.active[kCallbackMipLogging] = logging;
+      }
+    } restore{*callback_, callback_->active[kCallbackMipSolution],
+              callback_->active[kCallbackMipImprovingSolution],
+              callback_->active[kCallbackMipLogging]};
+    if (service_had_owner) {
+      callback_->active[kCallbackMipSolution] = false;
+      callback_->active[kCallbackMipImprovingSolution] = false;
+      callback_->active[kCallbackMipLogging] = false;
+    }
     // Note: Upper bound / limit of workers updated via addIncumbent
     std::vector<HighsWorkerCandidate> candidates;
-    bool mailbox_overflow = false;
+    bool mailbox_overflow = candidate_checkpoint.overflowed();
     for (HighsMipWorker& worker : mipdata_->workers) {
       if (worker.incumbent_mailbox_.overflowed()) {
         highsLogUser(options_mip_->log_options, HighsLogType::kError,
@@ -400,6 +492,7 @@ restart:
       for (HighsMipWorker& worker : mipdata_->workers) {
         worker.incumbent_mailbox_.drain();
         worker.incumbent_mailbox_.clearOverflow();
+        worker.attachPrimalStore(nullptr);
       }
       return false;
     }
@@ -411,6 +504,8 @@ restart:
                         std::make_move_iterator(worker_candidates.end()));
       worker.incumbent_mailbox_.clearOverflow();
     }
+    // This also retains a private-repair proposal that has no worker mailbox.
+    if (joined_primal) candidates.push_back(joined_primal->candidate);
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const HighsWorkerCandidate& left,
                         const HighsWorkerCandidate& right) {
@@ -422,11 +517,58 @@ restart:
                                        right.metadata.publication_sequence);
                      });
     for (HighsWorkerCandidate& candidate : candidates) {
-      mipdata_->addIncumbent(candidate.solution, candidate.native_objective,
+      const double dequeued = timer_.read();
+      const bool same_generation = candidate.metadata.admission_generation ==
+                                  callback_->data_in.admission_generation;
+      ++candidate_checked;
+      const bool accepted = same_generation && mipdata_->addIncumbent(candidate.solution, candidate.native_objective,
                              candidate.solution_source, true, false,
                              &candidate.metadata);
+      const double finished = timer_.read();
+      candidate_admitted += accepted;
+      candidate_wait_max = std::max(candidate_wait_max,
+          std::max(0.0, dequeued - candidate.metadata.publication_time));
+      candidate_check_seconds += std::max(0.0, finished - dequeued);
+      if (options_mip_->mip_candidate_checkpoint && candidate_checked <= 128)
+        highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-CandidateAdmission: schema=rost/highs-candidate-admission/v1 worker=%d epoch=%lld sequence=%lld "
+          "discovery_s=%.17g publication_s=%.17g dequeue_s=%.17g "
+          "finished_s=%.17g accepted=%d same_generation=%d authority=%s\n",
+          int(candidate.metadata.worker_id),
+          static_cast<long long>(candidate.metadata.work_epoch),
+          static_cast<long long>(candidate.metadata.publication_sequence),
+          candidate.metadata.discovery_time, candidate.metadata.publication_time,
+          dequeued, finished, int(accepted), int(same_generation),
+          opportunisticIncumbentExchange() ? "joined_reconciliation" : "joined_master");
     }
-    return true;
+    // Any cutoff used by a peer must have a globally retained witness before
+    // status/proof construction. A reconciliation failure is not infeasibility.
+    bool reconciled = !service_failed;
+    if (joined_primal && (mipdata_->incumbent.empty() ||
+        mipdata_->upper_bound > joined_primal->upper_bound + mipdata_->feastol))
+      reconciled = false;
+    for (HighsMipWorker& worker : mipdata_->workers) {
+      const auto snapshot = worker.pendingPrimalSnapshot();
+      if (snapshot && (mipdata_->incumbent.empty() ||
+          mipdata_->upper_bound > snapshot->upper_bound + mipdata_->feastol))
+        reconciled = false;
+      worker.attachPrimalStore(nullptr);
+    }
+    if (service_had_owner) {
+      auto& input = callback_->data_in;
+      input.incumbent_sequence = std::max(input.incumbent_sequence,
+                                          joined_service_input.incumbent_sequence);
+      input.last_candidate_id = joined_service_input.last_candidate_id;
+      input.admission = joined_service_input.admission;
+    }
+    joined_primal.reset();
+    service_had_owner = false;
+    if (!reconciled) {
+      highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                   "Checked peer witness did not reconcile at batch join\n");
+      modelstatus_ = HighsModelStatus::kSolveError;
+    }
+    return reconciled;
   };
 
   auto syncPools = [&](std::vector<HighsInt>& indices) -> void {
@@ -463,10 +605,12 @@ restart:
 
   auto doResetWorkerDomain = [&](HighsInt i) {
     HighsMipWorker& worker = mipdata_->workers[i];
+    if (worker.getGlobalDomain().infeasible()) return;
     for (const HighsDomainChange& domchg :
          mipdata_->getDomain().getDomainChangeStack()) {
       worker.getGlobalDomain().changeBound(domchg,
                                            HighsDomain::Reason::unspecified());
+      if (worker.getGlobalDomain().infeasible()) return;
     }
 #ifndef NDEBUG
     for (HighsInt col = 0; col < numCol(); ++col) {
@@ -484,7 +628,7 @@ restart:
     worker.getGlobalDomain().clearChangedCols();
   };
 
-  auto resetGlobalDomain = [&](bool force, bool resetWorkers) -> void {
+  auto resetGlobalDomain = [&](bool force, bool resetWorkers) -> bool {
     // if global propagation found bound changes, we update the domain
     if (!mipdata_->getDomain().getChangedCols().empty() || force) {
       profiling_->start(kMipClockUpdateLocalDomain);
@@ -492,11 +636,24 @@ restart:
                   "added %" HIGHSINT_FORMAT " global bound changes\n",
                   (HighsInt)mipdata_->getDomain().getChangedCols().size());
       mipdata_->cliquetable.cleanupFixed(mipdata_->getDomain());
+      if (mipdata_->getDomain().infeasible()) {
+        profiling_->stop(kMipClockUpdateLocalDomain);
+        return false;
+      }
       if (mipdata_->hasMultipleWorkers() && resetWorkers) {
         // Sync worker domains here. cleanupFixed might have found extra changes
         std::vector<HighsInt> indices(num_workers);
         std::iota(indices.begin(), indices.end(), 0);
         runTask(doResetWorkerDomain, tg, false, true, indices);
+        // All workers are joined. Global bound reconciliation can itself prove
+        // that no improving solution remains; do not erase that proof on reset.
+        for (const HighsInt i : indices) {
+          if (mipdata_->workers[i].getGlobalDomain().infeasible()) {
+            mipdata_->getDomain().markInfeasible();
+            profiling_->stop(kMipClockUpdateLocalDomain);
+            return false;
+          }
+        }
       }
       for (const HighsInt col : mipdata_->getDomain().getChangedCols())
         mipdata_->implications.cleanupVarbounds(col);
@@ -509,6 +666,7 @@ restart:
       mipdata_->removeFixedIndices();
       profiling_->stop(kMipClockUpdateLocalDomain);
     }
+    return true;
   };
 
   auto syncGlobalPseudoCost = [&]() -> void {
@@ -739,7 +897,8 @@ restart:
     const HighsSearch::NodeResult result =
         mipdata_->workers[i].search_ptr_->evaluateNode();
     if (result == HighsSearch::NodeResult::kSubOptimal ||
-        result == HighsSearch::NodeResult::kLpIterationLimit) {
+        result == HighsSearch::NodeResult::kLpIterationLimit ||
+        result == HighsSearch::NodeResult::kCandidateCheckpoint) {
       HighsNodeQueue& globalqueue = mipdata_->parallelLockActive()
                                         ? mipdata_->workers[i].nodequeue
                                         : mipdata_->nodequeue;
@@ -771,7 +930,10 @@ restart:
 
   auto separateAndStoreBasis = [&](HighsInt i) -> bool {
     HighsMipWorker& worker = mipdata_->workers[i];
-    if (options_mip_->mip_allow_cut_separation_at_nodes) {
+    HighsSearchWorkScope work_scope(worker.search_work,
+                                    HighsSearchWorkRole::kSeparation);
+    if (options_mip_->mip_allow_cut_separation_at_nodes &&
+        !worker.search_work.skipOptional()) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockNodeSearchSeparation);
       HighsNodeSeparationConfig node_separation_config;
@@ -885,8 +1047,9 @@ restart:
     return false;
   };
 
-  auto runHeuristics = [&](HighsInt i) -> bool {
+  auto runHeuristics = [&](HighsInt i, bool first_tree_lease) -> bool {
     HighsMipWorker& worker = mipdata_->workers[i];
+    worker.importPrimalSnapshot();
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockDiveEvaluateNode);
     const HighsSearch::NodeResult evaluate_node_result =
@@ -896,9 +1059,10 @@ restart:
 
     if (evaluate_node_result == HighsSearch::NodeResult::kSubOptimal ||
         evaluate_node_result ==
-            HighsSearch::NodeResult::kLpIterationLimit) {
-      if (evaluate_node_result ==
-          HighsSearch::NodeResult::kLpIterationLimit) {
+            HighsSearch::NodeResult::kLpIterationLimit ||
+        evaluate_node_result == HighsSearch::NodeResult::kCandidateCheckpoint) {
+      if (evaluate_node_result == HighsSearch::NodeResult::kLpIterationLimit ||
+          evaluate_node_result == HighsSearch::NodeResult::kCandidateCheckpoint) {
         HighsNodeQueue& queue = mipdata_->parallelLockActive()
                                    ? worker.nodequeue
                                    : mipdata_->nodequeue;
@@ -912,9 +1076,22 @@ restart:
       return false;
     }
 
+    // With a checked seed, first expose child nodes before optional repair.
+    // Cold-start RENS and subsequent tree leases retain their allowance.
+    const bool managed_repair = primal_portfolio ||
+        (managed_rins_budget && !worker.repairIncumbent().empty());
+    if (first_tree_lease && !managed_repair && !submip && max_num_workers > 1 &&
+        !worker.repairIncumbent().empty())
+      return false;
+
+    if (worker.search_work.checkpointRequested() ||
+        (!managed_repair && worker.search_work.skipOptional())) return false;
+    HighsSearchWorkScope work_scope(worker.search_work,
+                                    HighsSearchWorkRole::kHeuristic);
+
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockDivePrimalHeuristics);
-    if (mipdata_->incumbent.empty()) {
+    if (worker.repairIncumbent().empty()) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockDiveRandomizedRounding);
       mipdata_->heuristics.randomizedRounding(
@@ -923,38 +1100,56 @@ restart:
       if (!mipdata_->parallelLockActive())
         profiling_->stop(kMipClockDiveRandomizedRounding);
     }
-    if (mipdata_->incumbent.empty()) {
-      if (options_mip_->mip_heuristic_run_rens) {
+    if (primal_portfolio) {
+      mipdata_->heuristics.portfolio(worker,
+          worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+    } else if (worker.repairIncumbent().empty()) {
+      if (options_mip_->mip_heuristic_run_rens &&
+          !worker.search_work.skipOptional()) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRens);
+        const double helper_started = timer_.read();
+        // A blanket root-helper cap can suppress the only cold-start seed.
+        // Keep the existing tree RENS allowance; measure it separately.
+        const double allowance = kHighsInf;
         mipdata_->heuristics.RENS(
             worker,
             worker.getLpRelaxation().getLpSolver().getSolution().col_value,
-            kHighsInf, HighsSubMipOrigin::kTreeRens);
+            allowance, HighsSubMipOrigin::kTreeRens);
+        if (first_tree_lease && !submip && options_mip_->mip_root_work_budget)
+          highsLogDev(options_mip_->log_options, HighsLogType::kInfo,
+                      "MIP-TreeBootstrap: method=rens allowance=%.6g "
+                      "elapsed=%.6g candidate=%s\n",
+                      allowance, std::max(0.0, timer_.read() - helper_started),
+                      worker.repairIncumbent().empty() ? "false" : "true");
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRens);
       }
     } else {
-      if (options_mip_->mip_heuristic_run_rins) {
+      if (options_mip_->mip_heuristic_run_rins &&
+          (managed_repair || !worker.search_work.skipOptional())) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
         const std::vector<double>& relaxation_solution =
             worker.getLpRelaxation().getLpSolver().getSolution().col_value;
-        if (mipdata_->heuristic_manager.enabled() &&
-            !mipdata_->parallelLockActive()) {
+        if (mipdata_->heuristic_manager.enabled()) {
           HighsPrimalHeuristicContext context;
           context.method = HighsPrimalHeuristicMethod::kRins;
+          context.time = timer_.read();
+          context.restart = mipdata_->numRestarts;
+          context.worker_id = worker.workerId();
           context.node = mipdata_->num_nodes + worker.search_ptr_->nnodes;
           context.main_lp_iterations = std::max<int64_t>(
               0, mipdata_->total_lp_iterations -
                      mipdata_->heuristic_lp_iterations);
           context.heuristic_lp_iterations =
               mipdata_->heuristic_lp_iterations;
-          context.incumbent_sequence = mipdata_->numImprovingSols;
+          context.incumbent_sequence = worker.repairIncumbentSequence();
           context.recursion_depth = submip_level;
           context.neighbourhood_signature =
-              rinsNeighbourhoodSignature(*mipdata_, relaxation_solution);
-          context.has_incumbent = !mipdata_->incumbent.empty();
+              rinsNeighbourhoodSignature(*mipdata_, relaxation_solution,
+                                         worker.repairIncumbent());
+          context.has_incumbent = !worker.repairIncumbent().empty();
           context.has_lp_solution =
               relaxation_solution.size() ==
               static_cast<size_t>(numCol());
@@ -962,14 +1157,29 @@ restart:
               mipdata_->heuristic_manager.before(context);
           if (decision.run) {
             HighsPrimalHeuristicOutcome outcome;
+            const double helper_started = timer_.read();
+            const int64_t helper_lp_started = worker.getHeurLpIterations();
             const HighsSubMipCallBudget* budget =
                 mipdata_->heuristic_manager.config().schedule ==
                         HighsPrimalHeuristicSchedule::kManagedRins
                     ? &decision.budget
                     : nullptr;
-            mipdata_->heuristics.RINS(worker, relaxation_solution, budget,
-                                      &outcome);
-            mipdata_->heuristic_manager.record(context, outcome);
+            if (managed_repair) {
+              HighsRepairReservationScope repair(worker.search_work,
+                                                 decision.budget.max_lp_iterations);
+              if (repair.granted())
+                mipdata_->heuristics.RINS(worker, relaxation_solution, budget, &outcome);
+              else
+                outcome.reservation_denied = true;
+            } else {
+              mipdata_->heuristics.RINS(worker, relaxation_solution, budget, &outcome);
+            }
+            outcome.elapsed = std::max(outcome.elapsed, timer_.read() - helper_started);
+            outcome.lp_iterations = std::max(
+                outcome.lp_iterations, worker.getHeurLpIterations() - helper_lp_started);
+            outcome.finished_time = timer_.read();
+            mipdata_->heuristic_manager.record(context, outcome,
+                                               decision.observation_id);
           }
         } else {
           mipdata_->heuristics.RINS(worker, relaxation_solution);
@@ -998,8 +1208,17 @@ restart:
       if (search_dive_result == HighsSearch::NodeResult::kSubOptimal) {
         return true;
       }
+      if (search_dive_result == HighsSearch::NodeResult::kTaskWorkLimit) {
+        // openNodesToQueue at the epoch boundary owns the suspension.
+        return true;
+      }
+      if (search_dive_result == HighsSearch::NodeResult::kLpSolveError) {
+        // Leave the unresolved node open for the joined owner's error exit.
+        return true;
+      }
       if (search_dive_result ==
-          HighsSearch::NodeResult::kLpIterationLimit) {
+          HighsSearch::NodeResult::kLpIterationLimit ||
+          search_dive_result == HighsSearch::NodeResult::kCandidateCheckpoint) {
         HighsNodeQueue& queue = mipdata_->parallelLockActive()
                                    ? worker.nodequeue
                                    : mipdata_->nodequeue;
@@ -1011,19 +1230,107 @@ restart:
     return nodeLim != kHighsIInf && worker.search_ptr_->nnodes >= diveNodeLim;
   };
 
+  std::unique_ptr<HighsPrimalService> primal_service;
   auto processNodes = [&](const std::vector<HighsInt>& indices,
                           std::vector<RestartVote>& restarts,
                           const bool skip_separation, const HighsInt nodeLim,
                           const HighsInt plungeLimit, double avgiter) {
+    const uint64_t batch_sequence = candidate_checkpoint.sequence();
+    const HighsSearchCoordinator::Generation dispatch_generation{
+        "native-epoch-model", "native-epoch-mapping",
+        static_cast<uint64_t>(callback_->data_in.admission_generation), 0,
+        static_cast<uint64_t>(mipdata_->numRestarts)};
+    std::unique_ptr<HighsSearchCoordinator> dispatch;
+    std::vector<int64_t> dispatch_nodes(indices.size(), 0);
+    if (!submip && options_mip_->mip_flexible_node_dispatch &&
+        options_mip_->mip_incumbent_exchange != "deterministic" &&
+        indices.size() > 1 &&
+        indices.size() <= size_t(highs::parallel::num_threads()) &&
+        !options_mip_->mip_search_simulate_concurrency)
+      dispatch.reset(new HighsSearchCoordinator(
+          dispatch_generation, numCol(), indices.size(),
+          size_t{64} * 1024 * 1024, mipdata_->lower_bound));
+    std::shared_ptr<HighsPrimalSnapshotStore> primal_store;
+    if (opportunisticIncumbentExchange())
+      primal_store = std::make_shared<HighsPrimalSnapshotStore>(
+          *orig_model_, *model_, mipdata_->feastol,
+          callback_->data_in.admission_generation,
+          mipdata_->workers[indices.front()].workEpoch(), timer_.read());
+    if (primal_store && !mipdata_->incumbent.empty()) {
+      HighsWorkerCandidate seed;
+      seed.solution = mipdata_->incumbent;
+      seed.native_objective = mipdata_->upper_bound;
+      seed.solution_source = kSolutionSourceHighsSolution;
+      seed.metadata.admission_generation = callback_->data_in.admission_generation;
+      seed.metadata.work_epoch = mipdata_->workers[indices.front()].workEpoch();
+      seed.metadata.discovery_node = mipdata_->num_nodes;
+      seed.metadata.discovery_lp_iterations = mipdata_->total_lp_iterations;
+      seed.metadata.discovery_time = seed.metadata.publication_time = timer_.read();
+      primal_store->publish(seed, solution_);
+    }
+    try {
+      if (primal_store && callback_->primal_service_callback) {
+        if (primal_service) {
+          primal_service->nextBatch(
+              primal_store, callback_->data_in, mipdata_->lower_bound,
+              mipdata_->workers[indices.front()].workEpoch());
+        } else {
+          primal_service.reset(new HighsPrimalService(
+              primal_store, *orig_model_, *model_, *options_mip_,
+              mipdata_->postSolveStack, callback_->data_in,
+              callback_->primal_service_callback, callback_->primal_service_data,
+              mipdata_->lower_bound, mipdata_->workers[indices.front()].workEpoch(),
+              options_mip_->parallel == kHighsOnString &&
+                  highs::parallel::num_threads() > 1));
+        }
+      }
+      if (primal_service) primal_service->start();
+    } catch (const std::exception& error) {
+      // No worker owns the service yet. Keep installed nodes unresolved and
+      // let joined reconciliation turn the result into an explicit error.
+      service_failed = true;
+      highsLogUser(options_mip_->log_options, HighsLogType::kError,
+                   "Cannot start private primal service: %s\n", error.what());
+      return;
+    }
+    for (HighsInt i : indices)
+      mipdata_->workers[i].attachPrimalStore(primal_store);
+    for (HighsInt i : indices)
+      mipdata_->workers[i].attachPrimalService(primal_service.get());
     auto processNode = [&](HighsInt i) {
       HighsMipWorker& worker = mipdata_->workers[i];
+      const size_t dispatch_slot =
+          std::find(indices.begin(), indices.end(), i) - indices.begin();
+      if (dispatch)
+        worker.search_ptr_->setDonationSink([&](const HighsDetachedNode& node) {
+          return dispatch->offer(dispatch_generation, node);
+        });
       const double lease_started = timer_.read();
+      const int64_t lease_started_nodes = worker.search_ptr_->nnodes;
+      // Donation changes node ownership, not the receiving lease's allowance.
+      auto remainingLeaseNodes = [&]() -> HighsInt {
+        if (!dispatch || nodeLim == kHighsIInf) return nodeLim;
+        const int64_t used = worker.search_ptr_->nnodes - lease_started_nodes;
+        assert(used >= 0);
+        return used >= nodeLim ? 0 : nodeLim - HighsInt(used);
+      };
+      worker.search_work.begin(submip ? 0 : options_mip_->mip_search_work_lp_limit,
+                               options_mip_->mip_search_work_enforce, lease_started);
+      worker.search_work.attachCheckpoint(
+          !submip && options_mip_->mip_candidate_checkpoint
+              ? &candidate_checkpoint : nullptr, batch_sequence);
       auto run_lease = [&]() {
         int64_t nodes_explored = 0;
+        if (remainingLeaseNodes() == 0) return;
+        if (worker.search_work.checkpointRequested()) {
+          worker.search_work.recordCandidateYield();
+          return;
+        }
         if (!skip_separation) {
           const HighsSearch::NodeResult evaluate_result = evaluateNode(i);
           if (evaluate_result ==
-              HighsSearch::NodeResult::kLpIterationLimit) {
+              HighsSearch::NodeResult::kLpIterationLimit ||
+              evaluate_result == HighsSearch::NodeResult::kCandidateCheckpoint) {
             // The node was requeued with its last certified lower bound and
             // compatible basis. Remove the local search frame without
             // recording a processed node or pruned leaf.
@@ -1051,16 +1358,23 @@ restart:
         }
         bool considerHeuristics = true;
         while (true) {
+          if (remainingLeaseNodes() == 0) break;
+          if (worker.search_work.checkpointRequested()) {
+            worker.search_work.recordCandidateYield();
+            break;
+          }
           if (considerHeuristics &&
               (skip_separation || nodeLim == kHighsIInf ||
-               deterministicIncumbentExchange()) &&
+               boundedIncumbentEpochs()) &&
               worker.getAllowHeuristics() &&
-              mipdata_->moreHeuristicsAllowed()) {
-            if (runHeuristics(i)) break;
+              (mipdata_->moreHeuristicsAllowed() ||
+               primal_portfolio ||
+               (managed_rins_budget && !worker.repairIncumbent().empty()))) {
+            if (runHeuristics(i, skip_separation)) break;
           }
           considerHeuristics = false;
           if (worker.getGlobalDomain().infeasible()) break;
-          if (dive(i, nodeLim)) break;
+          if (dive(i, remainingLeaseNodes())) break;
           if (worker.search_ptr_->checkLimits(
                   worker.search_ptr_->getLocalNodes())) {
             break;
@@ -1082,10 +1396,66 @@ restart:
           restarts[i] = checkRestart(worker, 1);
         }
       };
-      run_lease();
+      try {
+        run_lease();
+        if (dispatch) {
+          for (int repeat = 0; repeat != 8; ++repeat) {
+            worker.search_ptr_->openNodesToQueue(worker.nodequeue);
+            if (remainingLeaseNodes() == 0 ||
+                worker.search_ptr_->lpRecoveryFailed() ||
+                worker.search_work.checkpointRequested() ||
+                worker.search_work.skipOptional() ||
+                worker.search_ptr_->checkLocalLimits())
+              break;
+            HighsSearchCoordinator::Receipt receipt;
+            if (!dispatch->take(dispatch_slot, receipt, true)) break;
+            worker.search_ptr_->installNode(receipt.node->node());
+            if (!dispatch->installed(receipt)) {
+              dispatch->fail();
+              break;
+            }
+            run_lease();
+          }
+          dispatch->retire(dispatch_slot);
+        }
+      } catch (...) {
+        if (!dispatch) throw;
+        // Preserve pending receipts on install failure. No early proof exit.
+        dispatch->fail();
+      }
+      worker.search_ptr_->setDonationSink({});
+      worker.search_work.finish();
+      dispatch_nodes[dispatch_slot] =
+          worker.search_ptr_->nnodes - lease_started_nodes;
       worker.recordTaskLease(std::max(0.0, timer_.read() - lease_started));
     };
     runTask(processNode, tg, true, false, indices);
+    if (dispatch) {
+      service_failed |= dispatch->failed();
+      for (auto& node : dispatch->drain())
+        mipdata_->nodequeue.emplaceNode(
+            std::move(node.changes), std::move(node.branchings), node.bound,
+            node.estimate, node.depth, std::move(node.basis), node.yields);
+      highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+                   "MIP-Dispatch: version=1 offered=%zu installed=%zu "
+                   "coverage_bound=%.17g failed=%d proof=joined_owner\n",
+                   dispatch->offered(), dispatch->installed(),
+                   dispatch->conservativeBound(), int(dispatch->failed()));
+      highsLogDev(options_mip_->log_options, HighsLogType::kInfo,
+                  "MIP-DispatchBudget: node_limit=%d max_nodes=%lld\n",
+                  int(nodeLim), static_cast<long long>(
+                      *std::max_element(dispatch_nodes.begin(), dispatch_nodes.end())));
+    }
+    if (primal_service) {
+      primal_service->stop();
+      service_failed |= primal_service->failed();
+      joined_service_input = primal_service->joinedInput();
+      service_had_owner = true;
+      service_queries = primal_service->queries();
+      service_notifications = primal_service->notifications();
+    }
+    if (primal_store) joined_primal = primal_store->latest();
+    for (HighsInt i : indices) mipdata_->workers[i].attachPrimalService(nullptr);
   };
 
   auto syncSepaStats = [&](HighsMipWorker& worker) {
@@ -1133,7 +1503,7 @@ restart:
       if (num_workers >= max_num_workers) {
         nodeLim = std::max(HighsInt{20}, 2 * nodeLim);
       }
-      if (deterministicIncumbentExchange()) {
+      if (boundedIncumbentEpochs()) {
         nodeLim = std::min(nodeLim,
                            options_mip_->mip_incumbent_epoch_nodes);
       } else if (nodeLim > 100) {
@@ -1149,12 +1519,28 @@ restart:
     processNodes(search_indices, workerRestartVotes, root_node, nodeLim, 100,
                  mipdata_->getLp().getAvgSolveIters());
 
+    // Read worker-owned receipts only after runTask has joined the batch.
+    if (!submip && options_mip_->mip_candidate_checkpoint)
+      for (HighsInt i : search_indices) {
+        const auto& work = mipdata_->workers[i].search_work;
+        if (work.firstCheckpointSeconds() < 0 || checkpoint_receipts >= 128) continue;
+        ++checkpoint_receipts;
+        highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-CandidateReturn: schema=rost/highs-candidate-return/v1 worker=%d "
+          "batch_sequence=%llu observed_s=%.17g returned_s=%.17g observed_phase=%s\n",
+          int(i), static_cast<unsigned long long>(work.batchSequence()),
+          work.firstCheckpointSeconds(), work.taskReturnSeconds(),
+          highsTaskPhaseName(work.checkpointPhase()));
+      }
+
     root_node = false;
 
     // Sync statistics, check infeasibility, and flush nodes from worker queues
     bool infeasible = false;
+    bool lp_recovery_failed = false;
     for (HighsInt i : search_indices) {
       HighsMipWorker& worker = mipdata_->workers[i];
+      lp_recovery_failed |= worker.search_ptr_->lpRecoveryFailed();
       if (worker.getGlobalDomain().infeasible()) {
         infeasible = true;
       }
@@ -1174,6 +1560,19 @@ restart:
       mipdata_->heuristics.flushStatistics(*this, worker);
     }
 
+    // Workers may prove their improving search empty after publishing its
+    // final incumbent. Admit joined packets before any terminal proof exit.
+    const int64_t admissions_before_sync = candidate_admitted;
+    if (!syncSolutions()) break;
+
+    if (lp_recovery_failed) {
+      highsLogUser(options_mip_->log_options, HighsLogType::kWarning,
+                   "Node LP recovery failed; unresolved search is not an "
+                   "infeasibility or optimality proof.\n");
+      modelstatus_ = HighsModelStatus::kSolveError;
+      break;
+    }
+
     if (infeasible) {
       mipdata_->nodequeue.clear();
       mipdata_->pruned_treeweight = 1.0;
@@ -1184,12 +1583,18 @@ restart:
     mipdata_->updateLowerBound(std::min(
         mipdata_->upper_bound, mipdata_->nodequeue.getBestLowerBound()));
 
-    if (!syncSolutions()) break;
-
     limit_reached = mipdata_->checkLimits();
     if (limit_reached) {
       mipdata_->printDisplayLine();
       break;
+    }
+
+    if (!submip && options_mip_->mip_candidate_checkpoint &&
+        candidate_admitted > admissions_before_sync) {
+      ++post_admission_queries;
+      mipdata_->queryExternalSolution(
+          solution_objective_, kExternalMipSolutionQueryOriginBeforeDive);
+      if (mipdata_->checkLimits()) break;
     }
 
     assert(!nodesInstalled());
@@ -1223,9 +1628,17 @@ restart:
     // Reset global domain and sync worker's global domains.
     bool spawn_more_workers = num_workers < max_num_workers &&
                               mipdata_->nodequeue.numNodes() > num_workers;
-    resetGlobalDomain(spawn_more_workers, mipdata_->hasMultipleWorkers());
+    if (!resetGlobalDomain(spawn_more_workers, mipdata_->hasMultipleWorkers())) {
+      // Candidate admission precedes reconciliation, so retain the admitted
+      // incumbent while closing the now-infeasible improving search domain.
+      mipdata_->nodequeue.clear();
+      mipdata_->pruned_treeweight = 1.0;
+      mipdata_->updateLowerBound(std::min(kHighsInf, mipdata_->upper_bound));
+      mipdata_->printDisplayLine();
+      break;
+    }
 
-    if ((nodeLim == kHighsIInf || deterministicIncumbentExchange()) &&
+    if ((nodeLim == kHighsIInf || boundedIncumbentEpochs()) &&
         checkWorkerRestartVotes(workerRestartVotes))
       goto restart;
 
@@ -1242,6 +1655,39 @@ restart:
     }
   }
   if (modelstatus_ != HighsModelStatus::kSolveError) syncSolutions();
+  if (opportunisticIncumbentExchange()) {
+    uint64_t resident_boundaries = 0;
+    HighsNodeLpEffortSummary resident;
+    for (const auto& worker : mipdata_->workers) {
+      resident_boundaries += worker.residentBoundaries();
+      const auto& observed = worker.residentLpSummary();
+      resident.attempts += observed.attempts;
+      resident.completed += observed.completed;
+      resident.yielded += observed.yielded;
+      resident.limit_stops += observed.limit_stops;
+      resident.numerical_failures += observed.numerical_failures;
+      resident.total_iterations += observed.total_iterations;
+      resident.maximum_iterations = std::max(resident.maximum_iterations,
+                                             observed.maximum_iterations);
+    }
+    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-PrimalService: schema=rost/highs-primal-service/v2 "
+        "queries=%llu notifications=%llu resident_boundaries=%llu "
+        "resident_attempts=%lld resident_completed=%lld resident_yielded=%lld "
+        "resident_limit_stops=%lld resident_failures=%lld "
+        "resident_lp_iterations=%lld resident_lp_max=%lld "
+        "failed=%d admission=checked_record proof_updates=joined\n",
+        static_cast<unsigned long long>(service_queries),
+        static_cast<unsigned long long>(service_notifications),
+        static_cast<unsigned long long>(resident_boundaries),
+        static_cast<long long>(resident.attempts),
+        static_cast<long long>(resident.completed),
+        static_cast<long long>(resident.yielded),
+        static_cast<long long>(resident.limit_stops),
+        static_cast<long long>(resident.numerical_failures),
+        static_cast<long long>(resident.total_iterations),
+        static_cast<long long>(resident.maximum_iterations), int(service_failed));
+  }
   profiling_->stop(kMipClockSearch);
 
   if (options_mip_->mip_node_lp_effort && !submip) {
@@ -1332,6 +1778,140 @@ restart:
         aggregate.task_lease_max_seconds);
   }
 
+  if (!submip) {
+    HighsSearchWorkSummary sum;
+    for (const HighsMipWorker& worker : mipdata_->workers) {
+      const auto& s = worker.search_work.summary();
+      if (options_mip_->mip_root_work_budget) {
+        highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+            "MIP-StrongProbe: version=1 event=summary worker=%d "
+            "scope=surviving_worker_tree_tasks calls=%lld certified=%lld "
+            "unavailable=%lld dropped=%lld retained=%llu\n", int(worker.workerId()),
+            static_cast<long long>(worker.search_work.probeCalls()),
+            static_cast<long long>(worker.search_work.probeCertified()),
+            static_cast<long long>(worker.search_work.probeUnavailable()),
+            static_cast<long long>(worker.search_work.probeDropped()),
+            static_cast<unsigned long long>(worker.search_work.strongProbes().size()));
+        for (const auto& probe : worker.search_work.strongProbes())
+          highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+              "MIP-StrongProbe: version=1 event=sample worker=%d lease=%lld "
+              "node=%lld depth=%lld column=%lld candidates=%lld reliable_directions=%lld "
+              "up=%d lp_iterations=%lld seconds=%.17g status=%d certified=%d "
+              "scope=optional_probe_only\n", int(worker.workerId()),
+              static_cast<long long>(probe.lease), static_cast<long long>(probe.node),
+              static_cast<long long>(probe.depth), static_cast<long long>(probe.column),
+              static_cast<long long>(probe.candidates),
+              static_cast<long long>(probe.reliable_directions), int(probe.up),
+              static_cast<long long>(probe.iterations), probe.seconds,
+              probe.status, int(probe.certified));
+      }
+      for (const auto& task : worker.search_work.tasks())
+        highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-TaskWork: worker=%d scope=local_completed_relaxations work=%lld "
+          "started_s=%.17g seconds=%.17g restoration_s=%.17g local_bound_gain=%.17g "
+          "completion_exemptions=%lld\n",
+          int(worker.workerId()), static_cast<long long>(task.work), task.started_seconds, task.seconds,
+          task.restoration_seconds, task.local_bound_gain,
+          static_cast<long long>(task.completion_exemptions));
+      sum.leases += s.leases;
+      sum.exhausted_leases += s.exhausted_leases;
+      sum.yields += s.yields;
+      sum.skipped_optional += s.skipped_optional;
+      sum.submip_reported_iterations += s.submip_reported_iterations;
+      sum.max_lease_work = std::max(sum.max_lease_work, s.max_lease_work);
+      sum.restoration_calls += s.restoration_calls;
+      sum.deferred_restorations += s.deferred_restorations;
+      sum.restoration_seconds += s.restoration_seconds;
+      sum.local_bound_observations += s.local_bound_observations;
+      sum.local_bound_gain += s.local_bound_gain;
+      sum.completion_exemptions += s.completion_exemptions;
+      sum.task_records_dropped += s.task_records_dropped;
+      sum.repair_reservations += s.repair_reservations;
+      sum.repair_iterations += s.repair_iterations;
+      for (size_t i = 0; i < sum.direct_iterations.size(); ++i)
+        sum.direct_iterations[i] += s.direct_iterations[i];
+      for (size_t i = 0; i < sum.lp_calls.size(); ++i)
+        sum.lp_calls[i].merge(s.lp_calls[i]);
+    }
+    for (size_t i = 0; i < sum.lp_calls.size(); ++i) {
+      const auto& work = sum.lp_calls[i];
+      highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-LpWork: schema=rost/highs-lp-work/v1 event=summary "
+          "scope=surviving_worker_tree_tasks kind=%s calls=%lld "
+          "simplex_iterations=%lld ipm_iterations=%lld "
+          "unavailable_iteration_calls=%lld unavailable_seconds_calls=%lld "
+          "seconds=%.17g\n",
+          highsLpWorkKindName(static_cast<HighsLpWorkKind>(i)),
+          static_cast<long long>(work.calls),
+          static_cast<long long>(work.simplex_iterations),
+          static_cast<long long>(work.ipm_iterations),
+          static_cast<long long>(work.unavailable_iteration_calls),
+          static_cast<long long>(work.unavailable_seconds_calls), work.seconds);
+    }
+    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-SearchWork: schema=rost/highs-search-work/v1 event=summary "
+        "scope=surviving_worker_tree_tasks enforce=%d limit=%lld leases=%lld exhausted=%lld "
+        "yields=%lld skipped_optional=%lld evaluation_lp=%lld "
+        "separation_lp=%lld heuristic_lp=%lld branch_lp=%lld "
+        "submip_reported_lp=%lld max_lease_work=%lld restoration_calls=%lld "
+        "restoration_us=%lld local_bound_observations=%lld "
+        "completion_exemptions=%lld task_records_dropped=%lld deferred_restorations=%lld "
+        "repair_reservations=%lld repair_iterations=%lld\n",
+        int(options_mip_->mip_search_work_enforce && options_mip_->mip_search_work_lp_limit > 0),
+        static_cast<long long>(options_mip_->mip_search_work_lp_limit),
+        static_cast<long long>(sum.leases),
+        static_cast<long long>(sum.exhausted_leases),
+        static_cast<long long>(sum.yields),
+        static_cast<long long>(sum.skipped_optional),
+        static_cast<long long>(sum.direct_iterations[0]),
+        static_cast<long long>(sum.direct_iterations[1]),
+        static_cast<long long>(sum.direct_iterations[2]),
+        static_cast<long long>(sum.direct_iterations[3]),
+        static_cast<long long>(sum.submip_reported_iterations),
+        static_cast<long long>(sum.max_lease_work),
+        static_cast<long long>(sum.restoration_calls),
+        static_cast<long long>(sum.restoration_seconds * 1e6),
+        static_cast<long long>(sum.local_bound_observations),
+        static_cast<long long>(sum.completion_exemptions),
+        static_cast<long long>(sum.task_records_dropped),
+        static_cast<long long>(sum.deferred_restorations),
+        static_cast<long long>(sum.repair_reservations),
+        static_cast<long long>(sum.repair_iterations));
+    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-TaskGain: scope=local_completed_relaxations "
+        "bound_gain=%.17g leases=%lld restoration_s=%.17g "
+        "global_bound_before_cleanup=%.17g\n",
+        sum.local_bound_gain, static_cast<long long>(sum.leases),
+        sum.restoration_seconds, mipdata_->lower_bound);
+  }
+  if (!submip && options_mip_->mip_candidate_checkpoint) {
+    int64_t yields = 0;
+    for (const HighsMipWorker& worker : mipdata_->workers)
+      yields += worker.search_work.summary().candidate_yields;
+    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+      "MIP-CandidateCheckpoint: schema=rost/highs-candidate-checkpoint/v1 "
+      "requests=%llu yields=%lld checked=%lld admitted=%lld "
+      "post_admission_queries=%lld publication_wait_max_s=%.17g "
+      "admission_call_s=%.17g\n",
+      static_cast<unsigned long long>(candidate_checkpoint.sequence()),
+      static_cast<long long>(yields), static_cast<long long>(candidate_checked),
+      static_cast<long long>(candidate_admitted),
+      static_cast<long long>(post_admission_queries), candidate_wait_max,
+      candidate_check_seconds);
+  }
+  if (opportunisticIncumbentExchange()) {
+    int64_t imports = 0;
+    double wait = 0;
+    for (const auto& worker : mipdata_->workers) {
+      imports += worker.peerImports();
+      wait = std::max(wait, worker.peerWaitMax());
+    }
+    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-PeerPrimal: schema=rost/highs-peer-primal/v1 "
+        "mode=opportunistic scope=surviving_workers peer_imports=%lld "
+        "peer_wait_max_s=%.17g authority=checked_record_joined_proof\n",
+        static_cast<long long>(imports), wait);
+  }
   cleanupSolve();
 }
 
@@ -1609,75 +2189,13 @@ bool HighsMipSolver::solutionFeasible(const HighsLp* lp,
                                       double& row_violation,
                                       double& integrality_violation,
                                       HighsCDouble& obj) const {
-  bound_violation = 0;
-  row_violation = 0;
-  integrality_violation = 0;
-  const double mip_feasibility_tolerance =
-      options_mip_->mip_feasibility_tolerance;
-
-  obj = lp->offset_;
-
-  if (kAllowDeveloperAssert)
-    assert(col_value.size() == static_cast<size_t>(lp->num_col_));
-  for (HighsInt i = 0; i != lp->num_col_; ++i) {
-    const double value = col_value[i];
-    obj += lp->col_cost_[i] * value;
-
-    if (lp->integrality_[i] == HighsVarType::kInteger) {
-      integrality_violation =
-          std::max(fractionality(value), integrality_violation);
-    }
-
-    const double lower = lp->col_lower_[i];
-    const double upper = lp->col_upper_[i];
-    double primal_infeasibility;
-    if (value < lower - mip_feasibility_tolerance) {
-      primal_infeasibility = lower - value;
-    } else if (value > upper + mip_feasibility_tolerance) {
-      primal_infeasibility = value - upper;
-    } else
-      continue;
-
-    bound_violation = std::max(bound_violation, primal_infeasibility);
-  }
-
-  // Check row feasibility if there are a positive number of rows.
-  //
-  // If there are no rows and pass_row_value is nullptr, then
-  // row_value_p is also nullptr since row_value is not resized
-  if (lp->num_row_ > 0) {
-    std::vector<double> row_value;
-    if (pass_row_value) {
-      if (kAllowDeveloperAssert)
-        assert((*pass_row_value).size() == static_cast<size_t>(lp->num_row_));
-    } else {
-      calculateRowValuesQuad(*lp, col_value, row_value);
-    }
-    const double* row_value_p =
-        pass_row_value ? (*pass_row_value).data() : row_value.data();
-    assert(row_value_p);
-
-    for (HighsInt i = 0; i != lp->num_row_; ++i) {
-      const double value = row_value_p[i];
-      const double lower = lp->row_lower_[i];
-      const double upper = lp->row_upper_[i];
-
-      double primal_infeasibility;
-      if (value < lower - mip_feasibility_tolerance) {
-        primal_infeasibility = lower - value;
-      } else if (value > upper + mip_feasibility_tolerance) {
-        primal_infeasibility = value - upper;
-      } else
-        continue;
-
-      row_violation = std::max(row_violation, primal_infeasibility);
-    }
-  }
-
-  const bool feasible = bound_violation <= mip_feasibility_tolerance &&
-                        integrality_violation <= mip_feasibility_tolerance &&
-                        row_violation <= mip_feasibility_tolerance;
-  return feasible;
+  const auto checked = highsVerifyCandidate(*lp, col_value, pass_row_value,
+                                            options_mip_->mip_feasibility_tolerance);
+  bound_violation = checked.bound_violation;
+  row_violation = checked.row_violation;
+  integrality_violation = checked.integrality_violation;
+  obj = checked.objective;
+  return checked.feasible;
 }
 
 std::vector<HighsModelStatus> HighsMipSolver::initialiseTerminatorRecord(

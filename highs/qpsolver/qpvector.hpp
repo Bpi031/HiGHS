@@ -39,6 +39,7 @@ struct QpVector {
   }
 
   QpVector& repopulate(const QpVector& other) {
+    if (this == &other) return *this;
     reset();
     for (HighsInt i = 0; i < other.num_nz; i++) {
       index[i] = other.index[i];
@@ -123,6 +124,11 @@ struct QpVector {
   }
 
   QpVector& saxpy(double a, double b, const QpVector& x) {
+    if (this == &x) {
+      // Keep the source and the non-aliased arithmetic/sparsification order.
+      const QpVector original(x);
+      return saxpy(a, b, original);
+    }
     scale(a);
     saxpy(b, x);
     return *this;

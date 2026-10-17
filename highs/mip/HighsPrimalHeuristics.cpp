@@ -8,6 +8,7 @@
 #include "mip/HighsPrimalHeuristics.h"
 
 #include <numeric>
+#include <map>
 #include <unordered_set>
 
 #include "../extern/pdqsort/pdqsort.h"
@@ -15,9 +16,12 @@
 #include "lp_data/HConst.h"
 #include "lp_data/HighsLpUtils.h"
 #include "mip/HighsCutGeneration.h"
+#include "mip/HighsCandidateVerifier.h"
+#include "mip/HighsChildProposalSink.h"
 #include "mip/HighsDomainChange.h"
 #include "mip/HighsLpRelaxation.h"
 #include "mip/HighsMipSolverData.h"
+#include "mip/HighsReplayCapture.h"
 #include "mip/MipTimer.h"
 #include "util/HighsHash.h"
 #include "util/HighsIntegers.h"
@@ -49,6 +53,8 @@ const char* HighsPrimalHeuristics::subMipMethodName(HighsSubMipOrigin origin) {
       return "rens";
     case HighsSubMipOrigin::kTreeRins:
       return "rins";
+    case HighsSubMipOrigin::kTreeLocalBranching:
+      return "local_branching";
   }
   return "unknown";
 }
@@ -61,6 +67,8 @@ void HighsPrimalHeuristics::configureSubMipOptions(
   options.mip_heuristic_run_rins = false;
   options.mip_heuristic_run_root_reduced_cost = false;
   options.mip_incumbent_exchange = "off";
+  options.mip_primal_heuristic_schedule = "off";
+  options.mip_primal_partition_file.clear();
   options.parallel = kHighsOffString;
   options.threads = 1;
   options.mip_detect_symmetry = false;
@@ -70,8 +78,667 @@ void HighsPrimalHeuristics::configureSubMipOptions(
 double HighsPrimalHeuristics::remainingHeuristicTime(double started,
                                                      double now,
                                                      double allowance) {
-  if (!std::isfinite(allowance)) return kHighsInf;
+  if (!std::isfinite(started) || !std::isfinite(now) ||
+      std::isnan(allowance) || allowance <= 0)
+    return 0.0;
+  if (allowance == kHighsInf) return kHighsInf;
   return std::max(0.0, allowance - std::max(0.0, now - started));
+}
+
+bool HighsPrimalHeuristics::buildRinsNeighbourhood(
+    const HighsLp& model, const std::vector<double>& relaxation,
+    const std::vector<double>& incumbent, double tolerance,
+    double min_fixing_rate, std::vector<double>& lower,
+    std::vector<double>& upper, double& fixing_rate) {
+  fixing_rate = 0.0;
+  const size_t n = static_cast<size_t>(std::max(HighsInt{0}, model.num_col_));
+  if (model.num_col_ < 0 || relaxation.size() != n || incumbent.size() != n ||
+      lower.size() != n || upper.size() != n || model.integrality_.size() != n ||
+      !std::isfinite(tolerance) || tolerance < 0 ||
+      !std::isfinite(min_fixing_rate) || min_fixing_rate < 0 || min_fixing_rate > 1)
+    return false;
+  std::vector<double> restricted_lower = lower, restricted_upper = upper;
+  size_t eligible = 0, fixed = 0;
+  for (size_t col = 0; col < n; ++col) {
+    const auto type = model.integrality_[col];
+    if ((type != HighsVarType::kContinuous && type != HighsVarType::kInteger &&
+         type != HighsVarType::kImplicitInteger) ||
+        !std::isfinite(relaxation[col]) || !std::isfinite(incumbent[col]) ||
+        std::isnan(lower[col]) || std::isnan(upper[col]) || lower[col] > upper[col] ||
+        incumbent[col] < lower[col] - tolerance ||
+        incumbent[col] > upper[col] + tolerance)
+      return false;
+    if (type != HighsVarType::kInteger) continue;
+    const double value = std::round(incumbent[col]);
+    if (std::abs(value - incumbent[col]) > tolerance) return false;
+    if (lower[col] == upper[col]) continue;
+    ++eligible;
+    if (std::abs(relaxation[col] - incumbent[col]) > tolerance ||
+        value < lower[col] || value > upper[col])
+      continue;
+    restricted_lower[col] = restricted_upper[col] = value;
+    ++fixed;
+  }
+  fixing_rate = eligible == 0 ? 0.0 : double(fixed) / double(eligible);
+  if (fixed == 0 || fixed == eligible || fixing_rate < min_fixing_rate)
+    return false;
+  lower.swap(restricted_lower);
+  upper.swap(restricted_upper);
+  return true;
+}
+
+bool HighsPrimalHeuristics::buildRensNeighbourhood(
+    const HighsLp& model, const std::vector<double>& relaxation,
+    double tolerance, std::vector<double>& lower, std::vector<double>& upper,
+    double& fixing_rate) {
+  fixing_rate = 0;
+  const size_t n = static_cast<size_t>(std::max(HighsInt{0}, model.num_col_));
+  if (model.num_col_ < 0 || relaxation.size() != n || lower.size() != n ||
+      upper.size() != n || model.integrality_.size() != n ||
+      !std::isfinite(tolerance) || tolerance < 0) return false;
+  auto lo = lower, hi = upper;
+  size_t changed = 0, eligible = 0, fixed = 0;
+  for (size_t j = 0; j < n; ++j) {
+    const auto type = model.integrality_[j];
+    if ((type != HighsVarType::kContinuous && type != HighsVarType::kInteger &&
+         type != HighsVarType::kImplicitInteger) ||
+        !std::isfinite(relaxation[j]) || std::isnan(lo[j]) || std::isnan(hi[j]) ||
+        lo[j] > hi[j] || relaxation[j] < lo[j] - tolerance ||
+        relaxation[j] > hi[j] + tolerance) return false;
+    if (type != HighsVarType::kInteger || lo[j] == hi[j]) continue;
+    ++eligible;
+    lo[j] = std::max(std::ceil(lo[j]), std::floor(relaxation[j] + tolerance));
+    hi[j] = std::min(std::floor(hi[j]), std::ceil(relaxation[j] - tolerance));
+    if (lo[j] > hi[j]) return false;
+    changed += lo[j] != lower[j] || hi[j] != upper[j];
+    fixed += lo[j] == hi[j];
+  }
+  if (!changed) return false;
+  fixing_rate = eligible ? double(fixed) / eligible : 0;
+  lower.swap(lo);
+  upper.swap(hi);
+  return true;
+}
+
+bool HighsPrimalHeuristics::buildLocalBranchingRow(
+    const HighsLp& model, const std::vector<double>& incumbent,
+    double tolerance, HighsInt radius, HighsLocalBranchingRow& row) {
+  const size_t n = static_cast<size_t>(std::max(HighsInt{0}, model.num_col_));
+  if (model.num_col_ < 0 || incumbent.size() != n || model.integrality_.size() != n ||
+      model.col_lower_.size() != n || model.col_upper_.size() != n || radius < 0 ||
+      !std::isfinite(tolerance) || tolerance < 0) return false;
+  HighsLocalBranchingRow built;
+  built.upper = radius;
+  for (size_t j = 0; j < n; ++j) {
+    const auto type = model.integrality_[j];
+    if ((type != HighsVarType::kContinuous && type != HighsVarType::kInteger &&
+         type != HighsVarType::kImplicitInteger) || !std::isfinite(incumbent[j]) ||
+        std::isnan(model.col_lower_[j]) || std::isnan(model.col_upper_[j]) ||
+        model.col_lower_[j] > model.col_upper_[j] ||
+        incumbent[j] < model.col_lower_[j] - tolerance ||
+        incumbent[j] > model.col_upper_[j] + tolerance) return false;
+    if (type != HighsVarType::kInteger || model.col_lower_[j] < 0 ||
+        model.col_upper_[j] > 1) continue;
+    const double value = std::round(incumbent[j]);
+    if ((value != 0 && value != 1) || std::abs(value - incumbent[j]) > tolerance ||
+        value < model.col_lower_[j] || value > model.col_upper_[j]) return false;
+    built.index.push_back(static_cast<HighsInt>(j));
+    built.value.push_back(value == 0 ? 1 : -1);
+    built.upper -= value;
+  }
+  if (built.index.empty()) return false;
+  row = std::move(built);
+  return true;
+}
+
+bool HighsPrimalHeuristics::buildAssignmentLocalBranchingRow(
+    const HighsLp& model, const std::vector<double>& incumbent,
+    const std::vector<HighsInt>& groups, double tolerance, HighsInt radius,
+    HighsLocalBranchingRow& row) {
+  if (groups.size() != size_t(std::max(HighsInt{0}, model.num_col_))) return false;
+  HighsLocalBranchingRow all, built;
+  if (!buildLocalBranchingRow(model, incumbent, tolerance, radius, all)) return false;
+  for (size_t col = 0; col < groups.size(); ++col)
+    if (groups[col] < 0 || groups[col] > model.num_col_ ||
+        (groups[col] && (model.integrality_[col] != HighsVarType::kInteger ||
+         model.col_lower_[col] < 0 || model.col_upper_[col] > 1))) return false;
+  built.upper = radius;
+  for (size_t i = 0; i < all.index.size(); ++i) {
+    if (!groups[all.index[i]]) continue;
+    built.index.push_back(all.index[i]);
+    built.value.push_back(all.value[i]);
+    if (all.value[i] < 0) --built.upper;
+  }
+  if (built.index.empty()) return false;
+  row = std::move(built);
+  return true;
+}
+
+bool HighsPrimalHeuristics::buildBinaryPartitionNeighbourhood(
+    const HighsLp& model, const std::vector<double>& incumbent,
+    const std::vector<HighsInt>& support,
+    const std::vector<HighsInt>& free_support, double tolerance,
+    std::vector<double>& lower, std::vector<double>& upper,
+    double& fixing_rate) {
+  fixing_rate = 0;
+  const size_t n = static_cast<size_t>(std::max(HighsInt{0}, model.num_col_));
+  if (model.num_col_ < 0 || incumbent.size() != n || lower.size() != n ||
+      upper.size() != n || model.integrality_.size() != n ||
+      model.col_lower_.size() != n || model.col_upper_.size() != n ||
+      &lower == &upper || support.empty() || free_support.empty() ||
+      !std::isfinite(tolerance) || tolerance < 0)
+    return false;
+  for (size_t col = 0; col < n; ++col) {
+    const auto type = model.integrality_[col];
+    if ((type != HighsVarType::kContinuous && type != HighsVarType::kInteger &&
+         type != HighsVarType::kImplicitInteger) ||
+        !std::isfinite(incumbent[col]) || std::isnan(lower[col]) ||
+        std::isnan(upper[col]) || std::isnan(model.col_lower_[col]) ||
+        std::isnan(model.col_upper_[col]) || lower[col] > upper[col] ||
+        lower[col] < model.col_lower_[col] || upper[col] > model.col_upper_[col] ||
+        incumbent[col] < lower[col] - tolerance ||
+        incumbent[col] > upper[col] + tolerance ||
+        (type == HighsVarType::kInteger &&
+         std::abs(incumbent[col] - std::round(incumbent[col])) > tolerance))
+      return false;
+  }
+  std::vector<unsigned char> membership(n, 0);
+  for (HighsInt col : support) {
+    if (col < 0 || static_cast<size_t>(col) >= n || membership[col] ||
+        model.integrality_[col] != HighsVarType::kInteger ||
+        model.col_lower_[col] < 0 || model.col_upper_[col] > 1)
+      return false;
+    const double bit = std::round(incumbent[col]);
+    if ((bit != 0 && bit != 1) || bit < lower[col] || bit > upper[col])
+      return false;
+    membership[col] = 1;
+  }
+  for (HighsInt col : free_support) {
+    if (col < 0 || static_cast<size_t>(col) >= n || membership[col] != 1)
+      return false;
+    membership[col] = 2;
+  }
+  size_t movable = 0, fixed = 0;
+  for (HighsInt col : support) {
+    if (lower[col] <= 0 && upper[col] >= 1) {
+      ++movable;
+      fixed += membership[col] == 1;
+    }
+  }
+  if (!fixed || fixed == movable) return false;
+  auto restricted_lower = lower, restricted_upper = upper;
+  for (HighsInt col : support) {
+    if (membership[col] == 1)
+      restricted_lower[col] = restricted_upper[col] = std::round(incumbent[col]);
+  }
+  fixing_rate = double(fixed) / double(movable);
+  lower.swap(restricted_lower);
+  upper.swap(restricted_upper);
+  return true;
+}
+
+bool HighsPrimalHeuristics::readBinaryPartitionContract(std::istream& input,
+    const HighsLp& model, std::vector<HighsInt>& groups, HighsInt& free_groups) {
+  std::string version;
+  HighsInt cols, count, free_count, support_count;
+  if (!(input >> version >> cols >> count >> free_count >> support_count) ||
+      version != "ROST_BINARY_PARTITION_V1" || cols != model.num_col_ ||
+      count <= 1 || count > cols || free_count <= 0 || free_count >= count ||
+      support_count < count || support_count > cols ||
+      model.sense_ != ObjSense::kMinimize ||
+      model.col_names_.size() != size_t(cols) ||
+      model.col_lower_.size() != size_t(cols) || model.col_upper_.size() != size_t(cols) ||
+      model.integrality_.size() != size_t(cols)) return false;
+  std::vector<HighsInt> parsed(cols, 0), sizes(count + 1, 0);
+  for (HighsInt record = 0; record < support_count; ++record) {
+    HighsInt col, group;
+    std::string name;
+    if (!(input >> col >> group >> name) || col < 0 || col >= cols ||
+        group <= 0 || group > count || parsed[col] ||
+        name != model.col_names_[col] ||
+        model.integrality_[col] != HighsVarType::kInteger ||
+        !(0 <= model.col_lower_[col] &&
+          model.col_lower_[col] <= model.col_upper_[col] &&
+          model.col_upper_[col] <= 1)) return false;
+    parsed[col] = group;
+    ++sizes[group];
+  }
+  std::string extra;
+  if (input >> extra || !input.eof()) return false;
+  for (HighsInt group = 1; group <= count; ++group)
+    if (!sizes[group]) return false;
+  groups.swap(parsed);
+  free_groups = free_count;
+  return true;
+}
+
+bool HighsPrimalHeuristics::selectBinaryPartition(const HighsLp& model,
+    const std::vector<double>& incumbent, const std::vector<HighsInt>& groups,
+    HighsInt free_groups, int64_t ordinal, std::vector<HighsInt>& support,
+    std::vector<HighsInt>& free_support, int variant) {
+  if (groups.size() != size_t(model.num_col_) || incumbent.size() != groups.size() ||
+      model.col_cost_.size() != groups.size() || model.col_lower_.size() != groups.size() ||
+      model.col_upper_.size() != groups.size() || free_groups <= 0 || ordinal < 0 ||
+      variant < 0 || variant > 2)
+    return false;
+  std::map<HighsInt, HighsCDouble> scores;
+  std::vector<HighsInt> declared;
+  for (HighsInt col = 0; col < model.num_col_; ++col) {
+    if (groups[col] < 0 || groups[col] > model.num_col_ ||
+        !std::isfinite(incumbent[col])) return false;
+    if (!groups[col]) continue;
+    declared.push_back(col);
+    if (model.col_lower_[col] <= 0 && model.col_upper_[col] >= 1)
+      scores.emplace(groups[col], 0);
+  }
+  if (scores.size() <= size_t(free_groups)) return false;
+  auto rows = model.a_matrix_;
+  rows.ensureRowwise();
+  for (HighsInt row = 0; row < model.num_row_; ++row) {
+    std::unordered_set<HighsInt> owners, penalties;
+    for (HighsInt k = rows.start_[row]; k < rows.start_[row + 1]; ++k) {
+      if (!rows.value_[k]) continue;
+      const HighsInt col = rows.index_[k];
+      if (groups[col] && scores.count(groups[col])) owners.insert(groups[col]);
+      if (!groups[col] && model.col_cost_[col] > 0 && incumbent[col] > 0)
+        penalties.insert(col);
+    }
+    if (owners.empty() || (variant == 0 && owners.size() > size_t(free_groups))) continue;
+    HighsCDouble penalty = 0;
+    for (HighsInt col : penalties) penalty += HighsCDouble(model.col_cost_[col]) * incumbent[col];
+    if (!std::isfinite(double(penalty))) return false;
+    for (HighsInt group : owners) scores[group] += penalty / double(owners.size());
+  }
+  std::vector<HighsInt> ranked;
+  for (const auto& score : scores) {
+    if (!std::isfinite(double(score.second))) return false;
+    ranked.push_back(score.first);
+  }
+  std::sort(ranked.begin(), ranked.end(), [&](HighsInt a, HighsInt b) {
+    return scores[a] != scores[b] ? scores[a] > scores[b] : a < b;
+  });
+  if (variant == 1) std::sort(ranked.begin(), ranked.end());
+  if (variant == 2) {
+    const HighsInt anchor = ranked[size_t(ordinal) % ranked.size()];
+    std::map<HighsInt, HighsCDouble> affinity;
+    for (HighsInt row = 0; row < model.num_row_; ++row) {
+      std::vector<HighsInt> owners;
+      bool touches = false;
+      for (HighsInt k = rows.start_[row]; k < rows.start_[row + 1]; ++k) {
+        if (!rows.value_[k]) continue;
+        const HighsInt group = groups[rows.index_[k]];
+        if (group && scores.count(group)) owners.push_back(group);
+        touches |= group == anchor;
+      }
+      if (!touches) continue;
+      std::sort(owners.begin(), owners.end());
+      owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+      if (owners.size() < 2) continue;
+      for (HighsInt group : owners) affinity[group] += 1.0 / double(owners.size());
+    }
+    for (HighsInt group : ranked) affinity.emplace(group, 0);
+    std::sort(ranked.begin(), ranked.end(), [&](HighsInt a, HighsInt b) {
+      if (a == anchor || b == anchor) return a == anchor && b != anchor;
+      if (affinity[a] != affinity[b]) return affinity[a] > affinity[b];
+      return scores[a] != scores[b] ? scores[a] > scores[b] : a < b;
+    });
+  }
+  const size_t offset = variant == 2 ? 0 :
+      (size_t(ordinal % int64_t(ranked.size())) * size_t(free_groups)) % ranked.size();
+  std::unordered_set<HighsInt> selected;
+  for (HighsInt i = 0; i < free_groups; ++i)
+    selected.insert(ranked[(offset + size_t(i)) % ranked.size()]);
+  std::vector<HighsInt> freed;
+  for (HighsInt col : declared) if (selected.count(groups[col])) freed.push_back(col);
+  support.swap(declared);
+  free_support.swap(freed);
+  return true;
+}
+
+void HighsPrimalHeuristics::portfolio(HighsMipWorker& worker,
+                                     const std::vector<double>& relaxation, bool at_root) {
+  auto& data = *mipsolver.mipdata_;
+  auto& manager = data.heuristic_manager;
+  if (mipsolver.submip || worker.getGlobalDomain().infeasible()) return;
+  if (manager.deferredEnabled()) worker.importPrimalSnapshot();
+  if (!manager.portfolioOpportunityAvailable(
+      std::max<int64_t>(0, data.total_lp_iterations - data.heuristic_lp_iterations),
+      data.numRestarts, mipsolver.timer_.read(), worker.repairIncumbentSequence())) return;
+  const bool burst_mode = manager.burstEnabled();
+  const uint64_t deferred = manager.deferredEnabled() ? manager.beginDeferredPortfolioBurst(
+      worker.workerId(), data.numRestarts, mipsolver.timer_.read(),
+      worker.upper_bound, worker.repairIncumbent()) : 0;
+  HighsPrimalPortfolioBurstScope burst(manager, worker.workerId(), data.numRestarts,
+                                     mipsolver.timer_.read(), deferred);
+  if (burst_mode && !burst.id()) return;
+  bool followup = deferred != 0;
+  for (int64_t call = 0; call < (burst_mode ? manager.config().portfolio_burst_calls : 1); ++call) {
+    worker.importPrimalSnapshot();
+    if (!portfolioCall(worker, relaxation, burst.id(), followup, at_root) || !burst_mode) return;
+    worker.importPrimalSnapshot();
+    if (manager.composedEnabled() && worker.search_work.checkpointRequested()) {
+      manager.deferPortfolioContinuation(burst.id(), worker.workerId(), data.numRestarts,
+          worker.repairIncumbentSequence(), worker.upper_bound, mipsolver.timer_.read(),
+          worker.repairIncumbent(), true);
+      return;
+    }
+    if (!manager.continuePortfolioBurst(burst.id(), worker.workerId(), data.numRestarts,
+        worker.repairIncumbentSequence(), worker.upper_bound, mipsolver.timer_.read(), worker.repairIncumbent())) {
+      if (manager.deferredEnabled())
+        manager.deferPortfolioContinuation(burst.id(), worker.workerId(), data.numRestarts,
+            worker.repairIncumbentSequence(), worker.upper_bound, mipsolver.timer_.read(),
+            worker.repairIncumbent());
+      return;
+    }
+    followup = true;
+  }
+}
+
+bool HighsPrimalHeuristics::portfolioCall(HighsMipWorker& worker,
+    const std::vector<double>& relaxation, uint64_t burst_id, bool followup, bool at_root) {
+  auto& data = *mipsolver.mipdata_;
+  auto& manager = data.heuristic_manager;
+  worker.importPrimalSnapshot();
+  std::array<bool, kHighsPrimalHeuristicMethodCount> eligible{};
+  eligible[static_cast<size_t>(HighsPrimalHeuristicMethod::kRens)] =
+      mipsolver.options_mip_->mip_heuristic_run_rens;
+  eligible[static_cast<size_t>(HighsPrimalHeuristicMethod::kRins)] =
+      mipsolver.options_mip_->mip_heuristic_run_rins && !worker.repairIncumbent().empty();
+  eligible[static_cast<size_t>(HighsPrimalHeuristicMethod::kLocalBranching)] =
+      !worker.repairIncumbent().empty();
+  // Continue with a fresh binary neighborhood of the checked improving seed,
+  // not a second RENS box around the unchanged relaxation.
+  if (followup && !manager.composedEnabled()) {
+    eligible[static_cast<size_t>(HighsPrimalHeuristicMethod::kRens)] = false;
+    eligible[static_cast<size_t>(HighsPrimalHeuristicMethod::kRins)] = false;
+  }
+  for (int attempted = 0; attempted < 3; ++attempted) {
+    HighsPrimalPortfolioChoice choice;
+    const auto method = manager.selectPortfolio(eligible, &choice);
+    if (method == HighsPrimalHeuristicMethod::kCount) return false;
+    eligible[static_cast<size_t>(method)] = false;
+    const double started = mipsolver.timer_.read();
+    const auto incumbent = worker.repairIncumbent();
+    std::vector<double> lower = worker.getGlobalDomain().col_lower_;
+    std::vector<double> upper = worker.getGlobalDomain().col_upper_;
+    const char* capture_method = method == HighsPrimalHeuristicMethod::kRens
+        ? "rens" : method == HighsPrimalHeuristicMethod::kRins ? "rins" : "local_branching";
+    const bool capture_enabled = HighsReplayCapture::enabled("sub_mip", capture_method);
+    // Retain the exact builder inputs only for an explicitly selected capture.
+    const auto capture_lower = capture_enabled ? lower : std::vector<double>{};
+    const auto capture_upper = capture_enabled ? upper : std::vector<double>{};
+    HighsLocalBranchingRow row;
+    const bool has_partition = method == HighsPrimalHeuristicMethod::kLocalBranching &&
+        !mipsolver.primal_partition_groups.empty();
+    const int variant = has_partition && manager.adaptiveEnabled()
+        ? manager.selectPartitionVariant() : -1;
+    const bool partition = has_partition && variant < 3;
+    const bool assignment_distance = has_partition && variant == 3;
+    const bool coupled_slots = method == HighsPrimalHeuristicMethod::kLocalBranching &&
+        !mipsolver.primal_assignment_slots.column_to_slot.empty();
+    const bool original_space = partition || assignment_distance || coupled_slots;
+    HighsAssignmentSupportResult slot_support;
+    const auto kind = method == HighsPrimalHeuristicMethod::kRens ? HighsPrimalNeighbourhoodKind::kRens :
+        method == HighsPrimalHeuristicMethod::kRins ? HighsPrimalNeighbourhoodKind::kRins :
+        coupled_slots ? HighsPrimalNeighbourhoodKind::kCoupledSlots :
+        partition ? HighsPrimalNeighbourhoodKind::kStaffPartition :
+        assignment_distance ? HighsPrimalNeighbourhoodKind::kAssignmentLocalBranching :
+        HighsPrimalNeighbourhoodKind::kReducedLocalBranching;
+    HighsInt radius = variant >= 3 ? HighsInt(manager.partitionAccounts()[variant].radius) : 0;
+    HighsInt free_groups = mipsolver.primal_partition_free_groups;
+    int64_t partition_ordinal = manager.account(method).scheduled;
+    if (variant >= 0 && variant < 3) {
+      const auto variants = manager.partitionAccounts();
+      free_groups = HighsInt(variants[variant].free_groups);
+      partition_ordinal = variants[variant].scheduled;
+      std::unordered_set<HighsInt> movable_groups;
+      const auto& original = *mipsolver.orig_model_;
+      for (HighsInt j = 0; j < original.num_col_; ++j)
+        if (mipsolver.primal_partition_groups[j] &&
+            original.col_lower_[j] <= 0 && original.col_upper_[j] >= 1)
+          movable_groups.insert(mipsolver.primal_partition_groups[j]);
+      free_groups = std::min(free_groups, HighsInt(movable_groups.size()) - 1);
+    }
+    std::vector<double> original_seed;
+    std::vector<HighsInt> partition_support, partition_free;
+    double fixing_rate = 0;
+    bool built = false;
+    if (method == HighsPrimalHeuristicMethod::kRins)
+      built = buildRinsNeighbourhood(*mipsolver.model_, relaxation, incumbent,
+          data.feastol, manager.config().rins_budget.min_fixing_rate,
+          lower, upper, fixing_rate);
+    else if (method == HighsPrimalHeuristicMethod::kRens)
+      built = buildRensNeighbourhood(*mipsolver.model_, relaxation, data.feastol,
+                                    lower, upper, fixing_rate);
+    else if (original_space) {
+      // Own the decoding cursor: neither preparation nor forward mapping may
+      // mutate the proof owner's shared postsolve stack.
+      auto mapping = data.postSolveStack;
+      HighsSolution restored;
+      restored.value_valid = true;
+      restored.col_value = incumbent;
+      mapping.undoPrimal(*mipsolver.options_mip_, restored, -1, true);
+      original_seed = std::move(restored.col_value);
+      const auto& original = *mipsolver.orig_model_;
+      lower = original.col_lower_;
+      upper = original.col_upper_;
+      if (highsVerifyCandidate(original, original_seed, nullptr, data.feastol).feasible) {
+        if (coupled_slots) {
+          partition_ordinal = manager.nextSlotSelectionOrdinal();
+          built = HighsAssignmentSupport::select(original, original_seed,
+              mipsolver.primal_assignment_slots, partition_ordinal, slot_support) &&
+              buildBinaryPartitionNeighbourhood(original, original_seed, slot_support.support,
+                  slot_support.free_columns, data.feastol, lower, upper, fixing_rate);
+          // Exact fixes can expose a seed's original-row residual: reject rather
+          // than weakening tolerance or launching from an unchecked start.
+          if (built) {
+            HighsLp restricted = original;
+            restricted.col_lower_ = lower;
+            restricted.col_upper_ = upper;
+            built = highsVerifyCandidate(restricted, original_seed, nullptr, data.feastol).feasible;
+          }
+        } else if (assignment_distance)
+          built = buildAssignmentLocalBranchingRow(original, original_seed,
+              mipsolver.primal_partition_groups, data.feastol, radius, row);
+        else
+          built = selectBinaryPartition(original, original_seed, mipsolver.primal_partition_groups,
+              free_groups, partition_ordinal, partition_support, partition_free,
+              variant < 0 ? 0 : variant) &&
+              buildBinaryPartitionNeighbourhood(original, original_seed, partition_support,
+                  partition_free, data.feastol, lower, upper, fixing_rate);
+      }
+    } else {
+      const int64_t calls = manager.account(method).scheduled;
+      if (variant < 3) radius = calls == 0 ? 2 : calls == 1 ? 4 : 8;
+      built = buildLocalBranchingRow(*mipsolver.model_, incumbent, data.feastol, radius, row);
+    }
+    HighsPrimalHeuristicContext context;
+    context.method = method;
+    context.at_root = at_root;
+    context.partition_variant = variant;
+    context.partition_groups = variant >= 0 && variant < 3 ? free_groups : 0;
+    context.neighbourhood = kind;
+    context.portfolio_choice = choice;
+    context.burst_id = burst_id;
+    context.seed_upper_bound = worker.upper_bound;
+    context.time = started;
+    context.restart = data.numRestarts;
+    context.worker_id = worker.workerId();
+    context.node = data.num_nodes + worker.search_ptr_->nnodes;
+    context.main_lp_iterations = std::max<int64_t>(0,
+        data.total_lp_iterations - data.heuristic_lp_iterations);
+    context.heuristic_lp_iterations = data.heuristic_lp_iterations;
+    context.incumbent_sequence = worker.repairIncumbentSequence();
+    if (manager.deferredEnabled() || manager.adaptiveEnabled()) context.checked_seed = incumbent;
+    context.recursion_depth = mipsolver.submip_level;
+    context.has_incumbent = !incumbent.empty();
+    context.has_lp_solution = relaxation.size() == static_cast<size_t>(mipsolver.numCol());
+    if (built) {
+      context.restriction_identity = lower;
+      context.restriction_identity.insert(context.restriction_identity.end(), upper.begin(), upper.end());
+      if (method == HighsPrimalHeuristicMethod::kLocalBranching && !partition && !coupled_slots) {
+        context.restriction_identity.push_back(row.upper);
+        for (size_t j = 0; j < row.index.size(); ++j) {
+          context.restriction_identity.push_back(row.index[j]);
+          context.restriction_identity.push_back(row.value[j]);
+        }
+      }
+      context.neighbourhood_signature = 1;
+      for (double value : context.restriction_identity)
+        context.neighbourhood_signature = HighsHashHelpers::hash(
+            context.neighbourhood_signature ^ std::hash<double>{}(value));
+    }
+    const auto decision = manager.before(context);
+    if (coupled_slots)
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-SlotSelection: version=1 decision=%llu worker=%lld restart=%lld "
+          "seed_sequence=%lld ordinal=%lld free_columns=%lld run=%d reason=%s\n",
+          static_cast<unsigned long long>(decision.observation_id),
+          static_cast<long long>(context.worker_id), static_cast<long long>(context.restart),
+          static_cast<long long>(context.incumbent_sequence), static_cast<long long>(partition_ordinal),
+          static_cast<long long>(slot_support.free_columns.size()), int(decision.run),
+          HighsPrimalHeuristicManager::reasonName(decision.reason));
+    if (!decision.run) {
+      // The existing three-attempt loop bounds duplicate support searches. A
+      // rejected support consumes no child credit, but must advance the anchor.
+      if (coupled_slots && decision.reason == HighsPrimalHeuristicDecisionReason::kDuplicateNeighbourhood)
+        eligible[static_cast<size_t>(method)] = true;
+      continue;
+    }
+    if (manager.adaptiveEnabled())
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-Adaptive-Call: version=1 decision=%llu method=%s root=%d "
+          "has_incumbent=%d variant=%d seed_sequence=%lld time=%.17g lp_budget=%lld\n",
+          static_cast<unsigned long long>(decision.observation_id), capture_method,
+          int(at_root), int(context.has_incumbent), variant,
+          static_cast<long long>(context.incumbent_sequence), started,
+          static_cast<long long>(decision.budget.max_lp_iterations));
+    if (manager.composedEnabled())
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-Neighbourhood: version=1 decision=%llu kind=%s variant=%d "
+          "radius=%d coordinates=%s\n",
+          static_cast<unsigned long long>(decision.observation_id),
+          HighsPrimalHeuristicManager::neighbourhoodName(kind), variant, int(radius),
+          original_space ? "original" : "reduced");
+    HighsPrimalHeuristicReservation reservation(manager, context, decision);
+    HighsPrimalHeuristicOutcome outcome;
+    outcome.fixing_rate = fixing_rate;
+    outcome.fixing_rate_measured = true;
+    HighsSubMipCallBudget remaining = decision.budget;
+    remaining.max_time = std::min(
+        remainingHeuristicTime(started, mipsolver.timer_.read(), remaining.max_time),
+        std::max(0.0, mipsolver.options_mip_->time_limit - mipsolver.timer_.read()));
+    const double child_started = mipsolver.timer_.read();
+    HighsRepairReservationScope repair(worker.search_work, remaining.max_lp_iterations,
+        at_root && manager.adaptiveEnabled(), child_started);
+    if (repair.granted() && remaining.max_time > 0) {
+      const auto origin = method == HighsPrimalHeuristicMethod::kRins
+          ? HighsSubMipOrigin::kTreeRins : method == HighsPrimalHeuristicMethod::kRens
+          ? (at_root ? HighsSubMipOrigin::kRootRens : HighsSubMipOrigin::kTreeRens)
+          : HighsSubMipOrigin::kTreeLocalBranching;
+      const auto& lp = worker.getLpRelaxation();
+      HighsReplayContext replay;
+      replay.decision = decision.observation_id;
+      replay.worker = worker.workerId();
+      replay.restart = data.numRestarts;
+      replay.relaxation = original_space ? nullptr : &relaxation;
+      replay.base_lower = original_space ? nullptr : &capture_lower;
+      replay.base_upper = original_space ? nullptr : &capture_upper;
+      replay.checked_seed = original_space ? &original_seed : &incumbent;
+      replay.original_space = original_space;
+      if (original_space) {
+        replay.base_lower = &mipsolver.orig_model_->col_lower_;
+        replay.base_upper = &mipsolver.orig_model_->col_upper_;
+      }
+      replay.lp_solution_status = original_space ? kSolutionStatusNone :
+          lp.getLpSolver().getInfo().primal_solution_status;
+      if (partition)
+        highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+            "MIP-Partition: version=1 decision=%llu worker=%lld ordinal=%lld "
+            "support=%lld free_columns=%lld free_groups=%lld coordinates=original\n",
+            static_cast<unsigned long long>(decision.observation_id),
+            static_cast<long long>(worker.workerId()),
+            static_cast<long long>(manager.account(method).scheduled - 1),
+            static_cast<long long>(partition_support.size()),
+            static_cast<long long>(partition_free.size()),
+            static_cast<long long>(free_groups));
+      if (variant >= 0 && variant < 3)
+        highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+            "MIP-Partition-Variant: version=1 decision=%llu variant=%d "
+            "free_groups=%lld ordinal=%lld seed_sequence=%lld\n",
+            static_cast<unsigned long long>(decision.observation_id), variant,
+            static_cast<long long>(free_groups), static_cast<long long>(partition_ordinal),
+            static_cast<long long>(context.incumbent_sequence));
+      solveSubMip(worker, original_space ? *mipsolver.orig_model_ : lp.getLp(),
+          lp.getLpSolver().getBasis(), fixing_rate,
+          std::move(lower), std::move(upper), 500, 200, 12, origin,
+          remaining.max_time, &remaining, &outcome,
+          original_space ? &original_seed : incumbent.empty() ? nullptr : &incumbent,
+          method == HighsPrimalHeuristicMethod::kLocalBranching && !partition && !coupled_slots ? &row : nullptr,
+          &replay, original_space);
+      if (coupled_slots) {
+        const uint64_t invocation = outcome.children.retained == 1 ? outcome.children.items[0].invocation : 0;
+        HighsInt parent_fixed = 0, free_movable = 0, builder_fixed = 0;
+        const auto& original = *mipsolver.orig_model_;
+        for (HighsInt col : slot_support.support) {
+          if (!(original.col_lower_[col] <= 0 && original.col_upper_[col] >= 1)) ++parent_fixed;
+          else if (std::binary_search(slot_support.free_columns.begin(), slot_support.free_columns.end(), col)) ++free_movable;
+          else ++builder_fixed;
+        }
+        highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+            "MIP-SlotChild: version=2 decision=%llu invocation=%llu worker=%lld restart=%lld "
+            "seed_sequence=%lld ordinal=%lld coordinates=original support=%lld free_columns=%lld free_slots=%lld "
+            "parent_fixed=%lld free_movable=%lld builder_fixed=%lld auxiliary_fixed=0 "
+            "visited_rows=%lld visited_edges=%lld skipped_dense_rows=%lld support_cap=%d work_cap=%d "
+            "first_lp_seconds=%.17g first_lp_iterations=%lld started=%d accepted=%d own_gain=%d\n",
+            static_cast<unsigned long long>(decision.observation_id), static_cast<unsigned long long>(invocation),
+            static_cast<long long>(worker.workerId()), static_cast<long long>(data.numRestarts),
+            static_cast<long long>(context.incumbent_sequence), static_cast<long long>(partition_ordinal),
+            static_cast<long long>(slot_support.support.size()),
+            static_cast<long long>(slot_support.free_columns.size()), static_cast<long long>(slot_support.free_slots),
+            static_cast<long long>(parent_fixed), static_cast<long long>(free_movable), static_cast<long long>(builder_fixed),
+            static_cast<long long>(slot_support.visited_rows), static_cast<long long>(slot_support.visited_edges),
+            static_cast<long long>(slot_support.skipped_dense_rows), int(slot_support.support_cap_reached),
+            int(slot_support.work_cap_reached), outcome.children.retained == 1 ? outcome.children.items[0].first_lp_seconds : -1.0,
+            static_cast<long long>(outcome.children.retained == 1 ? outcome.children.items[0].first_lp_iterations : 0),
+            int(outcome.started), int(outcome.candidate_accepted), int(outcome.admission.measured && outcome.admission.improved));
+      }
+      if (manager.composedEnabled() && outcome.children.retained == 1)
+        highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+            "MIP-Neighbourhood-Child: version=1 decision=%llu invocation=%llu\n",
+            static_cast<unsigned long long>(decision.observation_id),
+            static_cast<unsigned long long>(outcome.children.items[0].invocation));
+    } else {
+      outcome.reservation_denied = !repair.granted();
+      outcome.preparation_exhaustions = 1;
+      outcome.preparation_stop_mask = remaining.max_time <= 0
+          ? kHighsHeuristicStopDeadline : kHighsHeuristicStopCheckpoint;
+    }
+    outcome.phase_measured = outcome.fixing_rate_measured = true;
+    outcome.child_lp_iterations = std::max<int64_t>(0,
+        outcome.lp_iterations - outcome.completion_lp_iterations);
+    outcome.child_calls = outcome.started ? 1 : 0;
+    outcome.child_seconds = std::max(0.0, mipsolver.timer_.read() - child_started);
+    outcome.elapsed = std::max(0.0, mipsolver.timer_.read() - started);
+    outcome.preparation_seconds = std::max(0.0, outcome.elapsed - outcome.child_seconds);
+    outcome.finished_time = mipsolver.timer_.read();
+    if (worker.search_work.checkpointRequested() &&
+        (!manager.composedEnabled() || (outcome.children.retained == 1 &&
+         outcome.children.items[0].status == int(HighsModelStatus::kInterrupt))))
+      outcome.preparation_stop_mask |= kHighsHeuristicStopCheckpoint;
+    reservation.finish(outcome);
+    if (manager.adaptiveEnabled())
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-Adaptive-Outcome: version=1 decision=%llu started=%d completed=%d "
+          "proposed=%d accepted=%d improved=%d lp_iterations=%lld "
+          "setup_seconds=%.17g child_seconds=%.17g elapsed=%.17g finished_time=%.17g\n",
+          static_cast<unsigned long long>(decision.observation_id), int(outcome.started),
+          int(outcome.completed), int(outcome.candidate_proposed), int(outcome.candidate_accepted),
+          int(outcome.candidate_improved), static_cast<long long>(outcome.lp_iterations),
+          outcome.preparation_seconds, outcome.child_seconds, outcome.elapsed, outcome.finished_time);
+    return true;
+  }
+  return false;
 }
 
 const char* HighsPrimalHeuristics::subMipParentPhaseName(
@@ -82,6 +749,7 @@ const char* HighsPrimalHeuristics::subMipParentPhaseName(
       return "root";
     case HighsSubMipOrigin::kTreeRens:
     case HighsSubMipOrigin::kTreeRins:
+    case HighsSubMipOrigin::kTreeLocalBranching:
       return "tree";
   }
   return "unknown";
@@ -96,6 +764,8 @@ static int subMipSolutionSource(HighsSubMipOrigin origin) {
       return kSolutionSourceRens;
     case HighsSubMipOrigin::kTreeRins:
       return kSolutionSourceRins;
+    case HighsSubMipOrigin::kTreeLocalBranching:
+      return kSolutionSourceSubMip;
   }
   return kSolutionSourceSubMip;
 }
@@ -140,7 +810,11 @@ bool HighsPrimalHeuristics::solveSubMip(
     std::vector<double> colUpper, HighsInt maxleaves, HighsInt maxnodes,
     HighsInt stallnodes, HighsSubMipOrigin origin, double max_time,
     const HighsSubMipCallBudget* call_budget,
-    HighsPrimalHeuristicOutcome* outcome) {
+    HighsPrimalHeuristicOutcome* outcome,
+    const std::vector<double>* starting_solution,
+    const HighsLocalBranchingRow* local_branching,
+    const HighsReplayContext* replay_context, bool original_space) {
+  const double call_started = mipsolver.timer_.read();
   if (!subMipLaunchAllowed(mipsolver.submip, mipsolver.submip_level)) {
     highsLogUser(
         mipsolver.options_mip_->log_options, HighsLogType::kError,
@@ -152,8 +826,27 @@ bool HighsPrimalHeuristics::solveSubMip(
   }
   if (outcome != nullptr) {
     *outcome = HighsPrimalHeuristicOutcome{};
-    outcome->started = true;
     outcome->fixing_rate = fixingRate;
+  }
+  if (call_budget != nullptr &&
+      (call_budget->max_time <= 0 || call_budget->max_lp_iterations == 0 ||
+       call_budget->max_nodes == 0 || call_budget->max_leaves == 0 ||
+       call_budget->max_stall_nodes == 0))
+    return false;
+  if (local_branching) {
+    if (lp.num_row_ == std::numeric_limits<HighsInt>::max() ||
+        local_branching->index.empty() ||
+        local_branching->index.size() != local_branching->value.size() ||
+        !std::isfinite(local_branching->upper) ||
+        colLower.size() != static_cast<size_t>(lp.num_col_) ||
+        colUpper.size() != static_cast<size_t>(lp.num_col_)) return false;
+    std::unordered_set<HighsInt> indices;
+    for (size_t j = 0; j < local_branching->index.size(); ++j) {
+      const HighsInt col = local_branching->index[j];
+      if (col < 0 || col >= lp.num_col_ ||
+          (local_branching->value[j] != 1 && local_branching->value[j] != -1) ||
+          !indices.insert(col).second) return false;
+    }
   }
   HighsOptions submipoptions = *mipsolver.options_mip_;
   HighsLp submip = lp;
@@ -161,8 +854,22 @@ bool HighsPrimalHeuristics::solveSubMip(
   // set bounds and restore integrality of the lp relaxation copy
   submip.col_lower_ = std::move(colLower);
   submip.col_upper_ = std::move(colUpper);
-  submip.integrality_ = mipsolver.model_->integrality_;
-  submip.offset_ = 0;
+  submip.integrality_ = original_space ? mipsolver.orig_model_->integrality_ : mipsolver.model_->integrality_;
+  if (!original_space) submip.offset_ = 0;
+  if (local_branching) {
+    HighsSparseMatrix added;
+    added.format_ = MatrixFormat::kRowwise;
+    added.num_row_ = 1;
+    added.num_col_ = submip.num_col_;
+    added.start_ = {0, static_cast<HighsInt>(local_branching->index.size())};
+    added.index_ = local_branching->index;
+    added.value_ = local_branching->value;
+    submip.a_matrix_.addRows(added);
+    ++submip.num_row_;
+    submip.row_lower_.push_back(-kHighsInf);
+    submip.row_upper_.push_back(local_branching->upper);
+    if (!submip.row_names_.empty()) submip.row_names_.push_back("portfolio_local_branching");
+  }
 
   // set limits
   if (call_budget != nullptr) {
@@ -200,30 +907,11 @@ bool HighsPrimalHeuristics::solveSubMip(
   if (max_time >= 0.0)
     submipoptions.time_limit = std::min(submipoptions.time_limit, max_time);
   submipoptions.time_limit = std::max(0.0, submipoptions.time_limit);
-  submipoptions.objective_bound = worker.upper_limit;
+  submipoptions.objective_bound = original_space
+      ? worker.upper_limit + mipsolver.model_->offset_ : worker.upper_limit;
 
   const bool log_provenance =
       !mipsolver.submip && mipsolver.options_mip_->mip_root_work_budget;
-  const int64_t invocation =
-      log_provenance
-          ? nextSubMipInvocation.fetch_add(1, std::memory_order_relaxed) + 1
-          : 0;
-  const double invocation_started =
-      (log_provenance || outcome != nullptr) ? mipsolver.timer_.read() : 0.0;
-  if (log_provenance)
-    highsLogUser(
-        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
-        "MIP-Incumbent: schema=rost/highs-incumbent/v1 event=submip_start "
-        "invocation=%lld method=%s parent_phase=%s recursion_depth=%lld "
-        "fixing_rate=%.17g max_leaves=%lld max_nodes=%lld stall_nodes=%lld "
-        "max_time=%.17g primal_before=%.17g\n",
-        static_cast<long long>(invocation), subMipMethodName(origin),
-        subMipParentPhaseName(origin),
-        static_cast<long long>(mipsolver.submip_level), fixingRate,
-        static_cast<long long>(maxleaves), static_cast<long long>(maxnodes),
-        static_cast<long long>(stallnodes), submipoptions.time_limit,
-        worker.upper_limit);
-
   if (!mipsolver.submip) {
     double curr_abs_gap = worker.upper_limit - mipsolver.mipdata_->lower_bound;
 
@@ -248,21 +936,166 @@ bool HighsPrimalHeuristics::solveSubMip(
   HighsSolution solution;
   solution.value_valid = false;
   solution.dual_valid = false;
-  if (!mipsolver.submip && !mipsolver.mipdata_->parallelLockActive()) {
-    mipsolver.profiling_->start(kMipClockSubMipSolve);
+  if (starting_solution != nullptr &&
+      highsVerifyCandidate(submip, *starting_solution, nullptr,
+                           submipoptions.mip_feasibility_tolerance).feasible &&
+      calculateRowValuesQuad(submip, *starting_solution, solution.row_value) ==
+          HighsStatus::kOk) {
+    solution.col_value = *starting_solution;
+    solution.value_valid = true;
   }
-  mipsolver.profiling_->solveCall("MIP", mipsolver.submip);
+  submipoptions.time_limit = std::min(
+      submipoptions.time_limit,
+      remainingHeuristicTime(call_started, mipsolver.timer_.read(), max_time));
+  if (submipoptions.time_limit <= 0) return false;
   // Create HighsMipSolver instance for sub-MIP
+  HighsReplayContext capture_context = replay_context ? *replay_context : HighsReplayContext{};
+  capture_context.method = subMipMethodName(origin);
+  capture_context.parent_phase = subMipParentPhaseName(origin);
+  capture_context.parent_time = mipsolver.timer_.read();
+  capture_context.options = &submipoptions;
+  capture_context.helper_lp_limit = worker.search_work.remaining();
+  if (call_budget && call_budget->max_lp_iterations >= 0)
+    capture_context.helper_lp_limit = std::min<int64_t>(
+        capture_context.helper_lp_limit, call_budget->max_lp_iterations);
+  const double capture_started = mipsolver.timer_.read();
+  const bool captured = HighsReplayCapture::capture(
+      submip, "sub_mip", mipsolver.submip_level,
+      local_branching || original_space ? nullptr : &basis, &capture_context);
+  const double capture_elapsed = mipsolver.timer_.read() - capture_started;
   HighsMipSolver submipsolver(*mipsolver.callback_, submipoptions, submip,
                               solution, true, mipsolver.submip_level + 1);
+  submipsolver.helper_lp_limit = worker.search_work.remaining();
+  submipsolver.parent_candidate_checkpoint = worker.search_work.checkpoint();
+  submipsolver.parent_candidate_sequence = worker.search_work.batchSequence();
+  if (mipsolver.parent_candidate_checkpoint) {
+    submipsolver.parent_candidate_checkpoint = mipsolver.parent_candidate_checkpoint;
+    submipsolver.parent_candidate_sequence = mipsolver.parent_candidate_sequence;
+  }
+  if (call_budget != nullptr && call_budget->max_lp_iterations >= 0)
+    submipsolver.helper_lp_limit = std::min<int64_t>(
+        submipsolver.helper_lp_limit, call_budget->max_lp_iterations);
   // Initialise termination_status_ and propagate any terminator to
   // the sub-MIP
   submipsolver.initialiseTerminator(mipsolver);
-  submipsolver.rootbasis = &basis;
+  // A newly appended row invalidates the copied basis extent. Use the native
+  // cold child basis rather than changing the parent's proof LP or basis.
+  submipsolver.rootbasis = local_branching || original_space ? nullptr : &basis;
   HighsPseudocostInitialization pscostinit(worker.getPseudocost(), 1);
-  submipsolver.pscostinit = &pscostinit;
-  submipsolver.clqtableinit = &mipsolver.mipdata_->cliquetable;
-  submipsolver.implicinit = &mipsolver.mipdata_->implications;
+  if (!original_space) {
+    submipsolver.pscostinit = &pscostinit;
+    submipsolver.clqtableinit = &mipsolver.mipdata_->cliquetable;
+    submipsolver.implicinit = &mipsolver.mipdata_->implications;
+  }
+  submipoptions.time_limit = std::min(
+      submipoptions.time_limit,
+      remainingHeuristicTime(call_started, mipsolver.timer_.read(), max_time));
+  submipoptions.time_limit = std::min(
+      submipoptions.time_limit,
+      std::max(0.0, mipsolver.options_mip_->time_limit - mipsolver.timer_.read()));
+  if (submipoptions.time_limit <= 0) return false;
+  const bool trace_child = outcome &&
+      mipsolver.mipdata_->heuristic_manager.config().trace_decisions;
+  const int64_t invocation = (log_provenance || trace_child ||
+      mipsolver.mipdata_->heuristic_manager.progressiveEnabled())
+      ? nextSubMipInvocation.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  const double invocation_started = call_started;
+  std::unique_ptr<HighsChildProposalSink> progressive;
+  HighsPrimalAdmissionReceipt progressive_admission;
+  std::vector<double> progressive_reduced;
+  struct ProgressivePublication {
+    int64_t sequence, epoch;
+    double discovery, publication;
+    bool own_gain;
+  };
+  std::vector<ProgressivePublication> progressive_publications;
+  double first_publication = -1;
+  // Reset before the owned sink is destroyed, including an exceptional exit.
+  struct ProposalLinkReset {
+    HighsMipSolver& child;
+    ~ProposalLinkReset() { child.child_proposal_sink = nullptr; }
+  } proposal_link_reset{submipsolver};
+  // Keep an independent mapping cursor. Parent transformations may be shared
+  // by sibling workers; getReducedPrimalSolution mutates its stack cursor.
+  if (!mipsolver.submip && outcome &&
+      mipsolver.mipdata_->heuristic_manager.progressiveEnabled()) {
+    const int64_t generation = mipsolver.callback_->data_in.admission_generation;
+    auto mapping = std::make_shared<presolve::HighsPostsolveStack>(
+        mipsolver.mipdata_->postSolveStack);
+    progressive.reset(new HighsChildProposalSink(submip,
+        mipsolver.mipdata_->feastol,
+        [&, mapping, generation](const std::vector<double>& values) {
+          if (generation != mipsolver.callback_->data_in.admission_generation)
+            return false;
+          std::vector<double> reduced = original_space
+              ? mapping->getReducedPrimalSolution(values) : values;
+          const auto parent_check = highsVerifyCandidate(*mipsolver.model_,
+              reduced, nullptr, mipsolver.mipdata_->feastol);
+          if (!parent_check.feasible ||
+              static_cast<double>(parent_check.objective) - mipsolver.model_->offset_ >=
+                  worker.upper_bound)
+            return false;
+          if (original_space) {
+            HighsSolution restored;
+            restored.value_valid = true;
+            restored.col_value = reduced;
+            mapping->undoPrimal(*mipsolver.options_mip_, restored, -1, true);
+            if (!highsVerifyCandidate(submip, restored.col_value, nullptr,
+                                     mipsolver.mipdata_->feastol).feasible)
+              return false;
+          }
+          HighsPrimalAdmissionReceipt receipt;
+          const int64_t sequence = worker.nextPublicationSequence();
+          // Worker-local checks/mailbox only, including the single-worker case.
+          // Never recurse into parent addIncumbent or public callbacks here.
+          if (!worker.trySolution(reduced, subMipSolutionSource(origin), &receipt))
+            return false;
+          if (worker.nextPublicationSequence() != sequence + 1) return false;
+          progressive_publications.push_back({sequence, worker.workEpoch(),
+              progressive->current_discovery_s, mipsolver.timer_.read(),
+              receipt.measured && receipt.improved});
+          progressive_reduced = std::move(reduced);
+          if (receipt.measured && receipt.improved &&
+              (!progressive_admission.improved ||
+               receipt.candidate < progressive_admission.candidate))
+            progressive_admission = std::move(receipt);
+          if (first_publication < 0)
+            first_publication = progressive_publications.back().publication;
+          return true;
+        }, 8, [&]() { return mipsolver.timer_.read(); }));
+    submipsolver.child_proposal_sink = progressive.get();
+  }
+  if (progressive) {
+    const double prepared_at = mipsolver.timer_.read();
+    submipoptions.time_limit = std::min(submipoptions.time_limit,
+        remainingHeuristicTime(call_started, prepared_at, max_time));
+    submipoptions.time_limit = std::min(submipoptions.time_limit,
+        std::max(0.0, mipsolver.options_mip_->time_limit - prepared_at));
+    if (submipoptions.time_limit <= 0) return false;
+  }
+  if (captured && log_provenance)
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-ReplayCapture: version=1 method=%s decision=%llu invocation=%lld "
+        "worker=%lld restart=%lld elapsed=%.17g scope=restricted_model_only\n",
+        capture_context.method, static_cast<unsigned long long>(capture_context.decision),
+        static_cast<long long>(invocation), static_cast<long long>(capture_context.worker),
+        static_cast<long long>(capture_context.restart), capture_elapsed);
+  if (log_provenance)
+    highsLogUser(
+        mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Incumbent: schema=rost/highs-incumbent/v1 event=submip_start "
+        "invocation=%lld method=%s parent_phase=%s recursion_depth=%lld "
+        "fixing_rate=%.17g max_leaves=%lld max_nodes=%lld stall_nodes=%lld "
+        "max_time=%.17g primal_before=%.17g\n",
+        static_cast<long long>(invocation), subMipMethodName(origin),
+        subMipParentPhaseName(origin),
+        static_cast<long long>(mipsolver.submip_level), fixingRate,
+        static_cast<long long>(maxleaves), static_cast<long long>(maxnodes),
+        static_cast<long long>(stallnodes), submipoptions.time_limit,
+        worker.upper_limit);
+  if (!mipsolver.submip && !mipsolver.mipdata_->parallelLockActive())
+    mipsolver.profiling_->start(kMipClockSubMipSolve);
+  mipsolver.profiling_->solveCall("MIP", mipsolver.submip);
   // Solve the sub-MIP
   //
   // Copy the pointer to global sub-solver data into the sub-MIP
@@ -278,7 +1111,38 @@ bool HighsPrimalHeuristics::solveSubMip(
   if (!mipsolver.submip) mipsolver.profiling_->start(kSubSolverSubMip);
   // Ensure that sub-solver call time data accumulate in the sub-MIP record
   mipsolver.profiling_->setSubMip(true);
-  submipsolver.run();
+  const double child_run_started = mipsolver.timer_.read();
+  {
+    HighsTaskPhaseScope phase(worker.search_work, HighsTaskPhase::kChildMip);
+    if (outcome != nullptr) outcome->started = true;
+    submipsolver.run();
+  }
+  const double child_run_returned = mipsolver.timer_.read();
+  submipsolver.child_proposal_sink = nullptr;
+  for (const auto& publication : progressive_publications)
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Progressive-Publication: version=1 invocation=%lld worker=%lld "
+        "epoch=%lld worker_sequence=%lld discovery_s=%.17g publication_s=%.17g "
+        "own_gain=%d authority=worker_mailbox\n", static_cast<long long>(invocation),
+        static_cast<long long>(worker.workerId()), static_cast<long long>(publication.epoch),
+        static_cast<long long>(publication.sequence), publication.discovery,
+        publication.publication, int(publication.own_gain));
+  if (progressive)
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+        "MIP-Progressive-Child: version=1 invocation=%lld events=%llu proposed=%llu "
+        "published=%llu rejected=%llu duplicates=%llu non_improving=%llu "
+        "capacity_denied=%llu first_discovery_s=%.17g first_publication_s=%.17g "
+        "check_seconds=%.17g returned_s=%.17g "
+        "authority=worker_mailbox\n", static_cast<long long>(invocation),
+        static_cast<unsigned long long>(progressive->events),
+        static_cast<unsigned long long>(progressive->proposed),
+        static_cast<unsigned long long>(progressive->published),
+        static_cast<unsigned long long>(progressive->rejected),
+        static_cast<unsigned long long>(progressive->duplicates),
+        static_cast<unsigned long long>(progressive->non_improving),
+        static_cast<unsigned long long>(progressive->capacity_denied),
+        progressive->first_discovery_s, first_publication,
+        progressive->check_seconds, child_run_returned);
   // Ensure that further sub-solver call time data accumulate in the
   // MIP or sub-MIP record, according to whether the calling MIP is a
   // sub-MIP
@@ -311,6 +1175,8 @@ bool HighsPrimalHeuristics::solveSubMip(
                                   bool candidate_improved) {
     const int64_t lp_iterations =
         submipsolver.mipdata_ ? submipsolver.mipdata_->total_lp_iterations : 0;
+    const int64_t completion_lp = outcome ? outcome->completion_lp_iterations : 0;
+    worker.search_work.chargeSubMip(lp_iterations + completion_lp);
     if (outcome != nullptr) {
       outcome->completed = true;
       outcome->candidate_proposed = candidate_proposed;
@@ -321,7 +1187,31 @@ bool HighsPrimalHeuristics::solveSubMip(
       outcome->leaves = submipsolver.mipdata_
                             ? submipsolver.mipdata_->num_leaves
                             : 0;
-      outcome->lp_iterations = lp_iterations;
+      outcome->lp_iterations = lp_iterations + completion_lp;
+      if (trace_child) {
+        HighsPrimalChildReceipt receipt;
+        receipt.invocation = static_cast<uint64_t>(invocation);
+        receipt.status = static_cast<int>(submipsolver.modelstatus_);
+        receipt.input_rows = submip.num_row_;
+        receipt.input_columns = submip.num_col_;
+        receipt.input_nonzeros = submip.a_matrix_.numNz();
+        receipt.working_rows = submipsolver.numRow();
+        receipt.working_columns = submipsolver.numCol();
+        receipt.working_nonzeros = submipsolver.numNonzero();
+        receipt.lp_iterations = lp_iterations;
+        receipt.nodes = submipsolver.node_count_;
+        receipt.fixing_rate = fixingRate;
+        receipt.started_time = child_run_started;
+        receipt.returned_time = child_run_returned;
+        receipt.setup_seconds = std::max(0.0, child_run_started - call_started);
+        receipt.first_lp_seconds = submipsolver.child_first_lp_seconds;
+        receipt.first_lp_iterations = submipsolver.child_first_lp_iterations;
+        receipt.proposed = candidate_proposed;
+        receipt.accepted = candidate_accepted;
+        receipt.admission_measured = outcome->admission.measured;
+        receipt.own_gain = outcome->admission.measured && outcome->admission.improved;
+        outcome->children.append(receipt);
+      }
     }
     if (!log_provenance) return;
     highsLogUser(
@@ -343,7 +1233,10 @@ bool HighsPrimalHeuristics::solveSubMip(
   };
   if (submipsolver.termination_status_ != HighsModelStatus::kNotset) {
     worker.setHeurTerminationStatus(submipsolver.termination_status_);
-    log_submip_end(false, false, false);
+    if (outcome) outcome->admission = progressive_admission;
+    log_submip_end(progressive && progressive->proposed > 0,
+                   progressive && progressive->published > 0,
+                   progressive_admission.improved);
     return false;
   }
   if (submipsolver.mipdata_) {
@@ -356,6 +1249,7 @@ bool HighsPrimalHeuristics::solveSubMip(
     // (double)mipsolver.orig_model_->a_matrix_.value_.size();
     int64_t adjusted_lp_iterations =
         (size_t)(adjustmentfactor * submipsolver.mipdata_->total_lp_iterations);
+    if (original_space) adjusted_lp_iterations = submipsolver.mipdata_->total_lp_iterations;
     worker.updateHeurStatsLpIters(
         adjusted_lp_iterations, submipsolver.mipdata_->total_repair_lp,
         submipsolver.mipdata_->total_repair_lp_feasible,
@@ -375,16 +1269,66 @@ bool HighsPrimalHeuristics::solveSubMip(
     return false;
   }
   double oldUpperLimit = worker.upper_limit;
-  bool candidate_proposed = false;
-  bool candidate_accepted = false;
+  bool candidate_proposed = progressive && progressive->proposed > 0;
+  bool candidate_accepted = progressive && progressive->published > 0;
+  HighsPrimalAdmissionReceipt admission = progressive_admission;
+  const int64_t completion_before = mipsolver.mipdata_->parallelLockActive()
+      ? 0 : mipsolver.mipdata_->total_repair_lp_iterations;
   if (submipsolver.modelstatus_ != HighsModelStatus::kInfeasible &&
       !submipsolver.solution_.empty()) {
     candidate_proposed = true;
-    candidate_accepted = trySolution(submipsolver.solution_,
-                                     subMipSolutionSource(origin), worker);
+    if (original_space) {
+      const bool checked = highsVerifyCandidate(submip, submipsolver.solution_,
+          nullptr, mipsolver.mipdata_->feastol).feasible;
+      bool mapped = false;
+      if (checked) {
+        auto mapping = mipsolver.mipdata_->postSolveStack;
+        const auto reduced = mapping.getReducedPrimalSolution(submipsolver.solution_);
+        mapped = highsVerifyCandidate(*mipsolver.model_, reduced, nullptr,
+                                     mipsolver.mipdata_->feastol).feasible;
+        if (mapped) {
+          HighsSolution restored;
+          restored.value_valid = true;
+          restored.col_value = reduced;
+          mapping.undoPrimal(*mipsolver.options_mip_, restored, -1, true);
+          mapped = highsVerifyCandidate(submip, restored.col_value, nullptr,
+                                        mipsolver.mipdata_->feastol).feasible;
+        }
+        if (mapped && !(mipsolver.mipdata_->parallelLockActive() &&
+                        reduced == progressive_reduced)) {
+          HighsPrimalAdmissionReceipt final_admission;
+          candidate_accepted |= trySolution(reduced, subMipSolutionSource(origin), worker, &final_admission);
+          if (!admission.measured || (final_admission.improved &&
+              (!admission.improved || final_admission.candidate < admission.candidate)))
+            admission = std::move(final_admission);
+        }
+      }
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+          "MIP-Partition-Admission: version=1 invocation=%lld checked=%d mapped=%d accepted=%d\n",
+          static_cast<long long>(invocation), checked ? 1 : 0, mapped ? 1 : 0,
+          candidate_accepted ? 1 : 0);
+    } else {
+      if (!(mipsolver.mipdata_->parallelLockActive() &&
+            submipsolver.solution_ == progressive_reduced)) {
+        HighsPrimalAdmissionReceipt final_admission;
+        candidate_accepted |= trySolution(submipsolver.solution_,
+                                         subMipSolutionSource(origin), worker, &final_admission);
+        if (!admission.measured || (final_admission.improved &&
+            (!admission.improved || final_admission.candidate < admission.candidate)))
+          admission = std::move(final_admission);
+      }
+    }
   }
 
-  const bool candidate_improved = worker.upper_limit < oldUpperLimit;
+  const bool portfolio_call = mipsolver.mipdata_->heuristic_manager.portfolioEnabled();
+  const bool candidate_improved = portfolio_call
+      ? admission.measured && admission.improved : worker.upper_limit < oldUpperLimit;
+  if (outcome) {
+    outcome->admission = admission;
+    outcome->parent_lower_bound = mipsolver.mipdata_->lower_bound;
+    outcome->completion_lp_iterations = mipsolver.mipdata_->parallelLockActive()
+        ? 0 : std::max<int64_t>(0, mipsolver.mipdata_->total_repair_lp_iterations - completion_before);
+  }
   if (candidate_improved) {
     // remember fixing rate as good
     worker.updateHeurStatsSuccessObservations(fixingRate);
@@ -560,7 +1504,7 @@ void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
                                   max_submip_time);
   };
   // return if domain is infeasible
-  if (worker.getGlobalDomain().infeasible()) return;
+  if (worker.getGlobalDomain().infeasible() || remaining_time() <= 0.0) return;
 
   HighsPseudocost pscost(worker.getPseudocost());
   HighsSearch heur(worker, pscost);
@@ -581,8 +1525,12 @@ void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
                 intcols.end());
 
   // LP relaxation instantiation
+  HighsTaskPhaseScope preparation_phase(worker.search_work,
+                                        HighsTaskPhase::kHeuristicPreparation);
   HighsLpRelaxation heurlp(worker.getLpRelaxation());
+  heurlp.setHelperDeadline(heuristic_started + max_submip_time);
   heurlp.setMipWorker(worker);
+  heurlp.setCandidateInterruptible();
   heurlp.setProfiling(mipsolver.profiling_);
   // only use the global upper limit as LP limit so that dual proofs are valid
   heurlp.setObjectiveLimit(worker.upper_limit);
@@ -607,7 +1555,8 @@ void HighsPrimalHeuristics::RENS(HighsMipWorker& worker,
   HighsInt nbacktracks = -1;
   HeuristicNeighbourhood neighbourhood(mipsolver, localdom);
 retry:
-  if (remaining_time() <= 0.0) {
+  if (remaining_time() <= 0.0 || worker.search_work.checkpointRequested() ||
+      mipsolver.parentCheckpointRequested()) {
     worker.getHeurLpIterations() += heur.getLocalLpIterations();
     return;
   }
@@ -626,12 +1575,18 @@ retry:
   // printf("fixingrate before loop is %g\n", fixingrate);
   assert(heur.hasNode());
   while (true) {
-    if (remaining_time() <= 0.0) {
+    if (remaining_time() <= 0.0 || worker.search_work.checkpointRequested() ||
+        mipsolver.parentCheckpointRequested()) {
       worker.getHeurLpIterations() += heur.getLocalLpIterations();
       return;
     }
     // printf("evaluating node\n");
-    heur.evaluateNode();
+    const auto evaluation = heur.evaluateNode();
+    if (evaluation == HighsSearch::NodeResult::kLpIterationLimit ||
+        evaluation == HighsSearch::NodeResult::kCandidateCheckpoint) {
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
     // printf("done evaluating node\n");
     if (heur.currentNodePruned()) {
       ++nbacktracks;
@@ -791,7 +1746,9 @@ retry:
     return;
   }
 
-  heurlp.removeObsoleteRows(false);
+  heurlp.removeObsoleteRows(false, mipsolver.opportunisticIncumbentExchange()
+      ? HighsLpRelaxation::CutRemovalMode::kModelAndBasisOnly
+      : HighsLpRelaxation::CutRemovalMode::kReoptimize);
   HighsInt node_reduction_factor =
       mipsolver.mipdata_->parallelLockActive()
           ? std::max(
@@ -843,10 +1800,83 @@ void HighsPrimalHeuristics::RINS(
     const HighsSubMipCallBudget* call_budget,
     HighsPrimalHeuristicOutcome* outcome) {
   if (outcome != nullptr) *outcome = HighsPrimalHeuristicOutcome{};
+  const double call_started = mipsolver.timer_.read();
+  double call_deadline = call_budget == nullptr
+      ? kHighsInf : call_started + call_budget->max_time;
   // return if domain is infeasible
   if (worker.getGlobalDomain().infeasible()) return;
 
   if (relaxationsol.size() != static_cast<size_t>(mipsolver.numCol())) return;
+
+  // A private seed remains stable even if evaluateNode imports a newer peer
+  // snapshot. The master incumbent need not wait for an unrelated worker LP.
+  worker.importPrimalSnapshot();
+  const std::vector<double> incumbent = worker.repairIncumbent();
+  if (incumbent.size() != relaxationsol.size()) return;
+
+  if (call_budget != nullptr) {
+    // Basic RINS uses the already available LP/incumbent agreement. Re-solving
+    // a dive LP first can consume the entire managed reservation before repair.
+    if (outcome != nullptr) outcome->phase_measured = true;
+    const auto finish = [&](double child_seconds) {
+      if (outcome == nullptr) return;
+      outcome->elapsed = std::max(0.0, mipsolver.timer_.read() - call_started);
+      outcome->preparation_seconds = std::max(0.0, outcome->elapsed - child_seconds);
+      outcome->child_seconds = child_seconds;
+      outcome->child_lp_iterations = outcome->lp_iterations;
+      outcome->child_calls = outcome->started ? 1 : 0;
+    };
+    if (worker.search_work.checkpointRequested() || mipsolver.parentCheckpointRequested() ||
+        mipsolver.timer_.read() >= call_deadline) {
+      if (outcome != nullptr) {
+        outcome->preparation_exhaustions = 1;
+        outcome->preparation_stop_mask = mipsolver.timer_.read() >= call_deadline
+            ? kHighsHeuristicStopDeadline : kHighsHeuristicStopCheckpoint;
+      }
+      finish(0.0);
+      return;
+    }
+    std::vector<double> lower = worker.getGlobalDomain().col_lower_;
+    std::vector<double> upper = worker.getGlobalDomain().col_upper_;
+    double fixing_rate;
+    const bool restricted = buildRinsNeighbourhood(
+        *mipsolver.model_, relaxationsol, incumbent, mipsolver.mipdata_->feastol,
+        call_budget->min_fixing_rate, lower, upper, fixing_rate);
+    if (outcome != nullptr) {
+      outcome->fixing_rate = fixing_rate;
+      outcome->fixing_rate_measured = true;
+    }
+    if (!restricted) {
+      finish(0.0);
+      return;
+    }
+    HighsSubMipCallBudget remaining = *call_budget;
+    remaining.max_time = remainingHeuristicTime(
+        call_started, mipsolver.timer_.read(), call_budget->max_time);
+    if (remaining.max_time <= 0 || remaining.max_nodes == 0 ||
+        remaining.max_lp_iterations == 0) {
+      if (outcome != nullptr) {
+        outcome->preparation_exhaustions = 1;
+        if (remaining.max_time <= 0) outcome->preparation_stop_mask |= kHighsHeuristicStopDeadline;
+        if (remaining.max_nodes == 0) outcome->preparation_stop_mask |= kHighsHeuristicStopNodes;
+        if (remaining.max_lp_iterations == 0) outcome->preparation_stop_mask |= kHighsHeuristicStopLpWork;
+      }
+      finish(0.0);
+      return;
+    }
+    const double child_started = mipsolver.timer_.read();
+    HighsPrimalHeuristicOutcome child;
+    const auto& lp = worker.getLpRelaxation();
+    solveSubMip(worker, lp.getLp(), lp.getLpSolver().getBasis(), fixing_rate,
+                std::move(lower), std::move(upper), 500, 200, 12,
+                HighsSubMipOrigin::kTreeRins, kHighsInf, &remaining, &child, &incumbent);
+    if (outcome != nullptr) {
+      *outcome = child;
+      outcome->phase_measured = outcome->fixing_rate_measured = true;
+    }
+    finish(std::max(0.0, mipsolver.timer_.read() - child_started));
+    return;
+  }
 
   std::vector<HighsInt> intcols_;
   if (mipsolver.mipdata_->parallelLockActive()) {
@@ -863,12 +1893,50 @@ void HighsPrimalHeuristics::RINS(
   HighsPseudocost pscost(worker.getPseudocost());
   HighsSearch heur(worker, pscost);
 
+  struct RinsWorkLedger {
+    HighsSearch& search;
+    const HighsMipSolver& mip;
+    HighsPrimalHeuristicOutcome* outcome;
+    double started;
+    double child_seconds = 0.0;
+    int64_t child_calls = 0;
+    int64_t preparation_exhaustions = 0;
+    int64_t child_lp = 0;
+    int64_t child_nodes = 0;
+    double fixing_rate = 0.0;
+    bool fixing_rate_measured = false;
+    uint8_t stop_mask = 0;
+    RinsWorkLedger(HighsSearch& search_, const HighsMipSolver& mip_,
+                   HighsPrimalHeuristicOutcome* outcome_, double started_)
+        : search(search_), mip(mip_), outcome(outcome_), started(started_) {}
+    ~RinsWorkLedger() {
+      if (outcome) {
+        outcome->lp_iterations = child_lp + search.getLocalLpIterations();
+        outcome->nodes = child_nodes + search.getLocalNodes();
+        outcome->phase_measured = true;
+        outcome->preparation_lp_iterations = search.getLocalLpIterations();
+        outcome->child_lp_iterations = child_lp;
+        outcome->child_calls = child_calls;
+        outcome->preparation_exhaustions = preparation_exhaustions;
+        outcome->child_seconds = child_seconds;
+        outcome->preparation_seconds = std::max(0.0, mip.timer_.read() - started - child_seconds);
+        outcome->fixing_rate = fixing_rate;
+        outcome->fixing_rate_measured = fixing_rate_measured;
+        outcome->preparation_stop_mask = stop_mask;
+      }
+    }
+  } work(heur, mipsolver, outcome, call_started);
+
   HighsDomain& localdom = heur.getLocalDomain();
   heur.setHeuristic(true);
 
   // LP relaxation instantiation
+  HighsTaskPhaseScope preparation_phase(worker.search_work,
+                                        HighsTaskPhase::kHeuristicPreparation);
   HighsLpRelaxation heurlp(worker.getLpRelaxation());
+  heurlp.setHelperDeadline(call_deadline);
   heurlp.setMipWorker(worker);
+  heurlp.setCandidateInterruptible();
   heurlp.setProfiling(mipsolver.profiling_);
   // only use the global upper limit as LP limit so that dual proofs are valid
   heurlp.setObjectiveLimit(worker.upper_limit);
@@ -892,6 +1960,16 @@ void HighsPrimalHeuristics::RINS(
   HighsInt targetdepth = 1;
   HeuristicNeighbourhood neighbourhood(mipsolver, localdom);
 retry:
+  if (mipsolver.timer_.read() >= call_deadline ||
+      worker.search_work.checkpointRequested() || mipsolver.parentCheckpointRequested()) {
+    if (mipsolver.timer_.read() >= call_deadline)
+      work.stop_mask |= kHighsHeuristicStopDeadline;
+    if (worker.search_work.checkpointRequested() || mipsolver.parentCheckpointRequested())
+      work.stop_mask |= kHighsHeuristicStopCheckpoint;
+    ++work.preparation_exhaustions;
+    worker.getHeurLpIterations() += heur.getLocalLpIterations();
+    return;
+  }
   ++nbacktracks;
   neighbourhood.backtracked();
   // printf("current depth : %" HIGHSINT_FORMAT "   target depth : %"
@@ -907,7 +1985,53 @@ retry:
   assert(heur.hasNode());
 
   while (true) {
-    heur.evaluateNode();
+    if (worker.search_work.checkpointRequested() || mipsolver.parentCheckpointRequested()) {
+      work.stop_mask |= kHighsHeuristicStopCheckpoint;
+      ++work.preparation_exhaustions;
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
+    if (call_budget != nullptr ||
+        worker.search_work.remaining() != std::numeric_limits<int64_t>::max()) {
+      const int64_t requested = call_budget == nullptr || call_budget->max_lp_iterations < 0
+          ? kHighsIInf
+          : call_budget->max_lp_iterations - work.child_lp - heur.getLocalLpIterations();
+      const int64_t remaining = std::min<int64_t>(requested, worker.search_work.remaining());
+      const bool nodes_exhausted = call_budget != nullptr && call_budget->max_nodes >= 0 &&
+          work.child_nodes + heur.getLocalNodes() >= call_budget->max_nodes;
+      if (remaining <= 0 || nodes_exhausted || mipsolver.timer_.read() >= call_deadline) {
+        if (remaining <= 0) work.stop_mask |= kHighsHeuristicStopLpWork;
+        if (nodes_exhausted) work.stop_mask |= kHighsHeuristicStopNodes;
+        if (mipsolver.timer_.read() >= call_deadline)
+          work.stop_mask |= kHighsHeuristicStopDeadline;
+        ++work.preparation_exhaustions;
+        worker.getHeurLpIterations() += heur.getLocalLpIterations();
+        return;
+      }
+      // A managed reservation bounds the whole call. A second 10000-pivot
+      // ceiling can abandon its very first preparation LP despite available
+      // work; retain that legacy ceiling only for unmanaged preparation.
+      heurlp.setHelperIterationLimit(static_cast<HighsInt>(std::min<int64_t>(
+          remaining, call_budget == nullptr ? 10000 : kHighsIInf)));
+    }
+    const auto evaluation = heur.evaluateNode();
+    if (evaluation == HighsSearch::NodeResult::kLpIterationLimit ||
+        evaluation == HighsSearch::NodeResult::kCandidateCheckpoint) {
+      if (evaluation == HighsSearch::NodeResult::kCandidateCheckpoint)
+        work.stop_mask |= kHighsHeuristicStopCheckpoint;
+      else {
+        work.stop_mask |= kHighsHeuristicStopUnfinishedLp;
+        if (heurlp.getLpSolver().getModelStatus() == HighsModelStatus::kIterationLimit)
+          work.stop_mask |= kHighsHeuristicStopLpWork;
+        if (worker.search_work.checkpointRequested() || mipsolver.parentCheckpointRequested())
+          work.stop_mask |= kHighsHeuristicStopCheckpoint;
+      }
+      if (mipsolver.timer_.read() >= call_deadline)
+        work.stop_mask |= kHighsHeuristicStopDeadline;
+      ++work.preparation_exhaustions;
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
     if (heur.currentNodePruned()) {
       ++nbacktracks;
       // printf("backtrack1\n");
@@ -922,6 +2046,8 @@ retry:
     }
 
     fixingrate = neighbourhood.getFixingRate();
+    work.fixing_rate = fixingrate;
+    work.fixing_rate_measured = true;
 
     if (stop) break;
     if (fixingrate >= maxfixingrate) break;
@@ -937,7 +2063,7 @@ retry:
         heurlp.getFractionalIntegers().end(),
         [&](const std::pair<HighsInt, double>& fracvar) {
           return std::abs(relaxationsol[fracvar.first] -
-                          mipsolver.mipdata_->incumbent[fracvar.first]) <=
+                          incumbent[fracvar.first]) <=
                  mipsolver.mipdata_->feastol;
         });
 
@@ -974,7 +2100,7 @@ retry:
       for (HighsInt i : intcols) {
         if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
 
-        if (std::abs(currlpsol[i] - mipsolver.mipdata_->incumbent[i]) <=
+        if (std::abs(currlpsol[i] - incumbent[i]) <=
             mipsolver.mipdata_->feastol) {
           double fixval = HighsIntegers::nearestInteger(currlpsol[i]);
           if (localdom.col_lower_[i] < fixval) {
@@ -1060,6 +2186,7 @@ retry:
         }
 
         fixingrate = neighbourhood.getFixingRate();
+        work.fixing_rate = fixingrate;
       }
 
       if (localdom.col_upper_[fracint->first] > fixval) {
@@ -1073,6 +2200,7 @@ retry:
         }
 
         fixingrate = neighbourhood.getFixingRate();
+        work.fixing_rate = fixingrate;
       }
 
       if (fixingrate >= maxfixingrate) break;
@@ -1100,8 +2228,16 @@ retry:
 
   // printf("fixing rate is %g\n", fixingrate);
   fixingrate = neighbourhood.getFixingRate();
+  work.fixing_rate = fixingrate;
+  work.fixing_rate_measured = true;
   if (fixingrate < 0.1 ||
       (mipsolver.submip && mipsolver.mipdata_->numImprovingSols != 0)) {
+    // This depth-first fallback predates managed whole-call reservations and
+    // has no cumulative LP-work cap. Skip it in the bounded helper only.
+    if (call_budget != nullptr) {
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
     // heur.childselrule = ChildSelectionRule::kBestCost;
     heur.setMinReliable(0);
     heur.solveDepthFirst(10);
@@ -1112,20 +2248,64 @@ retry:
     return;
   }
 
-  heurlp.removeObsoleteRows(false);
+  heurlp.removeObsoleteRows(false, mipsolver.opportunisticIncumbentExchange()
+      ? HighsLpRelaxation::CutRemovalMode::kModelAndBasisOnly
+      : HighsLpRelaxation::CutRemovalMode::kReoptimize);
   HighsInt node_reduction_factor =
       mipsolver.mipdata_->parallelLockActive()
           ? std::max(
                 HighsInt{1},
                 static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
           : 1;
+  HighsSubMipCallBudget remaining_budget;
+  if (call_budget != nullptr) {
+    remaining_budget = *call_budget;
+    remaining_budget.max_time = std::max(0.0, call_deadline - mipsolver.timer_.read());
+    if (remaining_budget.max_lp_iterations >= 0)
+      remaining_budget.max_lp_iterations = std::max<int64_t>(
+          0, remaining_budget.max_lp_iterations - work.child_lp - heur.getLocalLpIterations());
+    if (remaining_budget.max_nodes >= 0)
+      remaining_budget.max_nodes = std::max<int64_t>(0, remaining_budget.max_nodes - work.child_nodes - heur.getLocalNodes());
+    if (remaining_budget.max_time <= 0 || remaining_budget.max_lp_iterations == 0 || remaining_budget.max_nodes == 0) {
+      if (remaining_budget.max_time <= 0)
+        work.stop_mask |= kHighsHeuristicStopDeadline;
+      if (remaining_budget.max_lp_iterations == 0)
+        work.stop_mask |= kHighsHeuristicStopLpWork;
+      if (remaining_budget.max_nodes == 0)
+        work.stop_mask |= kHighsHeuristicStopNodes;
+      ++work.preparation_exhaustions;
+      worker.getHeurLpIterations() += heur.getLocalLpIterations();
+      return;
+    }
+  }
+  HighsPrimalHeuristicOutcome child_outcome;
+  const double child_started = mipsolver.timer_.read();
   const bool solve_sub_mip_return = solveSubMip(
       worker, heurlp.getLp(), heurlp.getLpSolver().getBasis(), fixingrate,
       localdom.col_lower_, localdom.col_upper_,
       500,  // std::max(50, int(0.05 *
       // (mipsolver.mipdata_->num_leaves))),
       200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12,
-      HighsSubMipOrigin::kTreeRins, kHighsInf, call_budget, outcome);
+      HighsSubMipOrigin::kTreeRins, kHighsInf,
+      call_budget == nullptr ? nullptr : &remaining_budget,
+      &child_outcome);
+  work.child_seconds += std::max(0.0, mipsolver.timer_.read() - child_started);
+  ++work.child_calls;
+  {
+    work.child_lp += std::max<int64_t>(0, child_outcome.lp_iterations);
+    work.child_nodes += std::max<int64_t>(0, child_outcome.nodes);
+    if (outcome != nullptr) {
+      HighsPrimalChildReceipts children = outcome->children;
+      children.append(child_outcome.children);
+      child_outcome.children = std::move(children);
+      child_outcome.started |= outcome->started;
+      child_outcome.completed |= outcome->completed;
+      child_outcome.candidate_proposed |= outcome->candidate_proposed;
+      child_outcome.candidate_accepted |= outcome->candidate_accepted;
+      child_outcome.candidate_improved |= outcome->candidate_improved;
+      *outcome = child_outcome;
+    }
+  }
   if (worker.terminatorTerminated()) return;
   if (!solve_sub_mip_return) {
     int64_t new_lp_iterations =
@@ -1883,8 +3063,20 @@ void HighsPrimalHeuristics::feasibilityPump(HighsMipWorker& worker) {
 
 void HighsPrimalHeuristics::centralRounding(HighsMipWorker& worker) {
   if (mipsolver.mipdata_->analyticCenter.size() !=
-      static_cast<size_t>(mipsolver.numCol()))
+      static_cast<size_t>(mipsolver.numCol())) {
+    // The root portfolio may deliberately omit analytic-centre work. Keep
+    // the bounded completion pass useful with already-owned root LP points.
+    const auto& first = mipsolver.mipdata_->firstlpsol;
+    const auto& root = mipsolver.mipdata_->rootlpsol;
+    const size_t columns = static_cast<size_t>(mipsolver.numCol());
+    const bool have_first = first.size() == columns;
+    const bool have_root = root.size() == columns;
+    if (have_first || have_root)
+      linesearchRounding(worker, have_first ? first : root,
+                         have_root ? root : first,
+                         kSolutionSourceRandomizedRounding);
     return;
+  }
 
   if (!mipsolver.mipdata_->firstlpsol.empty())
     linesearchRounding(worker, mipsolver.mipdata_->firstlpsol,
@@ -1983,11 +3175,24 @@ bool HighsPrimalHeuristics::addIncumbent(const std::vector<double>& sol,
 
 bool HighsPrimalHeuristics::trySolution(const std::vector<double>& solution,
                                         const int solution_source,
-                                        HighsMipWorker& worker) {
+                                        HighsMipWorker& worker,
+                                        HighsPrimalAdmissionReceipt* receipt) {
+  if (receipt) *receipt = {};
   if (mipsolver.mipdata_->parallelLockActive()) {
-    return worker.trySolution(solution, solution_source);
+    return worker.trySolution(solution, solution_source, receipt);
   } else {
-    return mipsolver.mipdata_->trySolution(solution, solution_source);
+    const double before = mipsolver.mipdata_->upper_bound;
+    const bool accepted = mipsolver.mipdata_->trySolution(solution, solution_source);
+    if (accepted && receipt) {
+      receipt->measured = true;
+      receipt->before = before;
+      receipt->after = mipsolver.mipdata_->upper_bound;
+      receipt->improved = receipt->after < before;
+      // Only an improved master witness is known to be original-space checked.
+      receipt->candidate = receipt->improved ? receipt->after : kHighsInf;
+      if (receipt->improved) receipt->checked_seed = mipsolver.mipdata_->incumbent;
+    }
+    return accepted;
   }
 }
 

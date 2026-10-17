@@ -985,9 +985,38 @@ TEST_CASE("presolve-issue-2874", "[highs_test_presolve]") {
 TEST_CASE("bound_implied", "[highs_test_presolve]") {
   std::string model_file =
       std::string(HIGHS_DIR) + "/check/instances/bound_implied.mps";
-  Highs highs;
-  highs.setOptionValue("output_flag", dev_run);
-  highs.readModel(model_file);
-  highs.run();
-  REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+  for (const char* presolve : {"on", "off"}) {
+    CAPTURE(presolve);
+    Highs highs;
+    highs.resetGlobalScheduler(true);
+    highs.setOptionValue("output_flag", dev_run);
+    REQUIRE(highs.setOptionValue("threads", 1) == HighsStatus::kOk);
+    REQUIRE(highs.setOptionValue("presolve", presolve) == HighsStatus::kOk);
+    REQUIRE(highs.readModel(model_file) == HighsStatus::kOk);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    const auto& lp = highs.getLp();
+    const auto& x = highs.getSolution().col_value;
+    REQUIRE(x.size() == size_t(lp.num_col_));
+    REQUIRE(lp.a_matrix_.format_ == MatrixFormat::kColwise);
+    std::vector<double> activity(lp.num_row_, 0.0);
+    double objective = lp.offset_;
+    for (HighsInt col = 0; col < lp.num_col_; ++col) {
+      REQUIRE(x[col] >= lp.col_lower_[col] - 1e-6);
+      REQUIRE(x[col] <= lp.col_upper_[col] + 1e-6);
+      if (lp.integrality_[col] == HighsVarType::kInteger)
+        REQUIRE(std::abs(x[col] - std::round(x[col])) <= 1e-6);
+      objective += lp.col_cost_[col] * x[col];
+      for (HighsInt pos = lp.a_matrix_.start_[col];
+           pos < lp.a_matrix_.start_[col + 1]; ++pos)
+        activity[lp.a_matrix_.index_[pos]] += lp.a_matrix_.value_[pos] * x[col];
+    }
+    for (HighsInt row = 0; row < lp.num_row_; ++row) {
+      REQUIRE(activity[row] >= lp.row_lower_[row] - 1e-6);
+      REQUIRE(activity[row] <= lp.row_upper_[row] + 1e-6);
+    }
+    REQUIRE(objective == Approx(0).margin(1e-6));
+    REQUIRE(highs.getInfo().objective_function_value == Approx(objective).margin(1e-6));
+    highs.resetGlobalScheduler(true);
+  }
 }

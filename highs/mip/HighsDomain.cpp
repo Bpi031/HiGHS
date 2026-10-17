@@ -2119,7 +2119,9 @@ bool HighsDomain::checkChangeBound(HighsBoundType boundtype, HighsInt col,
 
 void HighsDomain::setDomainChangeStack(
     const std::vector<HighsDomainChange>& domchgstack) {
-  infeasible_ = false;
+  // An infeasible bound can remain on the stack after its activity update was
+  // rolled back. Only backtracking can restore that state, not a stack reset.
+  if (infeasible_) return;
   mipsolver->mipdata_->debugSolution.resetDomain(*this);
 
   if (!domchgstack_.empty()) {
@@ -2153,7 +2155,8 @@ void HighsDomain::setDomainChangeStack(
 void HighsDomain::setDomainChangeStack(
     const std::vector<HighsDomainChange>& domchgstack,
     const std::vector<HighsInt>& branchingPositions) {
-  infeasible_ = false;
+  // Preserve the proof and rollback position until explicit backtracking.
+  if (infeasible_) return;
   mipsolver->mipdata_->debugSolution.resetDomain(*this);
 
   if (!domchgstack_.empty()) {
@@ -2289,6 +2292,7 @@ void HighsDomain::backtrackToGlobal() {
   prevboundval_.clear();
   domchgreason_.clear();
   branchPos_.clear();
+  if (objProp_.isActive()) objProp_.debugCheckObjectiveLower();
 }
 
 HighsDomainChange HighsDomain::backtrack() {

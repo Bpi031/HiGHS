@@ -282,7 +282,8 @@ TEST_CASE("FibonacciTasksOmp", "[parallel]") {
 // This was fixed by catching and rethrowing in the TaskGroup destructor.
 
 static void loseTime() {
-  int total = 0;
+  // Keep real work without signed overflow or optimization deleting the loop.
+  volatile uint64_t total = 0;
   for (int i = 0; i < 1000; ++i) {
     total += i * i * i;
   }

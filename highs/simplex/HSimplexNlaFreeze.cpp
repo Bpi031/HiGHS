@@ -22,7 +22,8 @@ void SimplexIterate::clear() {
 }
 
 void HSimplexNla::putInvert() {
-  simplex_iterate_.valid_ = true;
-  simplex_iterate_.invert_ = factor_.getInvert();
+  // HEkk publishes validity only after the basis and weights are copied too.
+  simplex_iterate_.valid_ = false;
+  factor_.getInvert(simplex_iterate_.invert_);
 }
 void HSimplexNla::getInvert() { factor_.setInvert(simplex_iterate_.invert_); }

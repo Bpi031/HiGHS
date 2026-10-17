@@ -8,9 +8,15 @@
 #ifndef MIP_HIGHS_MIP_SOLVER_H_
 #define MIP_HIGHS_MIP_SOLVER_H_
 
+#include <cstdint>
+#include <limits>
+
 #include "Highs.h"
 #include "lp_data/HighsCallback.h"
 #include "lp_data/HighsOptions.h"
+#include "mip/HighsCandidateCheckpoint.h"
+#include "mip/HighsAssignmentSupport.h"
+#include "mip/HighsSolveCapacity.h"
 #include "parallel/HighsHardwareTopology.h"
 #include "parallel/HighsParallel.h"
 
@@ -19,6 +25,7 @@ class HighsCutPool;
 struct HighsPseudocostInitialization;
 class HighsCliqueTable;
 class HighsImplications;
+class HighsChildProposalSink;
 
 struct HighsTerminator {
   HighsInt num_instance;
@@ -40,6 +47,12 @@ class HighsMipSolver {
   const HighsOptions* options_mip_;
   const HighsLp* model_;
   const HighsLp* orig_model_;
+  std::vector<HighsInt> primal_partition_groups;
+  HighsInt primal_partition_free_groups = 0;
+  HighsAssignmentSlots primal_assignment_slots;
+  // Diagnostic-only writes by the terminal child's serial first-LP owner.
+  mutable double child_first_lp_seconds = -1;
+  mutable int64_t child_first_lp_iterations = 0;
   HighsModelStatus modelstatus_;
   std::vector<double> solution_;
   double solution_objective_;
@@ -59,6 +72,18 @@ class HighsMipSolver {
   std::vector<HighsObjectiveSolution> saved_objective_and_solution_;
 
   bool submip;
+  // Non-owning, solveSubMip-scoped, serial producer; not a public callback.
+  HighsChildProposalSink* child_proposal_sink = nullptr;
+  // Restricted helper work only; exhaustion never proves infeasibility.
+  int64_t helper_lp_limit = std::numeric_limits<int64_t>::max();
+  mutable int64_t helper_lp_work = 0;
+  HighsCandidateCheckpoint candidate_checkpoint;
+  const HighsCandidateCheckpoint* parent_candidate_checkpoint = nullptr;
+  uint64_t parent_candidate_sequence = 0;
+  bool parentCheckpointRequested() const {
+    return parent_candidate_checkpoint &&
+           parent_candidate_checkpoint->requestedSince(parent_candidate_sequence);
+  }
   HighsInt submip_level;
   HighsInt max_submip_level;
   const HighsBasis* rootbasis;
@@ -67,6 +92,7 @@ class HighsMipSolver {
   const HighsImplications* implicinit;
 
   std::unique_ptr<HighsMipSolverData> mipdata_;
+  std::unique_ptr<HighsSolveCapacity> solve_capacity;
 
   HighsModelStatus termination_status_;
   HighsTerminator terminator_;
@@ -163,13 +189,24 @@ class HighsMipSolver {
   bool deterministicIncumbentExchange() const {
     return options_mip_->mip_incumbent_exchange == "deterministic";
   }
+  bool opportunisticIncumbentExchange() const {
+    return !submip && options_mip_->mip_incumbent_exchange == "opportunistic";
+  }
+  bool boundedIncumbentEpochs() const {
+    return deterministicIncumbentExchange() || opportunisticIncumbentExchange();
+  }
   HighsInt getMaxNumWorkers() const {
     if (highs::parallel::num_threads() == 1 ||
         options_mip_->parallel != kHighsOnString || submip) {
       return 1;
     }
+    if (opportunisticIncumbentExchange())
+      return std::max(1, highs::parallel::num_threads() -
+          (callback_->primal_service_callback ? 1 : 0));
     if (deterministicIncumbentExchange())
       return highsTopologyAwareWorkerCount(highs::parallel::num_threads());
+    if (options_mip_->mip_flexible_node_dispatch)
+      return highs::parallel::num_threads();
     return static_cast<HighsInt>(
         std::ceil(1.7 * highs::parallel::num_threads()));
   }

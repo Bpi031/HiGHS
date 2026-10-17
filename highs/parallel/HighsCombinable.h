@@ -10,6 +10,7 @@
 #define HIGHS_COMBINABLE_H_
 
 #include <functional>
+#include <type_traits>
 
 #include "parallel/HighsCacheAlign.h"
 #include "parallel/HighsTaskExecutor.h"
@@ -19,7 +20,9 @@ class HighsCombinable {
   FConstruct_ construct_;
   struct PaddedData {
     alignas(highs::cache_aligned::alignment()) bool initialized_;
-    T data_;
+    typename std::aligned_storage<sizeof(T), alignof(T)>::type storage_;
+    PaddedData() : initialized_(false) {}
+    T* value() { return reinterpret_cast<T*>(&storage_); }
   };
   int numThreads;
   highs::cache_aligned::unique_ptr<PaddedData[]> threadCopies_;
@@ -30,7 +33,7 @@ class HighsCombinable {
         numThreads(HighsTaskExecutor::getNumWorkerThreads()),
         threadCopies_(
             highs::cache_aligned::make_unique_array<PaddedData>(numThreads)) {
-    for (int i = 0; i < numThreads; ++i) threadCopies_[i].initialized_ = false;
+    for (int i = 0; i < numThreads; ++i) new (&threadCopies_[i]) PaddedData();
   }
 
   template <typename FConstruct>
@@ -39,18 +42,32 @@ class HighsCombinable {
         numThreads(HighsTaskExecutor::getNumWorkerThreads()),
         threadCopies_(
             highs::cache_aligned::make_unique_array<PaddedData>(numThreads)) {
-    for (int i = 0; i < numThreads; ++i) threadCopies_[i].initialized_ = false;
+    for (int i = 0; i < numThreads; ++i) new (&threadCopies_[i]) PaddedData();
   }
 
   HighsCombinable<T, FConstruct_>& operator=(
-      HighsCombinable<T, FConstruct_>&&) = default;
-  HighsCombinable(HighsCombinable<T, FConstruct_>&&) = default;
+      HighsCombinable<T, FConstruct_>&& other) {
+    if (this != &other) {
+      clear();
+      construct_ = std::move(other.construct_);
+      threadCopies_ = std::move(other.threadCopies_);
+      numThreads = other.numThreads;
+      other.numThreads = 0;
+    }
+    return *this;
+  }
+  HighsCombinable(HighsCombinable<T, FConstruct_>&& other)
+      : construct_(std::move(other.construct_)),
+        numThreads(other.numThreads),
+        threadCopies_(std::move(other.threadCopies_)) {
+    other.numThreads = 0;
+  }
 
   void clear() {
     for (int i = 0; i < numThreads; ++i) {
       if (threadCopies_[i].initialized_) {
         threadCopies_[i].initialized_ = false;
-        threadCopies_[i].data_.~T();
+        threadCopies_[i].value()->~T();
       }
     }
   }
@@ -58,36 +75,36 @@ class HighsCombinable {
   T& local() {
     int threadId = HighsTaskExecutor::getThisWorkerDeque()->getOwnerId();
     if (!threadCopies_[threadId].initialized_) {
+      new (&threadCopies_[threadId].storage_) T(construct_());
       threadCopies_[threadId].initialized_ = true;
-      new (&threadCopies_[threadId].data_) T(construct_());
     }
 
-    return threadCopies_[threadId].data_;
+    return *threadCopies_[threadId].value();
   }
 
   const T& local() const {
     int threadId = HighsTaskExecutor::getThisWorkerDeque()->getOwnerId();
     if (!threadCopies_[threadId].initialized_) {
+      new (&threadCopies_[threadId].storage_) T(construct_());
       threadCopies_[threadId].initialized_ = true;
-      new (&threadCopies_[threadId].data_) T(construct_());
     }
 
-    return threadCopies_[threadId].data_;
+    return *threadCopies_[threadId].value();
   }
 
   template <typename FCombine>
   void combine_each(FCombine&& combine) {
     for (int i = 0; i < numThreads; ++i)
-      if (threadCopies_[i].initialized_) combine(threadCopies_[i].data_);
+      if (threadCopies_[i].initialized_) combine(*threadCopies_[i].value());
   }
 
   template <typename FCombine>
   T combine(FCombine&& combine) {
-    T combined;
+    T combined{};
     int i;
     for (i = 0; i < numThreads; ++i) {
       if (threadCopies_[i].initialized_) {
-        combined = std::move(threadCopies_[i].data_);
+        combined = std::move(*threadCopies_[i].value());
         break;
       }
     }
@@ -95,8 +112,7 @@ class HighsCombinable {
     for (++i; i < numThreads; ++i) {
       if (threadCopies_[i].initialized_) {
         combined =
-            combine(std::move(combined), std::move(threadCopies_[i].data_));
-        break;
+            combine(std::move(combined), std::move(*threadCopies_[i].value()));
       }
     }
 

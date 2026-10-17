@@ -264,6 +264,9 @@ struct HighsMipSolverData {
   void queryExternalSolution(
       const double mipsolver_objective_value,
       const ExternalMipSolutionQueryOrigin external_solution_query_origin);
+  void queryExternalSolutionOnce(
+      const double mipsolver_objective_value,
+      const ExternalMipSolutionQueryOrigin external_solution_query_origin);
 
   HighsInt terminatorConcurrency() const;
   bool terminatorActive() const { return terminatorConcurrency() > 0; }

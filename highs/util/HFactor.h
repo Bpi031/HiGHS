@@ -321,6 +321,7 @@ class HFactor {
   void reportAsm() const;
 
   InvertibleRepresentation getInvert() const;
+  void getInvert(InvertibleRepresentation& invert) const;
   void setInvert(const InvertibleRepresentation& invert);
 
   void setDebugReport(const bool debug_report) {

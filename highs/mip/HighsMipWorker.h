@@ -19,10 +19,13 @@
 #include "mip/HighsNodeLpEffort.h"
 #include "mip/HighsNodeQueue.h"
 #include "mip/HighsPrimalHeuristics.h"
+#include "mip/HighsPrimalSnapshot.h"
 #include "mip/HighsPseudocost.h"
 #include "mip/HighsSeparation.h"
+#include "mip/HighsSearchWork.h"
 
 class HighsSearch;
+class HighsPrimalService;
 
 class HighsMipWorker {
  private:
@@ -74,8 +77,18 @@ class HighsMipWorker {
   int64_t work_epoch_ = -1;
   int64_t publication_sequence_ = 0;
   HighsNodeLpEffortController node_lp_effort_;
+  // Passive resident-work accounting must not train bounded-LP budgets.
+  HighsNodeLpEffortController resident_lp_observer_;
+  std::shared_ptr<HighsPrimalSnapshotStore> primal_store_;
+  HighsPrimalService* primal_service_ = nullptr;
+  uint64_t resident_boundaries_ = 0;
+  std::shared_ptr<const HighsPrimalSnapshot> repair_snapshot_;
+  int64_t peer_imports_ = 0;
+  int64_t repair_sequence_ = 0;
+  double peer_wait_max_ = 0;
 
  public:
+  HighsSearchWork search_work;
   std::unique_ptr<HighsSearch> search_ptr_;
   std::unique_ptr<HighsSeparation> sepa_ptr_;
   HighsNodeQueue nodequeue;
@@ -127,21 +140,47 @@ class HighsMipWorker {
   void setLpRelaxation(HighsLpRelaxation* lp) { lp_ = lp; }
 
   bool addIncumbent(const std::vector<double>& sol, double solobj,
-                    int solution_source);
+                    int solution_source, HighsPrimalAdmissionReceipt* receipt = nullptr);
+
+  // Serial/joined master only; publishes a witness, never global proof state.
+  void publishMasterIncumbent(std::vector<double> reduced_columns,
+                              int solution_source);
+
+  void attachPrimalStore(std::shared_ptr<HighsPrimalSnapshotStore> store) {
+    // Called only by the joined owner. No stale mapping survives a new batch.
+    repair_snapshot_.reset();
+    primal_store_ = std::move(store);
+  }
+  void attachPrimalService(HighsPrimalService* service) { primal_service_ = service; }
+  bool residentLpEnabled() const { return primal_store_ != nullptr; }
+  void residentLpBoundary();
+  uint64_t residentBoundaries() const { return resident_boundaries_; }
+  void importPrimalSnapshot();
+  const std::vector<double>& repairIncumbent() const;
+  int64_t repairIncumbentSequence() const;
+  std::shared_ptr<const HighsPrimalSnapshot> pendingPrimalSnapshot() const {
+    return primal_store_ ? primal_store_->latest() : nullptr;
+  }
+  int64_t peerImports() const { return peer_imports_; }
+  double peerWaitMax() const { return peer_wait_max_; }
 
   HighsInt workerId() const { return worker_id_; }
   int64_t workEpoch() const { return work_epoch_; }
+  int64_t nextPublicationSequence() const { return publication_sequence_; }
   void setWorkEpoch(int64_t work_epoch) { work_epoch_ = work_epoch; }
 
   bool nodeLpEffortEnabled() const { return node_lp_effort_.enabled(); }
   HighsInt nodeLpIterationLimit(HighsInt depth,
                                 HighsInt yield_count) const;
-  void recordNodeLpAttempt() { node_lp_effort_.recordAttempt(); }
-  void recordNodeLpCompleted(const HighsNodeLpEffortObservation& observation) {
-    node_lp_effort_.recordCompleted(observation);
+  void recordNodeLpAttempt(bool resident = false) {
+    (resident ? resident_lp_observer_ : node_lp_effort_).recordAttempt();
   }
-  void recordNodeLpYield(HighsInt iterations) {
-    node_lp_effort_.recordYield(iterations);
+  void recordNodeLpCompleted(const HighsNodeLpEffortObservation& observation,
+                            bool resident = false) {
+    (resident ? resident_lp_observer_ : node_lp_effort_).recordCompleted(observation);
+  }
+  void recordNodeLpYield(HighsInt iterations, bool resident = false) {
+    (resident ? resident_lp_observer_ : node_lp_effort_).recordYield(iterations);
   }
   void recordNodeLpSerialCompletion() {
     node_lp_effort_.recordSerialCompletion();
@@ -152,11 +191,16 @@ class HighsMipWorker {
   const HighsNodeLpEffortSummary& nodeLpEffortSummary() const {
     return node_lp_effort_.summary();
   }
+  const HighsNodeLpEffortSummary& residentLpSummary() const {
+    return resident_lp_observer_.summary();
+  }
 
   std::pair<bool, double> transformNewIntegerFeasibleSolution(
-      const std::vector<double>& sol) const;
+      const std::vector<double>& sol,
+      std::vector<double>* original_columns = nullptr) const;
 
-  bool trySolution(const std::vector<double>& solution, int solution_source);
+  bool trySolution(const std::vector<double>& solution, int solution_source,
+                   HighsPrimalAdmissionReceipt* receipt = nullptr);
 
   void setAllowHeuristics(const bool allowed) { heuristics_allowed = allowed; }
 

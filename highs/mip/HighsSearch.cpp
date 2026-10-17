@@ -13,6 +13,7 @@
 #include "mip/HighsCutGeneration.h"
 #include "mip/HighsDomainChange.h"
 #include "mip/HighsMipSolverData.h"
+#include "mip/HighsReplayCapture.h"
 
 HighsSearch::HighsSearch(HighsMipWorker& mipworker, HighsPseudocost& pseudocost)
     : mipworker(mipworker),
@@ -572,10 +573,28 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
       pseudocost.addInferenceObservation(col, inferences, upbranch);
 
       int64_t numiters = lp->getNumLpIterations();
-      HighsLpRelaxation::Status status = playground.solveLp(localdom);
+      const bool observe_probe = mipsolver.options_mip_->mip_root_work_budget &&
+                                 mipworker.search_work.observingLpWork();
+      const double probe_started = observe_probe ? mipsolver.timer_.read() : 0;
+      HighsLpRelaxation::Status status;
+      {
+        HighsLpWorkScope lp_work(&mipworker.search_work,
+                                HighsLpWorkKind::kStrongBranch);
+        status = playground.solveLp(localdom);
+      }
       numiters = lp->getNumLpIterations() - numiters;
       lpiterations += numiters;
       sblpiterations += numiters;
+      if (observe_probe) {
+        const int64_t reliable =
+            std::count(upscorereliable.begin(), upscorereliable.end(), uint8_t{1}) +
+            std::count(downscorereliable.begin(), downscorereliable.end(), uint8_t{1});
+        mipworker.search_work.observeStrongProbe(nnodes, getCurrentDepth(), col,
+            numfrac, reliable, upbranch, numiters,
+            mipsolver.timer_.read() - probe_started, static_cast<int>(status),
+            lp->unscaledDualFeasible(status) ||
+            status == HighsLpRelaxation::Status::kInfeasible);
+      }
 
       if (lp->scaledOptimal(status)) {
         lp->performAging();
@@ -744,6 +763,48 @@ void HighsSearch::currentNodeToQueue(HighsNodeQueue& nodequeue) {
   nodestack.back().opensubtrees = 0;
 }
 
+bool HighsSearch::donateReadySibling() {
+  if (!donation_ || inheuristic || nodestack.size() < 2) return false;
+  const auto& stack = localdom.getDomainChangeStack();
+  const auto& positions = localdom.getBranchingPositions();
+  for (size_t i = 0; i + 1 < nodestack.size(); ++i) {
+    auto& parent = nodestack[i];
+    // Symmetry-skipped frames and fallback branches retain their existing
+    // backtracking logic. Only ordinary integral disjunctions are donated.
+    if (parent.opensubtrees != 1 || parent.skipDepthCount ||
+        parent.branchingdecision.column < 0 ||
+        parent.branchingdecision.boundval == parent.branching_point)
+      continue;
+    const HighsInt position = nodestack[i + 1].domgchgStackPos;
+    if (position < 0 || size_t(position) >= stack.size()) continue;
+    HighsDetachedNode sibling;
+    sibling.changes.assign(stack.begin(), stack.begin() + position);
+    for (HighsInt p : positions)
+      if (p < position) sibling.branchings.push_back(p);
+    sibling.branchings.push_back(position);
+    auto decision = parent.branchingdecision;
+    if (decision.boundtype == HighsBoundType::kLower) {
+      decision.boundtype = HighsBoundType::kUpper;
+      decision.boundval = std::floor(decision.boundval - 0.5);
+    } else {
+      decision.boundtype = HighsBoundType::kLower;
+      decision.boundval = std::ceil(decision.boundval + 0.5);
+    }
+    sibling.changes.push_back(decision);
+    sibling.bound = std::max(parent.lower_bound, parent.other_child_lb);
+    sibling.estimate = parent.estimate;
+    sibling.depth = depthoffset + HighsInt(i) + 2;
+    sibling.basis = parent.nodeBasis;
+    // The packet is completely owned by the receiver before the donor gives
+    // up its sibling. Allocation rejection leaves the search stack unchanged.
+    if (sibling.bound > getOptimalityLimit() || !donation_(sibling))
+      return false;
+    parent.opensubtrees = 0;
+    return true;
+  }
+  return false;
+}
+
 void HighsSearch::openNodesToQueue(HighsNodeQueue& nodequeue) {
   if (nodestack.empty()) return;
 
@@ -880,7 +941,13 @@ void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
 }
 
 HighsSearch::NodeResult HighsSearch::evaluateNode() {
+  // Between numerical solves, never from an LP callback or a foreign worker.
+  mipworker.importPrimalSnapshot();
   assert(!nodestack.empty());
+  if (!inheuristic && mipworker.search_work.checkpointRequested()) {
+    mipworker.search_work.recordCandidateYield();
+    return NodeResult::kCandidateCheckpoint;
+  }
   NodeData& currnode = nodestack.back();
   const NodeData* parent = getParentNodeData();
 
@@ -944,20 +1011,41 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
     // Bounded node-LP effort is a tree-search control. Same-worker heuristic
     // searches such as RINS and RENS require a completed relaxation and have
     // separate budgets; their callers do not consume the tree-yield outcome.
-    const bool bounded_node_lp_effort = boundedNodeLpEffortApplies(
-        inheuristic, mipworker.nodeLpEffortEnabled());
+    const bool candidate_chunks = !inheuristic &&
+                                  mipworker.search_work.checkpointEnabled();
+    const bool resident = !inheuristic && mipworker.residentLpEnabled() &&
+                          lp->getLpSolver().getBasis().valid;
+    const bool bounded_node_lp_effort = !resident && (boundedNodeLpEffortApplies(
+        inheuristic, mipworker.nodeLpEffortEnabled()) || candidate_chunks);
+    // The resident path services candidates without returning from simplex.
+    // Keep node/domain/factors/pricing on this owner; never requeue a partial LP.
+    if (resident) lp->setIterationLimit(kHighsIInf);
     HighsInt effort_limit = kHighsIInf;
     if (bounded_node_lp_effort) {
       effort_limit = mipworker.nodeLpIterationLimit(getCurrentDepth(),
                                                     currnode.yield_count);
+      // Preserve the eventual completion escape after repeated safe yields.
+      // Other tree evaluations consume only the remaining lease reservation.
+      if (effort_limit != kHighsIInf)
+        effort_limit = std::min<HighsInt>(effort_limit,
+            std::max<int64_t>(1, mipworker.search_work.remaining()));
+      if (candidate_chunks)
+        effort_limit = highsCandidateLpIterationLimit(effort_limit,
+                                                      currnode.yield_count);
+      if (effort_limit == kHighsIInf)
+        mipworker.search_work.recordCompletionExemption();
       lp->setIterationLimit(effort_limit);
-      mipworker.recordNodeLpAttempt();
     }
+    const bool observe_node_lp = bounded_node_lp_effort || resident;
+    if (observe_node_lp) mipworker.recordNodeLpAttempt(resident);
     const bool serial_completion = bounded_node_lp_effort &&
                                    currnode.yield_count > 0 &&
                                    effort_limit == kHighsIInf;
     int64_t oldnumiters = lp->getNumLpIterations();
     const double old_lower_bound = currnode.lower_bound;
+    if (!inheuristic && !mipsolver.submip)
+      HighsReplayCapture::capture(lp->getLpSolver().getLp(), "node_lp",
+                                 getCurrentDepth(), &lp->getLpSolver().getBasis());
     HighsLpRelaxation::Status status =
         lp->resolveLp(&localdom, bounded_node_lp_effort);
     const HighsInt node_lp_iterations = static_cast<HighsInt>(std::max<int64_t>(
@@ -969,14 +1057,14 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
       if (basis.valid)
         currnode.nodeBasis = std::make_shared<const HighsBasis>(basis);
       ++currnode.yield_count;
-      mipworker.recordNodeLpYield(node_lp_iterations);
+      mipworker.recordNodeLpYield(node_lp_iterations, resident);
       return NodeResult::kLpIterationLimit;
     }
 
     currnode.lower_bound =
         std::max(localdom.getObjectiveLowerBound(), currnode.lower_bound);
 
-    if (bounded_node_lp_effort) {
+    if (observe_node_lp) {
       HighsNodeLpEffortObservation effort_observation;
       effort_observation.depth = getCurrentDepth();
       effort_observation.iteration_count = node_lp_iterations;
@@ -986,15 +1074,17 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
         const HighsModelStatus model_status = lp->getLpSolver().getModelStatus();
         effort_observation.outcome =
             model_status == HighsModelStatus::kTimeLimit ||
+                    model_status == HighsModelStatus::kInterrupt ||
                     model_status == HighsModelStatus::kIterationLimit
                 ? HighsNodeLpEffortOutcome::kLimitReached
                 : HighsNodeLpEffortOutcome::kNumericalFailure;
       } else {
         effort_observation.outcome = HighsNodeLpEffortOutcome::kCompleted;
       }
-      effort_observation.improved_bound =
-          currnode.lower_bound > old_lower_bound;
-      mipworker.recordNodeLpCompleted(effort_observation);
+      effort_observation.improved_bound = currnode.lower_bound > old_lower_bound ||
+          (lp->scaledOptimal(status) && lp->unscaledDualFeasible(status) &&
+           lp->getObjective() > old_lower_bound);
+      mipworker.recordNodeLpCompleted(effort_observation, resident);
       if (serial_completion) mipworker.recordNodeLpSerialCompletion();
     }
 
@@ -1051,6 +1141,8 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
         if (lp->unscaledDualFeasible(status)) {
           currnode.lower_bound =
               std::max(currnode.lp_objective, currnode.lower_bound);
+          mipworker.search_work.recordLocalBound(old_lower_bound,
+                                                 currnode.lower_bound);
 
           if (currnode.lower_bound > getCutoffBound()) {
             result = NodeResult::kBoundExceeding;
@@ -1156,6 +1248,9 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
 }
 
 HighsSearch::NodeResult HighsSearch::branch() {
+  HighsSearchWorkScope work_scope(mipworker.search_work,
+                                  inheuristic ? mipworker.search_work.role()
+                                              : HighsSearchWorkRole::kBranch);
   assert(localdom.getChangedCols().empty());
 
   assert(nodestack.back().opensubtrees == 2);
@@ -1392,12 +1487,21 @@ HighsSearch::NodeResult HighsSearch::branch() {
 
     assert(!localdom.getChangedCols().empty());
     result = evaluateNode();
-    if (result == NodeResult::kSubOptimal) break;
+    // Re-evaluation can yield after a strong-branching domain change. The old
+    // LP solution is no longer evidence for another branching probe.
+    if (result == NodeResult::kSubOptimal ||
+        result == NodeResult::kLpIterationLimit ||
+        result == NodeResult::kCandidateCheckpoint)
+      break;
   }
   inbranching = false;
   NodeData& currnode = nodestack.back();
   pseudocost.setMinReliable(minrel);
   pseudocost.setDegeneracyFactor(1.0);
+
+  if (result == NodeResult::kLpIterationLimit ||
+      result == NodeResult::kCandidateCheckpoint)
+    return result;
 
   assert(currnode.opensubtrees == 2 || currnode.opensubtrees == 0);
 
@@ -1489,6 +1593,10 @@ HighsSearch::NodeResult HighsSearch::branch() {
       result = NodeResult::kLpInfeasible;
       return result;
     }
+    // A helper's exhausted LP budget is not evidence that its fixed assignment
+    // is infeasible. Leave this restricted node open instead of the unbounded
+    // numerical-recovery path below.
+    if (lp->isBoundedHelper()) return NodeResult::kOpen;
     lp->setIterationLimit();
 
     // create a fresh LP only with model rows since all integer columns are
@@ -1521,17 +1629,13 @@ HighsSearch::NodeResult HighsSearch::branch() {
       if (result == NodeResult::kOpen) {
         // LP still not solved, reevaluate with IPM instead of simplex
         lp->getLpSolver().clearSolver();
-        lp->getLpSolver().setOptionValue("solver", "ipm");
+        lp->useIpxForRecovery();
         result = evaluateNode();
 
         if (result == NodeResult::kOpen) {
-          highsLogUser(mipsolver.options_mip_->log_options,
-                       HighsLogType::kWarning,
-                       "Failed to solve node with all integer columns "
-                       "fixed. Declaring node infeasible.\n");
-          // LP still not solved, give up and declare as infeasible
-          currnode.opensubtrees = 0;
-          result = NodeResult::kLpInfeasible;
+          // No infeasibility proof was obtained. Preserve the open subtree;
+          // a joined master must report numerical failure, not prune it.
+          if (!checkLimits(nnodes)) result = failLpRecovery();
         }
       }
     }
@@ -1555,6 +1659,8 @@ HighsSearch::NodeResult HighsSearch::branch() {
       currnode.nodeBasis,
       passStabilizerToChildNode ? currnode.stabilizerOrbits : nullptr);
   nodestack.back().domgchgStackPos = domchgPos;
+
+  donateReadySibling();
 
   return NodeResult::kBranched;
 }
@@ -1934,7 +2040,8 @@ HighsSearch::NodeResult HighsSearch::dive(int64_t nodeLim) {
     ++nnodes;
     NodeResult result = evaluateNode();
 
-    if (result == NodeResult::kLpIterationLimit) {
+    if (result == NodeResult::kLpIterationLimit ||
+        result == NodeResult::kCandidateCheckpoint) {
       --nnodes;
       return result;
     }
@@ -1943,8 +2050,29 @@ HighsSearch::NodeResult HighsSearch::dive(int64_t nodeLim) {
 
     if (result != NodeResult::kOpen) return result;
 
+    if (!inheuristic && mipworker.search_work.checkpointRequested()) {
+      mipworker.search_work.recordCandidateYield();
+      --nnodes;
+      const HighsBasis& basis = lp->getLpSolver().getBasis();
+      if (resumableBasisMatches(basis, lp->numRows(), lp->numCols()))
+        nodestack.back().nodeBasis = std::make_shared<const HighsBasis>(basis);
+      return NodeResult::kCandidateCheckpoint;
+    }
+
     result = branch();
+    if (result == NodeResult::kLpIterationLimit ||
+        result == NodeResult::kLpSolveError ||
+        result == NodeResult::kCandidateCheckpoint) {
+      --nnodes;
+      return result;
+    }
     if (result != NodeResult::kBranched) return result;
+    // The branch is complete and every open child remains in nodestack.
+    // Do not interrupt a branching probe or count this as a pruned leaf.
+    if (!inheuristic && mipworker.search_work.exhausted()) {
+      mipworker.search_work.recordYield();
+      return NodeResult::kTaskWorkLimit;
+    }
     if (nnodes >= nodeLim) return result;
   } while (true);
 }
@@ -1955,7 +2083,10 @@ void HighsSearch::solveDepthFirst(int64_t maxbacktracks) {
 
     NodeResult result = dive();
     // if a limit was reached the result might be open
-    if (result == NodeResult::kOpen) break;
+    if (result == NodeResult::kOpen || result == NodeResult::kLpIterationLimit ||
+        result == NodeResult::kLpSolveError ||
+        result == NodeResult::kTaskWorkLimit ||
+        result == NodeResult::kCandidateCheckpoint) break;
 
     --maxbacktracks;
 
@@ -2005,6 +2136,7 @@ const HighsNodeQueue& HighsSearch::getNodeQueue() const {
 }
 
 bool HighsSearch::checkLimits(int64_t nodeOffset) const {
+  if (lp_recovery_failed_) return true;
   if (mipsolver.mipdata_->parallelLockActive()) {
     return checkLocalLimits();
   };
@@ -2012,6 +2144,7 @@ bool HighsSearch::checkLimits(int64_t nodeOffset) const {
 }
 
 bool HighsSearch::checkLocalLimits() const {
+  if (lp_recovery_failed_) return true;
   if (mipsolver.mipdata_->terminatorActive())
     if (mipsolver.mipdata_->terminatorTerminated()) return true;
 

@@ -1258,6 +1258,13 @@ class Highs {
   HighsStatus setCallback(HighsCCallbackType c_callback,
                           void* user_callback_data = nullptr);
 
+  // Opt-in private-model callback owner; may run concurrently with logging.
+  // Configure only outside run(). A null callback detaches the owner.
+  void setPrimalServiceCallback(HighsCCallbackType callback, void* data) {
+    callback_.primal_service_callback = callback;
+    callback_.primal_service_data = data;
+  }
+
   /**
    * @brief Start callback of given type
    */
@@ -1269,6 +1276,11 @@ class Highs {
    */
   HighsStatus stopCallback(const int callback_type);
   HighsStatus stopCallback(const HighsCallbackType callback_type);
+
+  // Read only at a master-safe callback or after run() returns.
+  const HighsCallbackSolutionOutcome& getCallbackSolutionOutcome() const {
+    return callback_.data_in.admission;
+  }
 
   /**
    * @brief Use the HighsBasis passed to set the internal HighsBasis
@@ -1596,6 +1608,7 @@ class Highs {
 
   // End of deprecated methods
  private:
+  friend struct HighsCallbackInput;
   HighsSolution solution_;
   HighsBasis basis_;
   ICrashInfo icrash_info_;
@@ -1854,7 +1867,8 @@ class Highs {
   HighsStatus optionChangeAction();
 
   HighsStatus userScale(HighsUserScaleData& data);
-  HighsStatus userUnscale(HighsUserScaleData& data);
+  HighsStatus userUnscale(HighsUserScaleData& data,
+                          const bool unscale_solution = true);
   HighsStatus userScaleModel(HighsUserScaleData& data);
   HighsStatus userScaleSolution(HighsUserScaleData& data,
                                 bool update_kkt = false);

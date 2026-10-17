@@ -68,6 +68,34 @@ typedef struct HighsCallbackDataIn {
   HighsInt user_solution_size;
 } HighsCallbackDataIn;
 
+// Additive, version-checked Rost admission evidence; existing callback layouts
+// are unchanged. Costs are in the native original model's objective units
+// (including its sense/offset and any user objective scaling).
+typedef struct HighsCallbackSolutionOutcome {
+  int64_t candidate_id;
+  int64_t generation;
+  int64_t sequence_before;
+  int64_t sequence_after;
+  int status;
+  double objective_before;
+  double objective_after;
+  double submitted_objective;
+  double reduced_objective;
+  double admission_time;
+} HighsCallbackSolutionOutcome;
+
+enum HighsCallbackAdmissionStatus {
+  kHighsAdmissionNone = 0,
+  kHighsAdmissionImproved = 1,
+  kHighsAdmissionNoImprovement = 2,
+  kHighsAdmissionInvalidDimensions = 3,
+  kHighsAdmissionNonfinite = 4,
+  kHighsAdmissionInfeasible = 5,
+  kHighsAdmissionPostsolveRejected = 6,
+  kHighsAdmissionStale = 7,
+  kHighsAdmissionDuplicate = 8
+};
+
 // Additional callback handling
 typedef void (*HighsCCallbackType)(int, const char*,
                                    const HighsCallbackDataOut*,

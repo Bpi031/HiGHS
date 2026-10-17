@@ -13,6 +13,8 @@
 
 #include <cassert>
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #include "lp_data/HConst.h"
 #include "stdio.h"  //Just for temporary printf
@@ -23,6 +25,9 @@ void HVectorBase<Real>::setup(HighsInt size_) {
   /*
    * Initialise an HVector instance
    */
+  const HighsInt max_extent = std::numeric_limits<HighsInt>::max();
+  if (size_ < 0 || size_ > max_extent / 4 || size_ > max_extent - 6400)
+    throw std::length_error("HVector work-buffer extent is out of range");
   size = size_;
   count = 0;
   index.resize(size);
@@ -112,6 +117,14 @@ void HVectorBase<Real>::pack() {
   if (!packFlag) return;
   packFlag = false;
   packCount = 0;
+  if (count < 0) {
+    for (HighsInt i = 0; i < size; ++i) {
+      if (array[i] == Real{0}) continue;
+      packIndex[packCount] = i;
+      packValue[packCount++] = array[i];
+    }
+    return;
+  }
   for (HighsInt i = 0; i < count; i++) {
     const HighsInt ipack = index[i];
     packIndex[packCount] = ipack;
@@ -128,9 +141,16 @@ void HVectorBase<Real>::reIndex() {
    */
   // Don't do it if there are relatively few nonzeros
   if (count >= 0 && count <= size * 0.1) return;
-  count = 0;
-  for (HighsInt i = 0; i < size; i++)
-    if ((double)array[i]) index[count++] = i;
+  HighsInt nonzero_count = 0;
+  const HighsInt dimension = size;
+  const Real* values = array.data();
+  HighsInt* indices = index.data();
+  for (HighsInt i = 0; i < dimension; i++) {
+    // Only index[0..count) is valid; keep the counter local to avoid reloads.
+    indices[nonzero_count] = i;
+    nonzero_count += static_cast<double>(values[i]) != 0.0;
+  }
+  count = nonzero_count;
 }
 
 template <typename Real>
@@ -141,11 +161,22 @@ void HVectorBase<Real>::copy(const HVectorBase<FromReal>* from) {
    * The real type of "from" does not need to be the same, but must be
    * convertible to this HVector's real type.
    */
+  if (static_cast<const void*>(this) == static_cast<const void*>(from)) return;
+  assert(size == from->size);
+  const HighsInt fromCount = from->count;
+  if (fromCount < 0) {
+    // Full replacement needs scalar reset, not a preceding full zero pass.
+    clearScalars();
+    count = fromCount;
+    synthetic_tick = from->synthetic_tick;
+    for (HighsInt i = 0; i < size; ++i) array[i] = Real(from->array[i]);
+    return;
+  }
   clear();
   synthetic_tick = from->synthetic_tick;
-  const HighsInt fromCount = count = from->count;
-  const HighsInt* fromIndex = &from->index[0];
-  const FromReal* fromArray = &from->array[0];
+  count = fromCount;
+  const HighsInt* fromIndex = from->index.data();
+  const FromReal* fromArray = from->array.data();
   for (HighsInt i = 0; i < fromCount; i++) {
     const HighsInt iFrom = fromIndex[i];
     const FromReal xFrom = fromArray[iFrom];
@@ -158,13 +189,13 @@ Real HVectorBase<Real>::norm2() const {
   /*
    * Compute the squared 2-norm of the vector
    */
-  const HighsInt workCount = count;
-  const HighsInt* workIndex = &index[0];
-  const Real* workArray = &array[0];
+  const HighsInt workCount = count < 0 ? size : count;
+  const HighsInt* workIndex = index.data();
+  const Real* workArray = array.data();
 
   Real result = Real{0};
   for (HighsInt i = 0; i < workCount; i++) {
-    Real value = workArray[workIndex[i]];
+    Real value = workArray[count < 0 ? i : workIndex[i]];
     result += value * value;
   }
   return result;
@@ -180,13 +211,28 @@ void HVectorBase<Real>::saxpy(const RealPivX pivotX,
    * The real types may all be different but must mix in operations and be
    * convertible to this HVector's real type.
    */
+  assert(size == pivot->size);
+  if (count < 0 || pivot->count < 0) {
+    const bool dense_pivot = pivot->count < 0;
+    const HighsInt pivot_count = dense_pivot ? size : pivot->count;
+    using std::abs;
+    for (HighsInt k = 0; k < pivot_count; ++k) {
+      const HighsInt row = dense_pivot ? k : pivot->index[k];
+      const RealPiv value = pivot->array[row];
+      if (dense_pivot && value == RealPiv{0}) continue;
+      const Real updated = Real(array[row] + pivotX * value);
+      array[row] = abs(updated) < kHighsTiny ? kHighsZero : updated;
+    }
+    count = -1;
+    return;
+  }
   HighsInt workCount = count;
-  HighsInt* workIndex = &index[0];
-  Real* workArray = &array[0];
+  HighsInt* workIndex = index.data();
+  Real* workArray = array.data();
 
   const HighsInt pivotCount = pivot->count;
-  const HighsInt* pivotIndex = &pivot->index[0];
-  const RealPiv* pivotArray = &pivot->array[0];
+  const HighsInt* pivotIndex = pivot->index.data();
+  const RealPiv* pivotArray = pivot->array.data();
 
   using std::abs;
   for (HighsInt k = 0; k < pivotCount; k++) {

@@ -7,6 +7,8 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsRedcostFixing.h"
 
+#include <limits>
+
 #include "mip/HighsMipSolverData.h"
 
 std::vector<std::pair<double, HighsDomainChange>>
@@ -289,7 +291,22 @@ void HighsRedcostFixing::addRootRedcost(const HighsMipSolver& mipsolver,
       };
 
   for (HighsInt col : mipsolver.mipdata_->integral_cols) {
-    if (lpredcost[col] > mipsolver.mipdata_->feastol) {
+    const double lower = mipsolver.mipdata_->getDomain().col_lower_[col];
+    const double upper = mipsolver.mipdata_->getDomain().col_upper_[col];
+    // This optional cache uses HighsInt bounds, differences and stepped sums.
+    // Leave headroom for that arithmetic; unsupported ranges simply forgo the
+    // cached reduction, never truncate a model bound or strengthen it unsafely.
+    const double cache_limit = double(std::numeric_limits<HighsInt>::max() / 4);
+    const auto cacheable = [cache_limit](double value) {
+      return std::isfinite(value) && std::abs(value) <= cache_limit &&
+             value == std::trunc(value);
+    };
+    const bool finiteLower = lower != -kHighsInf;
+    const bool finiteUpper = upper != kHighsInf;
+    if ((finiteLower && !cacheable(lower)) ||
+        (finiteUpper && !cacheable(upper)))
+      continue;
+    if (lpredcost[col] > mipsolver.mipdata_->feastol && finiteLower) {
       // col <= (cutoffbound - lpobj)/redcost + lb
       // so for lurkub = lb to ub - 1 we can compute the necessary cutoff
       // bound to reach this bound which is:
@@ -297,14 +314,12 @@ void HighsRedcostFixing::addRootRedcost(const HighsMipSolver& mipsolver,
       //  cutoffbound = (lurkub - lb) * redcost + lpobj
       findLurkingBounds(
           col, HighsInt{1},
-          static_cast<HighsInt>(
-              mipsolver.mipdata_->getDomain().col_lower_[col]),
-          static_cast<HighsInt>(
-              mipsolver.mipdata_->getDomain().col_upper_[col]),
-          mipsolver.mipdata_->getDomain().col_upper_[col] != kHighsInf,
+          static_cast<HighsInt>(lower),
+          finiteUpper ? static_cast<HighsInt>(upper) : HighsInt{0},
+          finiteUpper,
           lpobjective, lpredcost[col], maxNumSteps, maxNumStepsExp,
           lurkingColUpper[col], lurkingColLower[col]);
-    } else if (lpredcost[col] < -mipsolver.mipdata_->feastol) {
+    } else if (lpredcost[col] < -mipsolver.mipdata_->feastol && finiteUpper) {
       // col >= (cutoffbound - lpobj)/redcost + ub
       // so for lurklb = lb + 1 to ub we can compute the necessary cutoff
       // bound to reach this bound which is:
@@ -312,11 +327,9 @@ void HighsRedcostFixing::addRootRedcost(const HighsMipSolver& mipsolver,
       //  cutoffbound = (lurklb - ub) * redcost + lpobj
       findLurkingBounds(
           col, HighsInt{-1},
-          static_cast<HighsInt>(
-              mipsolver.mipdata_->getDomain().col_upper_[col]),
-          static_cast<HighsInt>(
-              mipsolver.mipdata_->getDomain().col_lower_[col]),
-          mipsolver.mipdata_->getDomain().col_lower_[col] != -kHighsInf,
+          static_cast<HighsInt>(upper),
+          finiteLower ? static_cast<HighsInt>(lower) : HighsInt{0},
+          finiteLower,
           lpobjective, lpredcost[col], maxNumSteps, maxNumStepsExp,
           lurkingColLower[col], lurkingColUpper[col]);
     }

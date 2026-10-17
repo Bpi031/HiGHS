@@ -22,6 +22,7 @@ class HighsMipWorker;
 
 class HighsLpRelaxation {
  public:
+  enum class CutRemovalMode { kReoptimize, kModelAndBasisOnly };
   enum class Status {
     kNotSet,
     kOptimal,
@@ -75,7 +76,7 @@ class HighsLpRelaxation {
   HVector row_ep;
   HighsSparseVectorSum row_ap;
   double dualproofrhs;
-  bool hasdualproof;
+  bool hasdualproof = false;
   double objective;
   std::shared_ptr<const HighsBasis> basischeckpoint;
   bool currentbasisstored;
@@ -89,6 +90,8 @@ class HighsLpRelaxation {
   bool adjustSymBranchingCol;
   bool solved_first_lp;
   HighsMipWorker* worker_;
+
+  HighsStatus optimizeLp(Highs& solver);
 
   void storeDualInfProof();
 
@@ -144,13 +147,7 @@ class HighsLpRelaxation {
     Playground(const Playground& other) = delete;
     Playground& operator=(const Playground& other) = delete;
 
-    ~Playground() {
-      if (iterateStored) {
-        lp->getLpSolver().getIterate();
-        lp->run();
-        // If desired, here is the place to clear the stored iterate
-      }
-    }
+    ~Playground();
   };
 
   Playground playground() { return Playground(this); }
@@ -331,11 +328,14 @@ class HighsLpRelaxation {
 
   void notifyCutPoolsLpCopied(HighsInt n);
 
-  void removeObsoleteRows(bool notifyPool = true);
+  void removeObsoleteRows(bool notifyPool = true,
+      CutRemovalMode mode = CutRemovalMode::kReoptimize);
 
-  void removeWorkerSpecificRows();
+  void removeWorkerSpecificRows(
+      CutRemovalMode mode = CutRemovalMode::kReoptimize);
 
-  void removeCuts(HighsInt ndelcuts, std::vector<HighsInt>& deletemask);
+  void removeCuts(HighsInt ndelcuts, std::vector<HighsInt>& deletemask,
+      CutRemovalMode mode = CutRemovalMode::kReoptimize);
 
   void removeCuts();
 
@@ -378,8 +378,30 @@ class HighsLpRelaxation {
   double getObjective() const { return objective; }
 
   void setIterationLimit(HighsInt limit = kHighsIInf) {
-    lpsolver.setOptionValue("simplex_iteration_limit", limit);
+    lpsolver.setOptionValue("simplex_iteration_limit", std::min(limit, helper_iteration_limit_));
   }
+  void setHelperDeadline(double deadline) { helper_deadline_ = deadline; }
+  void useIpxForRecovery() { recovery_ipx_ = true; }
+  void setHelperIterationLimit(HighsInt limit) {
+    helper_iteration_limit_ = limit;
+    setIterationLimit(limit);
+  }
+  bool isBoundedHelper() const {
+    return mipsolver.callback_->refinement_budget ||
+           helper_deadline_ < kHighsInf || helper_iteration_limit_ < kHighsIInf;
+  }
+  void setCandidateInterruptible(bool enabled = true) {
+    candidate_interruptible_ = enabled;
+  }
+
+ private:
+  double helper_deadline_ = kHighsInf;
+  bool recovery_ipx_ = false;
+  HighsInt helper_iteration_limit_ = kHighsIInf;
+  bool candidate_interruptible_ = false;
+  HighsCandidateLpInterrupt candidate_interrupt_;
+
+ public:
   void setSolvedFirstLp(const bool solved_first_lp_) {
     this->solved_first_lp = solved_first_lp_;
   }

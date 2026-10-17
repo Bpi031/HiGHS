@@ -1338,6 +1338,12 @@ HighsInt Highs_setSparseSolution(void* highs, const HighsInt num_entries,
 HighsInt Highs_setCallback(void* highs, HighsCCallbackType user_callback,
                            void* user_callback_data);
 
+/* Experimental candidate-only owner. Configure outside run; callback data must
+ * survive run. The callback receives a private model, not the live proof model.
+ * It may overlap logging callbacks; callers must isolate their mutable state. */
+HighsInt Highs_setPrimalServiceCallback(void* highs, HighsCCallbackType callback,
+                                      void* data);
+
 /**
  * Start callback of given type
  *
@@ -2614,6 +2620,27 @@ HighsInt Highs_setCallbackSparseSolution(HighsCallbackDataIn* data_in,
  * @returns A `kHighsStatus` constant indicating whether the call succeeded.
  */
 HighsInt Highs_repairCallbackSolution(HighsCallbackDataIn* data_in);
+
+/** Bounded exact-model helper. Unspecified columns use kHighsUndefined.
+ * require_optimal is 0 or 1. A successful candidate is in data_in; helper
+ * bounds and statuses never qualify the parent solve. */
+HighsInt Highs_refineCallbackSolution(HighsCallbackDataIn* data_in,
+                                    double seconds, HighsInt nodes,
+                                    HighsInt lp_iterations,
+                                    HighsInt require_optimal);
+
+// Rost additive admission API, version 1. No existing callback struct changes.
+// Access is restricted to master-safe user callbacks or, for the model getter,
+// after Highs_run returns. Mismatched versions leave the output untouched.
+HighsInt Highs_getCallbackSolutionOutcome(const HighsCallbackDataIn* data_in,
+                                        HighsInt version,
+                                        HighsCallbackSolutionOutcome* outcome);
+HighsInt Highs_getLastCallbackSolutionOutcome(const void* highs, HighsInt version,
+                                            HighsCallbackSolutionOutcome* outcome);
+// Tokens must increase strictly within a generation; replayed tokens are rejected.
+HighsInt Highs_tagCallbackSolution(HighsCallbackDataIn* data_in,
+                                 int64_t candidate_id, int64_t generation);
+HighsInt Highs_getCallbackRefinementStatus(const HighsCallbackDataIn* data_in);
 
 // *********************
 // * Deprecated methods*

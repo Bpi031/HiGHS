@@ -12,10 +12,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cmath>
 #include <utility>
 
 #include "Highs.h"
 #include "lp_data/HighsStatus.h"
+#include "lp_data/HighsRefinementBudget.h"
 #include "util/HighsIntegers.h"
 
 void HighsCallback::clearHighsCallbackOutput() {
@@ -26,6 +29,7 @@ void HighsCallback::clearHighsCallbackOutput() {
   this->data_out.pdlp_iteration_count = -1;
   this->data_out.objective_function_value = -kHighsInf;
   this->data_out.mip_node_count = -1;
+  this->data_out.mip_total_lp_iterations = -1;
   this->data_out.mip_primal_bound = kHighsInf;
   this->data_out.mip_dual_bound = -kHighsInf;
   this->data_out.mip_gap = -1;
@@ -41,6 +45,8 @@ void HighsCallback::clearHighsCallbackOutput() {
   this->data_out.mip_solution_publication_time = -1.0;
   this->data_out.mip_solution_admission_time = -1.0;
   this->data_out.cutpool_start.clear();
+  this->data_out.cutpool_num_col = 0;
+  this->data_out.cutpool_num_cut = 0;
   this->data_out.cutpool_index.clear();
   this->data_out.cutpool_value.clear();
   this->data_out.cutpool_lower.clear();
@@ -60,10 +66,15 @@ void HighsCallback::clearHighsCallbackInput() {
 
   this->data_in.user_interrupt = false;
   this->data_in.user_has_solution = false;
+  this->data_in.candidate_id = 0;
+  this->data_in.candidate_generation = -1;
 }
 
 void HighsCallback::clear() {
+  this->refinement_budget = nullptr;
   this->user_callback = nullptr;
+  this->primal_service_callback = nullptr;
+  this->primal_service_data = nullptr;
   this->user_callback_data = nullptr;
   this->active.assign(kNumCallbackType, false);
   this->clearHighsCallbackOutput();
@@ -174,7 +185,7 @@ HighsCallbackInput::operator HighsCallbackDataIn() const {
 
 // we assume that user_solution.data() == data_in.user_solution
 // and that user_solution.size() == data_in.user_solution_size
-HighsCallbackInput HighsCallbackInput::operator=(
+HighsCallbackInput& HighsCallbackInput::operator=(
     const HighsCallbackDataIn& data_in) {
   assert(user_solution.data() == data_in.user_solution);
   user_interrupt = data_in.user_interrupt != 0;
@@ -184,26 +195,35 @@ HighsCallbackInput HighsCallbackInput::operator=(
 
 HighsStatus HighsCallbackInput::setSolution(HighsInt num_entries,
                                             const double* value) {
-  if (num_entries <= highs->getNumCol()) {
-    for (int i = 0; i < num_entries; ++i) {
-      user_solution[i] = value[i];
-    }
-
-    user_has_solution = true;
-    return HighsStatus::kOk;
-  } else {
-    highsLogUser(highs->getOptions().log_options, HighsLogType::kError,
-                 "setSolution: num_entries %d is larger than num_col %d",
-                 int(num_entries), int(highs->getNumCol()));
-
+  if (!highs || num_entries < 0 || (num_entries > 0 && !value))
     return HighsStatus::kError;
+  if (num_entries == 0) return HighsStatus::kOk;
+  const auto& lp = highs->getLp();
+  const auto& options = highs->getOptions();
+  if (num_entries > lp.num_col_ ||
+      user_solution.size() != static_cast<size_t>(lp.num_col_))
+    return HighsStatus::kError;
+
+  // Validate the entire submission before replacing any previous candidate.
+  for (HighsInt i = 0; i < num_entries; ++i) {
+    if (value[i] != kHighsUndefined &&
+        (!std::isfinite(value[i]) ||
+         value[i] < lp.col_lower_[i] - options.primal_feasibility_tolerance ||
+         value[i] > lp.col_upper_[i] + options.primal_feasibility_tolerance))
+      return HighsStatus::kError;
   }
+  for (HighsInt i = 0; i < num_entries; ++i) user_solution[i] = value[i];
+  user_has_solution = true;
+  return HighsStatus::kOk;
 }
 
 // User provides a partial solution
 HighsStatus HighsCallbackInput::setSolution(HighsInt num_entries,
                                             const HighsInt* index,
                                             const double* value) {
+  if (!highs || num_entries < 0 ||
+      (num_entries > 0 && (!index || !value)))
+    return HighsStatus::kError;
   if (num_entries == 0) {
     // No solution provided, so nothing to do
     return HighsStatus::kOk;
@@ -213,7 +233,8 @@ HighsStatus HighsCallbackInput::setSolution(HighsInt num_entries,
   const auto& lp = highs->getLp();
 
   // Warn about duplicates in index
-  assert(user_solution.size() == static_cast<size_t>(lp.num_col_));
+  if (user_solution.size() != static_cast<size_t>(lp.num_col_))
+    return HighsStatus::kError;
 
   HighsStatus return_status = HighsStatus::kOk;
   HighsInt num_duplicates = 0;
@@ -221,14 +242,15 @@ HighsStatus HighsCallbackInput::setSolution(HighsInt num_entries,
 
   for (HighsInt iX = 0; iX < num_entries; iX++) {
     HighsInt iCol = index[iX];
-    if (iCol < 0 || iCol > lp.num_col_) {
+    if (iCol < 0 || iCol >= lp.num_col_) {
       highsLogUser(options.log_options, HighsLogType::kError,
                    "setSolution: User solution index %d has value %d out of "
                    "range [0, %d)",
                    int(iX), int(iCol), int(lp.num_col_));
       return HighsStatus::kError;
     } else if (value[iX] != kHighsUndefined &&
-               (value[iX] < lp.col_lower_[iCol] -
+               (!std::isfinite(value[iX]) ||
+                value[iX] < lp.col_lower_[iCol] -
                                 options.primal_feasibility_tolerance ||
                 lp.col_upper_[iCol] + options.primal_feasibility_tolerance <
                     value[iX])) {
@@ -255,90 +277,244 @@ HighsStatus HighsCallbackInput::setSolution(HighsInt num_entries,
   }
 
   user_has_solution = true;
+  return return_status;
+}
+
+HighsStatus HighsCallbackInput::refineSolution(
+    double seconds, HighsInt nodes, HighsInt lp_iterations,
+    bool require_optimal) {
+  const bool supplied = user_has_solution;
+  user_has_solution = false;
+  refinement_status = static_cast<HighsInt>(HighsModelStatus::kNotset);
+  refinement_simplex_iterations = 0;
+  refinement_ipm_iterations = 0;
+  refinement_lp_runs = 0;
+  if (!highs || !supplied || !std::isfinite(seconds) || seconds <= 0 ||
+      nodes <= 0 || lp_iterations <= 0 ||
+      user_solution.size() != static_cast<size_t>(highs->getNumCol()))
+    return HighsStatus::kError;
+
+  if (refinement_cancel && refinement_cancel->load()) {
+    refinement_status = static_cast<HighsInt>(HighsModelStatus::kInterrupt);
+    return HighsStatus::kWarning;
+  }
+
+  const auto& parent_options = highs->getOptions();
+  seconds = std::min(seconds, parent_options.time_limit - highs->getRunTime());
+  if (seconds <= 0) {
+    refinement_status = static_cast<HighsInt>(HighsModelStatus::kTimeLimit);
+    return HighsStatus::kWarning;
+  }
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration<double>(seconds);
+  HighsRefinementBudget budget(lp_iterations, deadline, refinement_cancel);
+  const auto& lp = highs->getLp();
+  std::vector<HighsInt> fixed_columns;
+  std::vector<double> fixed_values;
+  fixed_columns.reserve(lp.num_col_);
+  fixed_values.reserve(lp.num_col_);
+  for (HighsInt col = 0; col < lp.num_col_; ++col) {
+    double value = user_solution[col];
+    if (value == kHighsUndefined) continue;
+    if (!std::isfinite(value)) return HighsStatus::kError;
+    const HighsVarType type = lp.integrality_.empty()
+                                 ? HighsVarType::kContinuous : lp.integrality_[col];
+    if (type != HighsVarType::kContinuous && type != HighsVarType::kInteger)
+      return HighsStatus::kError;
+    if (type == HighsVarType::kInteger) {
+      if (!HighsIntegers::isIntegral(value, parent_options.mip_feasibility_tolerance))
+        return HighsStatus::kError;
+      value = std::round(value);
+    }
+    if (value < lp.col_lower_[col] || value > lp.col_upper_[col])
+      return HighsStatus::kError;
+    fixed_columns.push_back(col);
+    fixed_values.push_back(value);
+  }
+  Highs clone;
+  HighsOptions child_options = parent_options;
+  // A live callback sees the already user-scaled parent model. Keep those
+  // coordinates: applying the parent's scale again can overflow/reject it.
+  child_options.user_objective_scale = 0;
+  child_options.user_bound_scale = 0;
+  child_options.output_flag = false;
+  if (clone.passOptions(child_options) == HighsStatus::kError ||
+      clone.passModel(highs->getModel()) == HighsStatus::kError)
+    return HighsStatus::kError;
+  clone.setOptionValue("output_flag", false);
+  clone.setOptionValue("parallel", "off");
+  clone.setOptionValue("time_limit", seconds);
+  clone.setOptionValue("mip_max_nodes", nodes);
+  clone.setOptionValue("simplex_iteration_limit", lp_iterations);
+  clone.setOptionValue("ipm_iteration_limit", lp_iterations);
+  clone.setOptionValue("mip_lp_age_limit", parent_options.mip_lp_age_limit);
+  clone.setOptionValue("mip_rel_gap", 0.0);
+  clone.setOptionValue("mip_abs_gap", 0.0);
+  // Prevent recursive helper work and keep all available work in this model.
+  clone.setOptionValue("mip_heuristic_run_rins", false);
+  clone.setOptionValue("mip_heuristic_run_rens", false);
+  clone.setOptionValue("mip_heuristic_run_root_reduced_cost", false);
+  // One invalidation/assessment pass instead of one per fixed assignment.
+  if (!fixed_columns.empty() &&
+      clone.changeColsBounds(static_cast<HighsInt>(fixed_columns.size()),
+          fixed_columns.data(), fixed_values.data(), fixed_values.data()) ==
+              HighsStatus::kError)
+    return HighsStatus::kError;
+  HighsRefinementLpWork direct_lp_work(&budget);
+  if (!clone.getLp().isMip()) direct_lp_work.begin();
+  clone.setCallback([&](int kind, const std::string&, const HighsCallbackOutput* output,
+                        HighsCallbackInput* input, void*) {
+    if (kind == kCallbackSimplexInterrupt)
+      direct_lp_work.observe(output->simplex_iteration_count, -1);
+    else if (kind == kCallbackIpmInterrupt)
+      direct_lp_work.observe(-1, output->ipm_iteration_count);
+    input->user_interrupt = budget.stopStatus() != HighsModelStatus::kNotset;
+  });
+  clone.callback_.refinement_budget = &budget;
+  for (int kind : {kCallbackMipInterrupt, kCallbackSimplexInterrupt,
+                   kCallbackIpmInterrupt})
+    clone.startCallback(kind);
+  if (refinement_cancel && refinement_cancel->load()) {
+    refinement_status = static_cast<HighsInt>(HighsModelStatus::kInterrupt);
+    return HighsStatus::kWarning;
+  }
+  const double remaining = std::chrono::duration<double>(
+      deadline - std::chrono::steady_clock::now()).count();
+  if (remaining <= 0) {
+    refinement_status = static_cast<HighsInt>(HighsModelStatus::kTimeLimit);
+    return HighsStatus::kWarning;
+  }
+  // Include model copying and fixing in the allowance, including presolve
+  // intervals where the child does not invoke an interrupt callback.
+  clone.setOptionValue("time_limit", remaining);
+  const HighsStatus run_status = clone.run();
+  if (!clone.getLp().isMip())
+    direct_lp_work.observe(clone.getInfo().simplex_iteration_count,
+                           clone.getInfo().ipm_iteration_count);
+  refinement_status = static_cast<HighsInt>(clone.getModelStatus());
+  if ((clone.getModelStatus() == HighsModelStatus::kInterrupt ||
+       clone.getModelStatus() == HighsModelStatus::kIterationLimit) &&
+      budget.stopStatus() != HighsModelStatus::kNotset)
+    refinement_status = static_cast<HighsInt>(budget.stopStatus());
+  refinement_simplex_iterations = budget.simplex_iterations;
+  refinement_ipm_iterations = budget.ipm_iterations;
+  refinement_lp_runs = budget.lp_runs;
+  if (run_status == HighsStatus::kError) return HighsStatus::kError;
+  const auto& info = clone.getInfo();
+  const auto& solution = clone.getSolution();
+  if ((require_optimal && clone.getModelStatus() != HighsModelStatus::kOptimal) ||
+      info.primal_solution_status != kSolutionStatusFeasible ||
+      !solution.value_valid || solution.col_value.size() != user_solution.size() ||
+      !std::isfinite(info.max_primal_infeasibility) ||
+      info.max_primal_infeasibility > parent_options.mip_feasibility_tolerance ||
+      (clone.getLp().isMip() &&
+       (!std::isfinite(info.max_integrality_violation) ||
+        info.max_integrality_violation > parent_options.mip_feasibility_tolerance)))
+    return HighsStatus::kWarning;
+  // Preserve the C callback buffer: its pointer must survive callback return.
+  std::copy(solution.col_value.begin(), solution.col_value.end(), user_solution.begin());
+  user_has_solution = true;
   return HighsStatus::kOk;
 }
 
 HighsStatus HighsCallbackInput::repairSolution() {
-  if (!user_has_solution) {
-    highsLogUser(highs->getOptions().log_options, HighsLogType::kError,
-                 "repairSolution: No user solution has been set\n");
+  const bool supplied = user_has_solution;
+  user_has_solution = false;
+  if (!highs || !supplied ||
+      user_solution.size() != static_cast<size_t>(highs->getNumCol()))
     return HighsStatus::kError;
-  } else if (user_solution.size() != static_cast<size_t>(highs->getNumCol())) {
-    highsLogUser(highs->getOptions().log_options, HighsLogType::kError,
-                 "repairSolution: User solution size %d does not match model "
-                 "number of columns %d\n",
-                 int(user_solution.size()), int(highs->getNumCol()));
-    return HighsStatus::kError;
-  } else {
-    // naive approach to get/check feasible solution
-    // solve another MIP after fixing variables
-    Highs clone;
-    clone.setOptionValue("output_flag", false);
-    clone.passModel(highs->getModel());
+  const auto started = std::chrono::steady_clock::now();
+  const auto& options = highs->getOptions();
+  const auto& lp = highs->getLp();
+  const double allowance = options.time_limit - highs->getRunTime();
+  auto stopped = [&]() {
+    return (refinement_cancel && refinement_cancel->load()) ||
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+            >= allowance;
+  };
+  if (stopped()) return HighsStatus::kError;
 
-    HighsVarType vtype = HighsVarType::kContinuous;
-    double tolerance = highs->getOptions().mip_feasibility_tolerance;
-
-    // fix the variables
-    for (HighsInt i = 0; i < static_cast<HighsInt>(user_solution.size()); i++) {
-      if (user_solution[i] != kHighsUndefined) {
-        double value = user_solution[i];
-        highs->getColIntegrality(i, vtype);
-
-        if (vtype == HighsVarType::kInteger) {
-          // check if the provided solution value is integerfeasible
-          if (!HighsIntegers::isIntegral(value, tolerance)) {
-            highsLogUser(highs->getOptions().log_options, HighsLogType::kError,
-                         "repairSolution: User solution (index %d) is outside "
-                         "integrality tolerance (value %f)\n",
-                         i, value);
-            return HighsStatus::kError;
-          } else {
-            // since the variable is integral, round it to avoid numerical
-            // issues
-            value = std::round(value);
-          }
-        }
-
-        clone.changeColBounds(i, value, value);
-      }
+  std::vector<HighsInt> columns;
+  std::vector<double> values;
+  std::vector<HighsInt> semi_columns;
+  std::vector<HighsVarType> fixed_types;
+  for (HighsInt col = 0; col < lp.num_col_; ++col) {
+    double value = user_solution[col];
+    if (value == kHighsUndefined) continue;
+    if (!std::isfinite(value)) return HighsStatus::kError;
+    const auto type = lp.integrality_.empty() ? HighsVarType::kContinuous
+                                              : lp.integrality_[col];
+    if (type == HighsVarType::kInteger || type == HighsVarType::kSemiInteger) {
+      if (!HighsIntegers::isIntegral(value, options.mip_feasibility_tolerance))
+        return HighsStatus::kError;
+      value = std::round(value);
     }
-
-    // set callback to stop at first feasible solution
-    bool user_interrupt = false;
-
-    HighsCallbackFunctionType mip_callback =
-        [&](int callback_type, const std::string& message,
-            const HighsCallbackOutput* data_out, HighsCallbackInput* data_in,
-            void* user_callback_data) {
-          if (callback_type == kCallbackMipSolution) {
-            user_interrupt = true;
-          } else {
-            data_in->user_interrupt = user_interrupt;
-          }
-        };
-
-    clone.setCallback(mip_callback);
-    clone.startCallback(kCallbackMipSolution);
-    clone.startCallback(kCallbackMipInterrupt);
-    clone.startCallback(kCallbackSimplexInterrupt);
-    clone.startCallback(kCallbackIpmInterrupt);
-    clone.run();
-
-    auto status = clone.getModelStatus();
-
-    // check if the solution is feasible
-    if (status == HighsModelStatus::kOptimal ||
-        status == HighsModelStatus::kInterrupt) {
-      // copy the solution
-      user_solution = clone.getSolution().col_value;
-      user_has_solution = true;
-      return HighsStatus::kOk;
-    } else {
-      highsLogUser(highs->getOptions().log_options, HighsLogType::kError,
-                   "repairSolution: No feasible solution found\n");
-      user_has_solution = false;
+    // Fixing must restrict the original domain, not silently replace it.
+    const bool semi_zero = value == 0 &&
+        (type == HighsVarType::kSemiContinuous || type == HighsVarType::kSemiInteger);
+    if (!semi_zero && (value < lp.col_lower_[col] || value > lp.col_upper_[col]))
       return HighsStatus::kError;
+    columns.push_back(col);
+    values.push_back(value);
+    if (type == HighsVarType::kSemiContinuous || type == HighsVarType::kSemiInteger) {
+      semi_columns.push_back(col);
+      fixed_types.push_back(HighsVarType::kContinuous);
     }
   }
+
+  Highs clone;
+  HighsOptions child_options = options;
+  child_options.user_objective_scale = child_options.user_bound_scale = 0;
+  child_options.output_flag = false;
+  child_options.parallel = kHighsOffString;
+  if (clone.passOptions(child_options) == HighsStatus::kError ||
+      clone.passModel(highs->getModel()) == HighsStatus::kError ||
+      (!columns.empty() && clone.changeColsBounds(
+          static_cast<HighsInt>(columns.size()), columns.data(), values.data(),
+          values.data()) == HighsStatus::kError))
+    return HighsStatus::kError;
+  // A semi-variable still permits zero even when its nonzero interval is
+  // fixed. Remove that disjunction only for the explicitly fixed columns.
+  if (!semi_columns.empty() && clone.changeColsIntegrality(
+          static_cast<HighsInt>(semi_columns.size()), semi_columns.data(),
+          fixed_types.data()) == HighsStatus::kError)
+    return HighsStatus::kError;
+  bool found = false;
+  clone.setCallback([&](int kind, const std::string&, const HighsCallbackOutput*,
+                        HighsCallbackInput* input, void*) {
+    if (kind == kCallbackMipSolution) found = true;
+    else input->user_interrupt = found || stopped();
+  });
+  for (int kind : {kCallbackMipSolution, kCallbackMipInterrupt,
+                   kCallbackSimplexInterrupt, kCallbackIpmInterrupt})
+    clone.startCallback(kind);
+  if (stopped()) return HighsStatus::kError;
+  clone.setOptionValue("time_limit", std::max(0.0, allowance -
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()));
+  if (clone.run() == HighsStatus::kError) return HighsStatus::kError;
+  HighsSolution solution = clone.getSolution();
+  HighsLp colwise;
+  const HighsLp* verification = &lp;
+  if (!lp.a_matrix_.isColwise()) {
+    colwise = lp;
+    colwise.ensureColwise();
+    verification = &colwise;
+  }
+  if (!solution.value_valid || solution.col_value.size() != user_solution.size() ||
+      clone.getInfo().primal_solution_status != kSolutionStatusFeasible ||
+      !std::all_of(solution.col_value.begin(), solution.col_value.end(),
+                   [](double value) { return std::isfinite(value); }) ||
+      calculateRowValuesQuad(*verification, solution) != HighsStatus::kOk ||
+      !std::all_of(solution.row_value.begin(), solution.row_value.end(),
+                   [](double value) { return std::isfinite(value); }))
+    return HighsStatus::kError;
+  bool valid = false, integral = false, feasible = false;
+  if (assessLpPrimalSolution("callback repair", clone.getOptions(), *verification, solution,
+                            valid, integral, feasible) == HighsStatus::kError ||
+      !valid || !integral || !feasible)
+    return HighsStatus::kError;
+  // Keep the C callback's borrowed storage alive across the repair call.
+  std::copy(solution.col_value.begin(), solution.col_value.end(), user_solution.begin());
+  user_has_solution = true;
+  return HighsStatus::kOk;
 }

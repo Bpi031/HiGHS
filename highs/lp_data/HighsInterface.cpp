@@ -3111,7 +3111,8 @@ HighsStatus Highs::userScale(HighsUserScaleData& data) {
   return HighsStatus::kOk;
 }
 
-HighsStatus Highs::userUnscale(HighsUserScaleData& data) {
+HighsStatus Highs::userUnscale(HighsUserScaleData& data,
+                              const bool unscale_solution) {
   if (!data.applied) return HighsStatus::kOk;
   // Unscale the incumbent model and solution
   HighsStatus status = HighsStatus::kOk;
@@ -3124,7 +3125,9 @@ HighsStatus Highs::userUnscale(HighsUserScaleData& data) {
         this->options_.log_options, HighsLogType::kError,
         "Unexpected error removing user scaling from the incumbent model\n");
     assert(unscale_status != HighsStatus::kError);
+    return HighsStatus::kError;
   }
+  if (!unscale_solution) return HighsStatus::kOk;
   const bool update_kkt = true;
   unscale_status = this->userScaleSolution(data, update_kkt);
   highsLogUser(this->options_.log_options, HighsLogType::kInfo,

@@ -323,7 +323,7 @@ class HighsDomain {
 
   bool infeasible_ = false;
   Reason infeasible_reason;
-  HighsInt infeasible_pos;
+  HighsInt infeasible_pos = -1;
 
   void updateActivityLbChange(HighsInt col, double oldbound, double newbound);
 
@@ -404,6 +404,7 @@ class HighsDomain {
     conflictPoolPropagation = other.conflictPoolPropagation;
     infeasible_ = other.infeasible_;
     infeasible_reason = other.infeasible_reason;
+    infeasible_pos = other.infeasible_pos;
     colLowerPos_ = other.colLowerPos_;
     colUpperPos_ = other.colUpperPos_;
     branchPos_ = other.branchPos_;

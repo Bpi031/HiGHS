@@ -1477,6 +1477,15 @@ void HighsSparseMatrix::priceByRowWithSwitch(
   // that result.index is still of correct size
   assert(HighsInt(result.size) == this->num_col_);
   assert(HighsInt(result.index.size()) == this->num_col_);
+  if (quad_precision && from_index > 0) {
+    // Carry the prefix into the accumulator; cancelled entries must not remain
+    // in the output array after the sparse result is reconstructed.
+    for (HighsInt i = 0; i < result.count; ++i) {
+      const HighsInt iCol = result.index[i];
+      sum.add(iCol, result.array[iCol]);
+      result.array[iCol] = 0;
+    }
+  }
   if (expected_density <= kHyperPriceDensity) {
     double inv_num_col = 1.0 / this->num_col_;
     for (HighsInt ix = next_index; ix < column.count; ix++) {
@@ -1535,17 +1544,7 @@ void HighsSparseMatrix::priceByRowWithSwitch(
         }
       }
     } else {
-      this->priceByRowDenseResult(result.array, column, next_index);
-      // Determine indices of nonzeros in result
-      result.count = 0;
-      for (HighsInt iCol = 0; iCol < this->num_col_; iCol++) {
-        double value1 = result.array[iCol];
-        if (fabs(value1) < kHighsTiny) {
-          result.array[iCol] = 0;
-        } else {
-          result.index[result.count++] = iCol;
-        }
-      }
+      this->priceByRowDenseResult(result, column, next_index);
     }
   } else {
     if (quad_precision) {
@@ -1634,6 +1633,22 @@ void HighsSparseMatrix::collectAj(HVector& column, const HighsInt use_col,
     if (value0 == 0) column.index[column.count++] = iRow;
     column.array[iRow] = (fabs(value1) < kHighsTiny) ? kHighsZero : value1;
   }
+}
+
+void HighsSparseMatrix::priceByRowDenseResult(
+    HVector& result, const HVector& column,
+    const HighsInt from_index) const {
+  this->priceByRowDenseResult(result.array, column, from_index);
+  HighsInt count = 0;
+  double* const values = result.array.data();
+  HighsInt* const indices = result.index.data();
+  for (HighsInt iCol = 0; iCol < this->num_col_; ++iCol) {
+    if (fabs(values[iCol]) < kHighsTiny)
+      values[iCol] = 0;
+    else
+      indices[count++] = iCol;
+  }
+  result.count = count;
 }
 
 void HighsSparseMatrix::priceByRowDenseResult(

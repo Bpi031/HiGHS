@@ -364,6 +364,9 @@ class JumpMove {
             ((1.0 / cell.coeff) * (bound.second - residualIncumbent)),
         };
 
+        // Division by a negative coefficient reverses interval endpoints.
+        if (cell.coeff < 0) std::swap(validRange.first, validRange.second);
+
         if (problem.vars[varIdx].vartype == VarType::Integer)
           validRange = {
               std::ceil(validRange.first - equalityTolerance),
@@ -434,6 +437,8 @@ class JumpMove {
 };
 
 class FeasibilityJumpSolver {
+  friend struct FeasibilityJumpTestAccess;
+
   Problem problem;
   JumpMove jumpMove;
 
@@ -649,12 +654,14 @@ class FeasibilityJumpSolver {
       if (objectiveWeight > 1.0e20) rescaleAllWeights = true;
 
       dt += problem.vars.size();
-      for (size_t varIdx = 0; varIdx < problem.vars.size(); varIdx += 1)
+      for (size_t varIdx = 0; varIdx < problem.vars.size(); varIdx += 1) {
         forEachMove(varIdx, [&](Move& move) {
-          move.score += weightUpdateIncrement *
+          move.score -= weightUpdateIncrement *
                         problem.vars[varIdx].objectiveCoeff *
                         (move.value - problem.incumbentAssignment[varIdx]);
         });
+        updateGoodMoves(varIdx);
+      }
     } else {
       for (auto& cIdx : problem.violatedConstraints) {
         auto& constraint = problem.constraints[cIdx];
@@ -752,7 +759,8 @@ class FeasibilityJumpSolver {
 
     forEachMove(varIdx, [&](Move& move) {
       move.score = 0.0;
-      move.score += objectiveWeight * problem.vars[varIdx].objectiveCoeff *
+      // Higher move scores are better; objective costs are minimization costs.
+      move.score -= objectiveWeight * problem.vars[varIdx].objectiveCoeff *
                     (move.value - problem.incumbentAssignment[varIdx]);
 
       for (auto& cell : problem.vars[varIdx].coeffs) {

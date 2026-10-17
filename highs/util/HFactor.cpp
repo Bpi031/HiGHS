@@ -12,6 +12,8 @@
 
 #include <cassert>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 
 #include "../extern/pdqsort/pdqsort.h"
 #include "lp_data/HConst.h"
@@ -30,6 +32,23 @@ using std::fill_n;
 using std::make_pair;
 using std::min;
 using std::pair;
+
+#ifdef ROST_HIGHS_FACTOR_REPLAY
+// Diagnostic-only linked sink; ordinary builds have no capture calls.
+void rostFactorReplayBefore(const HFactor&, const HVector&, double);
+void rostFactorReplayAfter(const HFactor&, const HVector&);
+#endif
+
+namespace {
+HighsInt factorWorkspaceExtent(HighsInt base, HighsInt multiplier = 1,
+                               HighsInt extra = 0) {
+  const HighsInt limit = std::numeric_limits<HighsInt>::max();
+  if (base < 0 || multiplier < 0 || extra < 0 ||
+      (multiplier && base > (limit - extra) / multiplier))
+    throw std::length_error("HFactor workspace extent is out of range");
+  return base * multiplier + extra;
+}
+}  // namespace
 
 static void solveMatrixT(const HighsInt X_Start, const HighsInt x_end,
                          const HighsInt y_start, const HighsInt y_end,
@@ -204,6 +223,11 @@ void HFactor::setupGeneral(
     const double pivot_tolerance_, const HighsInt highs_debug_level_,
     const HighsLogOptions* log_options_, const bool use_original_HFactor_logic_,
     const HighsInt update_method_) {
+  // Check dimension arithmetic before replacing an existing factor's bindings.
+  factorWorkspaceExtent(num_col_, 1, num_row_);
+  factorWorkspaceExtent(num_row_, 4);
+  factorWorkspaceExtent(num_row_, 1, 6400);
+  factorWorkspaceExtent(num_basic_, 1, 1);
   // Copy Problem size and (pointer to) coefficient matrix
   num_row = num_row_;
   num_col = num_col_;
@@ -241,22 +265,43 @@ void HFactor::setupGeneral(
   update_method = update_method_;
 
   // Allocate for working buffer
-  iwork.reserve(num_row * 2);
+  iwork.reserve(factorWorkspaceExtent(num_row, 2));
   dwork.assign(num_row, 0);
 
   // Find Basis matrix limit size
   basis_matrix_limit_size = 0;
 
-  iwork.assign(num_row + 1, 0);
-  for (HighsInt i = 0; i < num_col; i++) iwork[a_start[i + 1] - a_start[i]]++;
+  iwork.assign(factorWorkspaceExtent(num_row, 1, 1), 0);
+  for (HighsInt i = 0; i < num_col; i++) {
+    if (a_start[i] < 0 || a_start[i + 1] < a_start[i] ||
+        a_start[i + 1] - a_start[i] > num_row)
+      throw std::invalid_argument("HFactor requires valid column lengths");
+    iwork[a_start[i + 1] - a_start[i]]++;
+  }
   const HighsInt b_max_dim = max(num_row, num_basic);
-  for (HighsInt i = num_row, counted = 0; i >= 0 && counted < b_max_dim; i--)
-    basis_matrix_limit_size += i * iwork[i], counted += iwork[i];
-  basis_matrix_limit_size += b_max_dim;
+  for (HighsInt i = num_row, counted = 0; i >= 0 && counted < b_max_dim; i--) {
+    // Only the remaining basis slots, not an entire tied-length bucket.
+    const HighsInt selected = min(iwork[i], b_max_dim - counted);
+    basis_matrix_limit_size =
+        factorWorkspaceExtent(selected, i, basis_matrix_limit_size);
+    counted += selected;
+  }
+  basis_matrix_limit_size = factorWorkspaceExtent(
+      basis_matrix_limit_size, 1, b_max_dim);
+  const HighsInt mc_extent = factorWorkspaceExtent(
+      basis_matrix_limit_size, kMCExtraEntriesMultiplier);
+  const HighsInt mr_extent = factorWorkspaceExtent(
+      basis_matrix_limit_size, kMRExtraEntriesMultiplier);
+  const HighsInt l_extent = factorWorkspaceExtent(
+      basis_matrix_limit_size, kLFactorExtraEntriesMultiplier);
+  const HighsInt u_extent = factorWorkspaceExtent(
+      basis_matrix_limit_size, kUFactorExtraEntriesMultiplier);
+  const HighsInt pf_extent = factorWorkspaceExtent(
+      basis_matrix_limit_size, kPFEntriesMultiplier);
 
   // Allocate space for basis matrix, L, U factor and Update buffer
   b_var.resize(b_max_dim);
-  b_start.resize(b_max_dim + 1, 0);
+  b_start.resize(factorWorkspaceExtent(b_max_dim, 1, 1), 0);
   b_index.resize(basis_matrix_limit_size);
   b_value.resize(basis_matrix_limit_size);
 
@@ -272,14 +317,14 @@ void HFactor::setupGeneral(
   mc_count_n.resize(mc_dim);
   mc_space.resize(mc_dim);
   mc_min_pivot.resize(mc_dim);
-  mc_index.resize(basis_matrix_limit_size * kMCExtraEntriesMultiplier);
-  mc_value.resize(basis_matrix_limit_size * kMCExtraEntriesMultiplier);
+  mc_index.resize(mc_extent);
+  mc_value.resize(mc_extent);
 
   mr_start.resize(num_row);
   mr_count.resize(num_row);
   mr_space.resize(num_row);
   mr_count_before.resize(num_row);
-  mr_index.resize(basis_matrix_limit_size * kMRExtraEntriesMultiplier);
+  mr_index.resize(mr_extent);
 
   mwz_column_mark.assign(num_row, 0);
   mwz_column_index.resize(num_row);
@@ -295,8 +340,7 @@ void HFactor::setupGeneral(
   const HighsInt row_link_max_count = num_basic;
   const HighsInt row_link_dim = num_row;
   // Strictly not necessary, but nice if it's the right size
-  row_link_first.resize(row_link_max_count + 1);
-  row_link_first.assign(row_link_max_count + 1, -1);
+  row_link_first.assign(factorWorkspaceExtent(row_link_max_count, 1, 1), -1);
   row_link_next.resize(row_link_dim);
   row_link_last.resize(row_link_dim);
 
@@ -304,12 +348,12 @@ void HFactor::setupGeneral(
   l_pivot_lookup.resize(num_row);
   l_pivot_index.reserve(num_row);
   l_start.reserve(num_row + 1);
-  l_index.reserve(basis_matrix_limit_size * kLFactorExtraEntriesMultiplier);
-  l_value.reserve(basis_matrix_limit_size * kLFactorExtraEntriesMultiplier);
+  l_index.reserve(l_extent);
+  l_value.reserve(l_extent);
 
   lr_start.reserve(num_row + 1);
-  lr_index.reserve(basis_matrix_limit_size * kLFactorExtraEntriesMultiplier);
-  lr_value.reserve(basis_matrix_limit_size * kLFactorExtraEntriesMultiplier);
+  lr_index.reserve(l_extent);
+  lr_value.reserve(l_extent);
 
   // Allocate space for U factor
   u_pivot_lookup.resize(num_row);
@@ -318,21 +362,21 @@ void HFactor::setupGeneral(
 
   u_start.reserve(num_row + kUFactorExtraVectors + 1);
   u_last_p.reserve(num_row + kUFactorExtraVectors);
-  u_index.reserve(basis_matrix_limit_size * kUFactorExtraEntriesMultiplier);
-  u_value.reserve(basis_matrix_limit_size * kUFactorExtraEntriesMultiplier);
+  u_index.reserve(u_extent);
+  u_value.reserve(u_extent);
 
   ur_start.reserve(num_row + kUFactorExtraVectors + 1);
   ur_lastp.reserve(num_row + kUFactorExtraVectors);
   ur_space.reserve(num_row + kUFactorExtraVectors);
-  ur_index.reserve(basis_matrix_limit_size * kUFactorExtraEntriesMultiplier);
-  ur_value.reserve(basis_matrix_limit_size * kUFactorExtraEntriesMultiplier);
+  ur_index.reserve(u_extent);
+  ur_value.reserve(u_extent);
 
   // Allocate spaces for Update buffer
   pf_pivot_value.reserve(kPFFPivotEntries);
   pf_pivot_index.reserve(kPFFPivotEntries);
   pf_start.reserve(kPFVectors + 1);
-  pf_index.reserve(basis_matrix_limit_size * kPFEntriesMultiplier);
-  pf_value.reserve(basis_matrix_limit_size * kPFEntriesMultiplier);
+  pf_index.reserve(pf_extent);
+  pf_value.reserve(pf_extent);
 
   // Set up the local HVector for use when RHS is
   // std::vector<double>.
@@ -462,6 +506,9 @@ HighsInt HFactor::build(HighsTimerClock* factor_timer_clock_pointer) {
 
 void HFactor::ftranCall(HVector& vector, const double expected_density,
                         HighsTimerClock* factor_timer_clock_pointer) const {
+#ifdef ROST_HIGHS_FACTOR_REPLAY
+  rostFactorReplayBefore(*this, vector, expected_density);
+#endif
   const bool use_indices = vector.count >= 0;
   FactorTimer factor_timer;
   factor_timer.start(FactorFtran, factor_timer_clock_pointer);
@@ -470,12 +517,13 @@ void HFactor::ftranCall(HVector& vector, const double expected_density,
   // Possibly find the indices in order
   if (use_indices) vector.reIndex();
   factor_timer.stop(FactorFtran, factor_timer_clock_pointer);
+#ifdef ROST_HIGHS_FACTOR_REPLAY
+  rostFactorReplayAfter(*this, vector);
+#endif
 }
 
 void HFactor::ftranCall(std::vector<double>& vector,
                         HighsTimerClock* factor_timer_clock_pointer) {
-  FactorTimer factor_timer;
-  factor_timer.start(FactorFtran, factor_timer_clock_pointer);
   // Only have to clear the scalars of the local HVector, since the
   // array is moved in. Set the count to -1 to indicate that indices
   // aren't known.
@@ -485,7 +533,6 @@ void HFactor::ftranCall(std::vector<double>& vector,
   const double expected_density = 1;
   ftranCall(this->rhs_, expected_density, factor_timer_clock_pointer);
   vector = std::move(this->rhs_.array);
-  factor_timer.stop(FactorFtran, factor_timer_clock_pointer);
 }
 
 void HFactor::btranCall(HVector& vector, const double expected_density,
@@ -582,6 +629,14 @@ void HFactor::buildSimple() {
   const bool report_anything =
       report_unit || report_singletons || report_markowitz;
   HighsInt BcountX = 0;
+  auto ensure_basis_space = [&](HighsInt entries) {
+    const HighsInt required = factorWorkspaceExtent(BcountX, 1, entries);
+    if (static_cast<size_t>(required) <= b_index.size()) return;
+    // Repeated structural columns are legitimate singularity input, but are
+    // not bounded by the unique-column histogram used for initial allocation.
+    b_index.resize(required);
+    b_value.resize(required);
+  };
   fill_n(mr_count_before.data(), num_row, 0);
   nwork = 0;
   if (report_anything) printf("\nFactor\n");
@@ -621,6 +676,7 @@ void HFactor::buildSimple() {
         iRow = lc_iRow;
       } else {
         mr_count_before[lc_iRow]++;
+        ensure_basis_space(1);
         b_index[BcountX] = lc_iRow;
         b_value[BcountX++] = 1.0;
         iwork[nwork++] = iCol;
@@ -648,6 +704,7 @@ void HFactor::buildSimple() {
         pivot_type = kPivotColSingleton;  //;kPivotUnit;//
         iRow = a_index[start];
       } else {
+        ensure_basis_space(count);
         for (HighsInt k = start; k < start + count; k++) {
           mr_count_before[a_index[k]]++;
           assert(BcountX < (HighsInt)b_index.size());
@@ -2062,8 +2119,8 @@ void HFactor::updateCFT(HVector* aq, HVector* ep, HighsInt* iRow
   HighsInt num_update = 0;
   for (HVector* vec = aq; vec != 0; vec = vec->next) num_update++;
 
-  HVector** aq_work = new HVector*[num_update];
-  HVector** ep_work = new HVector*[num_update];
+  std::unique_ptr<HVector*[]> aq_work(new HVector*[num_update]);
+  std::unique_ptr<HVector*[]> ep_work(new HVector*[num_update]);
 
   for (HighsInt i = 0; i < num_update; i++) {
     aq_work[i] = aq;
@@ -2074,9 +2131,9 @@ void HFactor::updateCFT(HVector* aq, HVector* ep, HighsInt* iRow
 
   // Pivot related buffers
   HighsInt pf_np0 = pf_pivot_index.size();
-  HighsInt* p_logic = new HighsInt[num_update];
-  double* p_value = new double[num_update];
-  double* p_alpha = new double[num_update];
+  std::unique_ptr<HighsInt[]> p_logic(new HighsInt[num_update]);
+  std::unique_ptr<double[]> p_value(new double[num_update]);
+  std::unique_ptr<double[]> p_alpha(new double[num_update]);
   for (HighsInt cp = 0; cp < num_update; cp++) {
     HighsInt c_row = iRow[cp];
     HighsInt i_logic = u_pivot_lookup[c_row];
@@ -2086,8 +2143,8 @@ void HFactor::updateCFT(HVector* aq, HVector* ep, HighsInt* iRow
   }
 
   // Temporary U pointers
-  HighsInt* t_start = new HighsInt[num_update + 1];
-  double* t_pivot = new double[num_update];
+  std::unique_ptr<HighsInt[]> t_start(new HighsInt[num_update + 1]);
+  std::unique_ptr<double[]> t_pivot(new double[num_update]);
   t_start[0] = u_index.size();
 
   // Logically sorted previous row_ep
@@ -2288,13 +2345,6 @@ void HFactor::updateCFT(HVector* aq, HVector* ep, HighsInt* iRow
   //    // See if we want refactor
   //    if (u_total_x > u_merit_x && pf_pivot_index.size() > 100)
   //        *hint = 1;
-  delete[] aq_work;
-  delete[] ep_work;
-  delete[] p_logic;
-  delete[] p_value;
-  delete[] p_alpha;
-  delete[] t_start;
-  delete[] t_pivot;
 }
 
 void HFactor::updateFT(HVector* aq, HVector* ep, HighsInt iRow
@@ -2506,6 +2556,11 @@ void HFactor::updateAPF(HVector* aq, HVector* ep, HighsInt iRow
 
 InvertibleRepresentation HFactor::getInvert() const {
   InvertibleRepresentation invert;
+  getInvert(invert);
+  return invert;
+}
+
+void HFactor::getInvert(InvertibleRepresentation& invert) const {
   invert.l_pivot_index = this->l_pivot_index;
   invert.l_pivot_lookup = this->l_pivot_lookup;
   invert.l_start = this->l_start;
@@ -2533,7 +2588,6 @@ InvertibleRepresentation HFactor::getInvert() const {
   invert.pf_value = this->pf_value;
   invert.pf_pivot_index = this->pf_pivot_index;
   invert.pf_pivot_value = this->pf_pivot_value;
-  return invert;
 }
 
 void HFactor::setInvert(const InvertibleRepresentation& invert) {

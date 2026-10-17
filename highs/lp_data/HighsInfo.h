@@ -133,17 +133,16 @@ struct HighsInfoStruct {
 
 class HighsInfo : public HighsInfoStruct {
  public:
-  HighsInfo() { initRecords(); }
+  HighsInfo() : HighsInfoStruct{} { initRecords(); }
 
   HighsInfo(const HighsInfo& info) {
     initRecords();
     HighsInfoStruct::operator=(info);
   }
 
-  HighsInfo(HighsInfo&& info) {
-    records = std::move(info.records);
-    HighsInfoStruct::operator=(std::move(info));
-  }
+  // Records point into their owning object, so moving their pointer vector
+  // would keep references to the source object's fields.
+  HighsInfo(HighsInfo&& info) : HighsInfo(info) {}
 
   const HighsInfo& operator=(const HighsInfo& other) {
     if (&other != this) {

@@ -12,10 +12,12 @@
 #define LP_DATA_HIGHSCALLBACK_H_
 
 #include <functional>
+#include <atomic>
 
 // forward declaration to avoid circular dependency
 enum class HighsStatus;
 class Highs;
+struct HighsRefinementBudget;
 
 #include "lp_data/HStruct.h"
 #include "lp_data/HighsCallbackStruct.h"
@@ -74,6 +76,17 @@ struct HighsCallbackInput {
   bool user_interrupt = false;
   bool user_has_solution = false;
   std::vector<double> user_solution;
+  int64_t admission_generation = 0;
+  int64_t incumbent_sequence = 0;
+  int64_t last_candidate_id = 0;
+  int64_t candidate_id = 0;
+  int64_t candidate_generation = -1;
+  HighsCallbackSolutionOutcome admission = {};
+  HighsInt refinement_status = 0;
+  int64_t refinement_simplex_iterations = 0;
+  int64_t refinement_ipm_iterations = 0;
+  int64_t refinement_lp_runs = 0;
+  const std::atomic<bool>* refinement_cancel = nullptr;
 
   HighsStatus setSolution(HighsInt num_entries, const double* value);
 
@@ -82,8 +95,12 @@ struct HighsCallbackInput {
 
   HighsStatus repairSolution();
 
+  // Rost helpers return candidates only, never a bound for the parent MIP.
+  HighsStatus refineSolution(double seconds, HighsInt nodes,
+                             HighsInt lp_iterations, bool require_optimal);
+
   operator HighsCallbackDataIn() const;
-  HighsCallbackInput operator=(const HighsCallbackDataIn& data_in);
+  HighsCallbackInput& operator=(const HighsCallbackDataIn& data_in);
 };
 
 using HighsCallbackFunctionType =
@@ -100,6 +117,10 @@ struct HighsCallback {
   // Function pointers cannot be used for Pybind11, so use std::function
   HighsCallbackFunctionType user_callback = nullptr;
   HighsCCallbackType c_callback = nullptr;
+  HighsRefinementBudget* refinement_budget = nullptr;
+  // Separate, explicitly opted-in owner. Never uses the legacy callback input.
+  HighsCCallbackType primal_service_callback = nullptr;
+  void* primal_service_data = nullptr;
   void* user_callback_data = nullptr;
   Highs* highs = nullptr;
   std::vector<bool> active;

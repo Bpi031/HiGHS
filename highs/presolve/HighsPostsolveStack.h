@@ -611,19 +611,11 @@ class HighsPostsolveStack {
   void undo(const HighsOptions& options, HighsSolution& solution,
             HighsBasis& basis, const HighsInt report_col = -1,
             const bool thread_safe = false) {
-    HighsDataStack reductionValuesCopy;
     std::vector<Nonzero> colValuesCopy;
     std::vector<Nonzero> rowValuesCopy;
-    if (!thread_safe) {
-      reductionValues.resetPosition();
-    } else {
-      reductionValuesCopy = reductionValues;
-      reductionValuesCopy.resetPosition();
-      colValuesCopy = colValues;
-      rowValuesCopy = rowValues;
-    }
-    HighsDataStack& reductionValues_ =
-        thread_safe ? reductionValuesCopy : reductionValues;
+    // Reduction bytes are immutable during postsolve. Only the cursor and
+    // scratch vectors need private ownership, not the whole reduction stack.
+    auto reductionValues_ = reductionValues.reader();
     std::vector<Nonzero>& colValues_ = thread_safe ? colValuesCopy : colValues;
     std::vector<Nonzero>& rowValues_ = thread_safe ? rowValuesCopy : rowValues;
 
@@ -780,9 +772,6 @@ class HighsPostsolveStack {
   void undoPrimal(const HighsOptions& options, HighsSolution& solution,
                   const HighsInt report_col = -1,
                   const bool thread_safe = false) {
-    // Call to reductionValues.resetPosition(); seems unnecessary as
-    // it's the first thing done in undo
-    if (!thread_safe) reductionValues.resetPosition();
     HighsBasis basis;
     basis.valid = false;
     solution.dual_valid = false;

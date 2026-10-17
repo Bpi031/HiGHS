@@ -38,7 +38,7 @@ class HVectorBase {
   void clearScalars();
 
   HighsInt size;           //!< Dimension of the vector
-  HighsInt count;          //!< Number of nonzeros
+  HighsInt count;          //!< Indexed entries; negative means dense/no index list
   vector<HighsInt> index;  //!< Packed indices of nonzeros
   vector<Real> array;      //!< Full-length array of values
 
@@ -88,7 +88,9 @@ class HVectorBase {
 
   /**
    * @brief Add a multiple pivotX of *pivot into this vector,
-   * maintaining indices of nonzeros but not tracking cancellation
+   * maintaining indices of nonzeros but not tracking cancellation.
+   * A dense operand leaves the result dense; exact zero dense-pivot entries
+   * are skipped. Tiny updated values retain the existing nonzero sentinel.
    */
   template <typename RealPivX, typename RealPiv>
   void saxpy(const RealPivX pivotX,  //!< The multiple of *pivot to be added

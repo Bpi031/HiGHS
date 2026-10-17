@@ -23,6 +23,7 @@ struct HighsWorkerCandidateMetadata {
   int64_t publication_sequence = -1;
   double discovery_time = -1.0;
   double publication_time = -1.0;
+  int64_t admission_generation = -1;
 };
 
 struct HighsWorkerCandidate {

@@ -120,6 +120,10 @@ class HighsRootWorkController {
   HighsRootWorkDecision beforeOptional(HighsRootWorkPhase phase,
                                        double now) const;
   double optionalAllowance(HighsRootWorkPhase phase, double now) const;
+  double coldSeedDiversificationAllowance(double now, bool cold_seed,
+                                          bool weighted_improved,
+                                          double admitted_bound,
+                                          double incumbent_bound);
   void recordCompleted(HighsRootWorkPhase phase, double elapsed,
                        bool produced_separation_round = false);
   void recordCompleted(HighsRootWorkPhase phase,
@@ -151,6 +155,7 @@ class HighsRootWorkController {
 
   HighsRootWorkConfig config_;
   HighsRootWorkSnapshot snapshot_;
+  bool cold_seed_diversification_consumed_ = false;
   std::array<HighsRootWorkActivityAccount, kHighsRootWorkPhaseCount>
       activities_;
 };

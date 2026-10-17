@@ -86,8 +86,11 @@ class HighsConflictPool {
   }
 
   void setAgeLimit(HighsInt agelim) {
+    // Older live conflicts still use their histogram buckets until aged out.
+    const size_t required = static_cast<size_t>(agelim) + 1;
+    if (ageDistribution_.size() < required)
+      ageDistribution_.resize(required);
     agelim_ = agelim;
-    ageDistribution_.resize(agelim_ + 1);
   }
 
   unsigned getModificationCount(HighsInt cut) const {

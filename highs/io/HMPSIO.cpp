@@ -444,6 +444,7 @@ FilereaderRetcode readMps(
     assert((HighsInt)Qindex.size() == hessian_nz);
     assert((HighsInt)Qvalue.size() == hessian_nz);
   }
+  if (file.bad()) return FilereaderRetcode::kParserError;
   // Determine the number of integer variables and set bounds of [0,1]
   // for integer variables without bounds
   HighsInt num_int = 0;
@@ -478,6 +479,12 @@ FilereaderRetcode readMps(
 bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
                   char* line, char* flag, double* data) {
   HighsInt F1 = 1, F2 = 4, F3 = 14, F4 = 24, F5 = 39, F6 = 49;
+  const auto malformed = [&]() {
+    flag[0] = flag[1] = 0;
+    file.setstate(std::ios::badbit);
+    return false;
+  };
+  if (lmax <= F6 || file.bad()) return malformed();
 
   // check the buffer
   if (flag[1]) {
@@ -490,18 +497,17 @@ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
   // try to read some to the line
   for (;;) {
     // Line input
-    *line = '\0';
-    file.get(line, lmax);
-    if (*line == '\0' && file.eof())  // nothing read and EOF
-      return false;
+    std::fill(line, line + lmax, ' ');
+    line[lmax - 1] = '\0';
+    file.getline(line, lmax);
+    if (file.eof() && file.gcount() == 0) return false;
+    if (file.fail() && !file.eof()) return malformed();
+    const HighsInt length = file.gcount() - (file.eof() ? 0 : 1);
+    if (length < 0 || std::memchr(line, '\0', length)) return malformed();
 
-    // Line trim   -- to delete tailing white spaces
-    HighsInt lcnt = strlen(line) - 1;
-    // if file.get() did not stop because it reached the lmax-1 limit,
-    // then because it reached a newline char (or eof); lets consume this
-    // newline (or do nothing if eof)
-    if (lcnt + 1 < lmax - 1) file.get();
-    while (isspace(line[lcnt]) && lcnt >= 0) lcnt--;
+    // Check the index before reading; empty and whitespace-only lines are valid.
+    HighsInt lcnt = length - 1;
+    while (lcnt >= 0 && isspace(static_cast<unsigned char>(line[lcnt]))) lcnt--;
     if (lcnt <= 0 || line[0] == '*') continue;
 
     // Line expand -- to get data easier
@@ -519,8 +525,9 @@ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
     if (line[F3] == '\'') {
       if (line[F3 + 1] == 'M' && line[F3 + 2] == 'A' && line[F3 + 3] == 'R' &&
           line[F3 + 4] == 'K' && line[F3 + 5] == 'E' && line[F3 + 6] == 'R') {
-        HighsInt cnter = line[F3 + 8];
-        while (line[cnter] != '\'') ++cnter;
+        HighsInt cnter = F3 + 8;
+        while (cnter < lcnt && line[cnter] != '\'') ++cnter;
+        if (cnter + 8 > lcnt || line[cnter + 7] != '\'') return malformed();
         if (line[cnter + 1] == 'I' && line[cnter + 2] == 'N' &&
             line[cnter + 3] == 'T' && line[cnter + 4] == 'O' &&
             line[cnter + 5] == 'R' && line[cnter + 6] == 'G')
@@ -529,6 +536,8 @@ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
                  line[cnter + 3] == 'T' && line[cnter + 4] == 'E' &&
                  line[cnter + 5] == 'N' && line[cnter + 6] == 'D')
           integerVar = HighsVarType::kContinuous;
+        else
+          return malformed();
         continue;
       }
     }
@@ -541,7 +550,10 @@ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
     data[0] = atof(&line[F4]);
 
     // Keep 2nd minor name & value for future
-    if (lcnt > F5) flag[1] = 1;
+    if (lcnt > F5) {
+      if (lcnt <= F6) return malformed();
+      flag[1] = 1;
+    }
     break;
   }
 

@@ -56,6 +56,18 @@ HighsNodeSeparationRoundResult HighsSeparation::separationRoundDetailed(
 
   HighsMipSolverData& mipdata = *lp->getMipSolver().mipdata_;
   HighsLpAggregator lpAggregator(*lp, limits.base_model_rows_only);
+  auto resolve = [&]() {
+    const int64_t remaining = mipworker_.search_work.remaining();
+    if (remaining == std::numeric_limits<int64_t>::max())
+      return lp->resolveLp(&propdomain);
+    HighsInt saved;
+    lp->getLpSolver().getOptionValue("simplex_iteration_limit", saved);
+    lp->setIterationLimit(static_cast<HighsInt>(std::min<int64_t>(saved,
+        std::max<int64_t>(1, remaining))));
+    const auto resolved = lp->resolveLp(&propdomain, true);
+    lp->setIterationLimit(saved);
+    return resolved;
+  };
 
   auto poolCuts = [&]() {
     HighsInt cuts = mipworker_.getCutPool().getNumCuts();
@@ -131,7 +143,7 @@ HighsNodeSeparationRoundResult HighsSeparation::separationRoundDetailed(
 
     while (!propdomain.getChangedCols().empty()) {
       lp->setObjectiveLimit(mipworker_.upper_limit);
-      status = lp->resolveLp(&propdomain);
+      status = resolve();
       if (!lp->scaledOptimal(status)) return -1;
 
       if (&propdomain == &mipdata.getDomain() &&
@@ -239,7 +251,9 @@ HighsNodeSeparationRoundResult HighsSeparation::separationRoundDetailed(
       ++result.selected_by_origin[static_cast<size_t>(origin)];
     ncuts += cutset.numCuts();
     lp->addCuts(cutset);
-    status = lp->resolveLp(&propdomain);
+    status = resolve();
+    if (status == HighsLpRelaxation::Status::kIterationLimit)
+      return finish();
     lp->performAging(true);
 
     // only for the master domain.

@@ -8,6 +8,7 @@
 #ifndef HIGHS_CUTPOOL_H_
 #define HIGHS_CUTPOOL_H_
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <memory>
@@ -111,7 +112,8 @@ class HighsCutPool {
         numPropNzs(0),
         numPropRows(0),
         index_(index) {
-    ageDistribution.resize(agelim_ + 1);
+    // Removed LP cuts start at age one, even when the aging limit is zero.
+    ageDistribution.resize(std::max(HighsInt{2}, agelim_ + 1));
     minScoreFactor = 0.9;
     bestObservedScore = 0.0;
     minDensityLim = 0.1 * ncols;
@@ -164,7 +166,9 @@ class HighsCutPool {
 
   void setAgeLimit(HighsInt agelim) {
     agelim_ = agelim;
-    ageDistribution.resize(agelim_ + 1);
+    // Live cuts keep their existing ages until the next aging pass.
+    const size_t needed = static_cast<size_t>(std::max(HighsInt{2}, agelim_ + 1));
+    if (ageDistribution.size() < needed) ageDistribution.resize(needed);
   }
 
   void increaseNumLps(HighsInt cut, HighsInt n) {

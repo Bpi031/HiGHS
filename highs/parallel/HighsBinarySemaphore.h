@@ -22,7 +22,7 @@
 class HighsBinarySemaphore {
   struct Data {
     std::atomic<int> count;
-    alignas(64) std::mutex mutex;
+    alignas(highs::cache_aligned::alignment()) std::mutex mutex;
     std::condition_variable condvar;
 
     Data(int init) : count(init) {}
@@ -51,7 +51,7 @@ class HighsBinarySemaphore {
   void acquire() {
     if (try_acquire()) return;
 
-    auto tStart = std::chrono::high_resolution_clock::now();
+    auto tStart = HighsSchedulerConstants::Clock::now();
     int spinIters = 10;
     while (true) {
       for (int i = 0; i < spinIters; ++i) {
@@ -63,11 +63,11 @@ class HighsBinarySemaphore {
 
       auto numMicroSecs =
           std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::high_resolution_clock::now() - tStart)
+              HighsSchedulerConstants::Clock::now() - tStart)
               .count();
 
       if (numMicroSecs < HighsSchedulerConstants::kMicroSecsBeforeSleep)
-        spinIters *= 2;
+        spinIters = HighsSchedulerConstants::nextSpinTries(spinIters);
       else
         break;
     }

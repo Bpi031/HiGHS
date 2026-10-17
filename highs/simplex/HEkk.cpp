@@ -3820,6 +3820,7 @@ void HEkk::putIterate() {
     // Clear to indicate no weights
     iterate.dual_edge_weight_.clear();
   }
+  iterate.valid_ = true;
 }
 
 HighsStatus HEkk::getIterate() {
@@ -3828,7 +3829,10 @@ HighsStatus HEkk::getIterate() {
   this->simplex_nla_.getInvert();
   this->basis_ = iterate.basis_;
   if (iterate.dual_edge_weight_.size()) {
+    this->status_.has_dual_steepest_edge_weights = false;
     this->dual_edge_weight_ = iterate.dual_edge_weight_;
+    this->scattered_dual_edge_weight_.resize(this->lp_.num_col_ + this->lp_.num_row_);
+    this->status_.has_dual_steepest_edge_weights = true;
   } else {
     this->status_.has_dual_steepest_edge_weights = false;
   }

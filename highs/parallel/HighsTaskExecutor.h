@@ -12,6 +12,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <memory>
+#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -24,6 +26,9 @@
 class HighsTaskExecutor {
  public:
   using cache_aligned = highs::cache_aligned;
+  // Injectable launcher for deterministic startup-failure tests, not a solver option.
+  using WorkerFactory = std::thread (*)(void (*)(int, HighsTaskExecutor*), int,
+                                       HighsTaskExecutor*);
   struct ExecutorHandle {
     HighsTaskExecutor* ptr{nullptr};
     bool isMain{false};
@@ -49,8 +54,9 @@ class HighsTaskExecutor {
   }
 #endif
 
-  std::atomic<int> referenceCount;
+  std::atomic<int> referenceCount{1};
   std::atomic<bool> hasStopped{false};
+  std::atomic<int> startupReady{0};
 
   cache_aligned::shared_ptr<HighsSplitDeque::WorkerBunk> workerBunk;
   std::vector<cache_aligned::unique_ptr<HighsSplitDeque>> workerDeques;
@@ -59,9 +65,9 @@ class HighsTaskExecutor {
   HighsTask* random_steal_loop(HighsSplitDeque* localDeque) {
     const int numWorkers = static_cast<int>(workerDeques.size());
 
-    int numTries = 16 * (numWorkers - 1);
+    int numTries = HighsSchedulerConstants::initialSpinTries(numWorkers);
 
-    auto tStart = std::chrono::high_resolution_clock::now();
+    auto tStart = HighsSchedulerConstants::Clock::now();
 
     while (true) {
       for (int s = 0; s < numTries; ++s) {
@@ -73,11 +79,11 @@ class HighsTaskExecutor {
 
       auto numMicroSecs =
           std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::high_resolution_clock::now() - tStart)
+              HighsSchedulerConstants::Clock::now() - tStart)
               .count();
 
       if (numMicroSecs < HighsSchedulerConstants::kMicroSecsBeforeGlobalSync)
-        numTries *= 2;
+        numTries = HighsSchedulerConstants::nextSpinTries(numTries);
       else
         break;
     }
@@ -93,7 +99,7 @@ class HighsTaskExecutor {
       HighsSplitDeque* localDeque = ptr->workerDeques[workerId].get();
       threadLocalWorkerDeque() = localDeque;
 
-      HighsTask* currentTask = ptr->workerBunk->waitForNewTask(localDeque);
+      HighsTask* currentTask = ptr->workerBunk->waitForNewTask(localDeque, &ptr->startupReady);
       while (currentTask != nullptr) {
         localDeque->runStolenTask(currentTask);
 
@@ -107,9 +113,35 @@ class HighsTaskExecutor {
     executorHandle.dispose();
   }
 
+  void startWorkers(WorkerFactory factory) {
+    for (int i = 1; i < static_cast<int>(workerDeques.size()); ++i) {
+      // Reserve a handle before the new worker can finish. The owner's handle
+      // keeps the executor alive throughout partial-startup cleanup.
+      ++referenceCount;
+      try {
+        std::thread worker = factory ? factory(&run_worker, i, this)
+                                    : std::thread(&run_worker, i, this);
+        if (!worker.joinable())
+          throw std::system_error(
+              std::make_error_code(std::errc::resource_unavailable_try_again));
+        workerThreads.emplace_back(std::move(worker));
+      } catch (...) {
+        --referenceCount;
+        stopWorkerThreads(true);
+        throw;
+      }
+    }
+    // Publishing the first task before sleepers register can miss its wakeup.
+    // Wait only at startup; steady-state scheduling and stealing are unchanged.
+    while (startupReady.load(std::memory_order_acquire) !=
+           static_cast<int>(workerThreads.size()))
+      std::this_thread::yield();
+  }
+
  public:
   HighsTaskExecutor(int numThreads) {
-    assert(numThreads > 0);
+    if (numThreads <= 0)
+      throw std::invalid_argument("scheduler worker count must be positive");
 
     workerDeques.resize(numThreads);
     workerBunk = cache_aligned::make_shared<HighsSplitDeque::WorkerBunk>();
@@ -117,14 +149,7 @@ class HighsTaskExecutor {
       workerDeques[i] = cache_aligned::make_unique<HighsSplitDeque>(
           workerBunk, workerDeques.data(), i, numThreads);
 
-    threadLocalWorkerDeque() = workerDeques[0].get();
     workerThreads.reserve(numThreads - 1);
-    referenceCount.store(numThreads);
-
-    for (int i = 1, numThreads = static_cast<int>(workerDeques.size());
-         i < numThreads; ++i) {
-      workerThreads.emplace_back(&HighsTaskExecutor::run_worker, i, this);
-    }
   }
 
   void stopWorkerThreads(bool blocking = false) {
@@ -157,12 +182,19 @@ class HighsTaskExecutor {
     return threadLocalWorkerDeque()->getNumWorkers();
   }
 
-  static void initialize(int numThreads) {
+  static void initialize(int numThreads, WorkerFactory factory = nullptr) {
     auto& executorHandle = threadLocalExecutorHandle();
     if (executorHandle.ptr == nullptr) {
+      auto executor = cache_aligned::make_unique<HighsTaskExecutor>(numThreads);
       executorHandle.isMain = true;
-      executorHandle.ptr = new (cache_aligned::alloc(sizeof(HighsTaskExecutor)))
-          HighsTaskExecutor(numThreads);
+      executorHandle.ptr = executor.release();
+      threadLocalWorkerDeque() = executorHandle.ptr->workerDeques[0].get();
+      try {
+        executorHandle.ptr->startWorkers(factory);
+      } catch (...) {
+        executorHandle.dispose();
+        throw;
+      }
     }
   }
 
@@ -182,9 +214,9 @@ class HighsTaskExecutor {
     HighsSplitDeque* stealer;
     if (!localDeque->leapfrogStolenTask(stolenTask, stealer)) {
       const int numWorkers = localDeque->getNumWorkers();
-      int numTries = HighsSchedulerConstants::kNumTryFac * (numWorkers - 1);
+      int numTries = HighsSchedulerConstants::initialSpinTries(numWorkers);
 
-      auto tStart = std::chrono::high_resolution_clock::now();
+      auto tStart = HighsSchedulerConstants::Clock::now();
 
       while (true) {
         for (int s = 0; s < numTries; ++s) {
@@ -197,11 +229,11 @@ class HighsTaskExecutor {
 
         auto numMicroSecs =
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::high_resolution_clock::now() - tStart)
+                HighsSchedulerConstants::Clock::now() - tStart)
                 .count();
 
         if (numMicroSecs < HighsSchedulerConstants::kMicroSecsBeforeSleep)
-          numTries *= 2;
+          numTries = HighsSchedulerConstants::nextSpinTries(numTries);
         else
           break;
       }

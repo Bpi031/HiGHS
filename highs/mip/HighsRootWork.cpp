@@ -29,6 +29,7 @@ void HighsRootWorkController::beginStage(const HighsRootWorkConfig& config,
                                          double now, double absolute_deadline) {
   config_ = config;
   snapshot_ = HighsRootWorkSnapshot{};
+  cold_seed_diversification_consumed_ = false;
   activities_ = {};
   snapshot_.stage_start = now;
   snapshot_.absolute_deadline = absolute_deadline;
@@ -98,6 +99,21 @@ double HighsRootWorkController::optionalAllowance(HighsRootWorkPhase phase,
         allowance,
         std::max(0.0, config_.max_heuristic_time - snapshot_.heuristic_time));
   return allowance;
+}
+
+double HighsRootWorkController::coldSeedDiversificationAllowance(
+    double now, bool cold_seed, bool weighted_improved, double admitted_bound,
+    double incumbent_bound) {
+  if (!config_.enabled || cold_seed_diversification_consumed_ || !cold_seed ||
+      !std::isfinite(now) || now < 0 || !std::isfinite(admitted_bound) ||
+      !std::isfinite(incumbent_bound))
+    return 0.0;
+  // One owner-only opportunity per stage, not one per root restart. A better
+  // seed or an exhausted allowance must not start a later duplicate search.
+  cold_seed_diversification_consumed_ = true;
+  if (weighted_improved || incumbent_bound < admitted_bound) return 0.0;
+  const double allowance = optionalAllowance(HighsRootWorkPhase::kRens, now);
+  return std::isfinite(allowance) && allowance > 0 ? allowance : 0.0;
 }
 
 void HighsRootWorkController::recordCompleted(HighsRootWorkPhase phase,

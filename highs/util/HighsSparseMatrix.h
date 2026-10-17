@@ -112,6 +112,8 @@ class HighsSparseMatrix {
   void priceByRow(const bool quad_precision, HVector& result,
                   const HVector& column,
                   const HighsInt debug_report = kDebugReportOff) const;
+  // For continuation, result contains the indexed prefix product for input
+  // indices before from_index. Fresh calls require a cleared result.
   void priceByRowWithSwitch(
       const bool quad_precision, HVector& result, const HVector& column,
       const double expected_density, const HighsInt from_index,
@@ -129,6 +131,8 @@ class HighsSparseMatrix {
                  const double multiplier) const;
 
  private:
+  void priceByRowDenseResult(HVector& result, const HVector& column,
+                            const HighsInt from_index) const;
   void priceByRowDenseResult(
       std::vector<double>& result, const HVector& column,
       const HighsInt from_index,

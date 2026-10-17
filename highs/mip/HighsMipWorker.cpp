@@ -6,6 +6,7 @@
 /*                                                                       */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipWorker.h"
+#include "mip/HighsPrimalService.h"
 
 #include <algorithm>
 
@@ -76,23 +77,20 @@ void HighsMipWorker::resetSepa() {
 }
 
 bool HighsMipWorker::addIncumbent(const std::vector<double>& sol, double solobj,
-                                  int solution_source) {
+                                  int solution_source, HighsPrimalAdmissionReceipt* receipt) {
+  if (receipt) *receipt = {};
+  if (sol.size() != static_cast<size_t>(mipsolver_.numCol()) ||
+      !std::isfinite(solobj) ||
+      !std::all_of(sol.begin(), sol.end(),
+                   [](double value) { return std::isfinite(value); }))
+    return false;
   if (solobj < upper_bound) {
     // Get the transformed objective and solution if required
+    std::vector<double> original_columns;
     const std::pair<bool, double> transformed_solobj =
-        transformNewIntegerFeasibleSolution(sol);
-    if (!transformed_solobj.first) return false;
-    if (transformed_solobj.second < upper_bound) {
-      upper_bound = transformed_solobj.second;
-      double new_upper_limit =
-          mipdata_.computeNewUpperLimit(upper_bound, 0.0, 0.0);
-      if (new_upper_limit < upper_limit) {
-        upper_limit = new_upper_limit;
-        optimality_limit = mipdata_.computeNewUpperLimit(
-            upper_bound, mipsolver_.options_mip_->mip_abs_gap,
-            mipsolver_.options_mip_->mip_rel_gap);
-      }
-    }
+        transformNewIntegerFeasibleSolution(sol, primal_store_ ? &original_columns : nullptr);
+    if (!transformed_solobj.first || !std::isfinite(transformed_solobj.second))
+      return false;
     // The master remains the only authority that can admit an incumbent.
     // Preserve every locally interesting candidate in a bounded, worker-owned
     // mailbox until the deterministic synchronization point.
@@ -110,13 +108,107 @@ bool HighsMipWorker::addIncumbent(const std::vector<double>& sol, double solobj,
     candidate.metadata.publication_sequence = publication_sequence_++;
     candidate.metadata.discovery_time = mipsolver_.timer_.read();
     candidate.metadata.publication_time = candidate.metadata.discovery_time;
-    if (!incumbent_mailbox_.publish(std::move(candidate))) return false;
+    candidate.metadata.admission_generation =
+        mipsolver_.callback_->data_in.admission_generation;
+    // Persist the master's witness before exposing any tighter local cutoff.
+    if (primal_store_) {
+      if (!incumbent_mailbox_.publish(candidate)) return false;
+      const auto publication = primal_store_->publishChecked(
+          candidate, std::move(original_columns), receipt);
+      // Peer publication tightens only local cutoffs. Wake the joined master
+      // for a checked new gain, without interrupting unresolved LP proof work.
+      if (publication == HighsPrimalPublication::kImproved)
+        search_work.requestCheckpoint();
+      importPrimalSnapshot();
+    } else {
+      if (!incumbent_mailbox_.publish(std::move(candidate))) return false;
+      if (transformed_solobj.second < upper_bound)
+        search_work.requestCheckpoint();
+    }
+    if (transformed_solobj.second < upper_bound) {
+      upper_bound = transformed_solobj.second;
+      upper_limit = std::min(upper_limit,
+          mipdata_.computeNewUpperLimit(upper_bound, 0.0, 0.0));
+      optimality_limit = std::min(optimality_limit,
+          mipdata_.computeNewUpperLimit(upper_bound,
+              mipsolver_.options_mip_->mip_abs_gap,
+              mipsolver_.options_mip_->mip_rel_gap));
+    }
   }
   return true;
 }
 
+void HighsMipWorker::publishMasterIncumbent(std::vector<double> reduced_columns,
+                                            int solution_source) {
+  assert(!mipdata_.parallelLockActive());
+  if (!primal_store_ || mipdata_.incumbent.empty()) return;
+  const auto latest = primal_store_->latest();
+  if (latest && mipdata_.upper_bound >= latest->upper_bound) return;
+  HighsWorkerCandidate candidate;
+  // Master postsolve may repair continuous values. Reconstruct from the
+  // checked original witness, not the heuristic's pre-repair reduced vector.
+  candidate.solution = std::move(reduced_columns);
+  candidate.native_objective = mipdata_.upper_bound;
+  candidate.solution_source = solution_source;
+  candidate.metadata.worker_id = worker_id_;
+  candidate.metadata.admission_generation =
+      mipsolver_.callback_->data_in.admission_generation;
+  candidate.metadata.work_epoch = work_epoch_;
+  candidate.metadata.publication_sequence = publication_sequence_++;
+  candidate.metadata.discovery_node =
+      mipdata_.num_nodes + (search_ptr_ ? search_ptr_->nnodes : 0);
+  candidate.metadata.discovery_lp_iterations =
+      mipdata_.total_lp_iterations + (search_ptr_ ? search_ptr_->lpiterations : 0);
+  candidate.metadata.discovery_time = mipsolver_.timer_.read();
+  candidate.metadata.publication_time = candidate.metadata.discovery_time;
+  primal_store_->publish(candidate, mipsolver_.solution_);
+  importPrimalSnapshot();
+}
+
+void HighsMipWorker::importPrimalSnapshot() {
+  if (!primal_store_) return;
+  auto snapshot = primal_store_->latestAfter(
+      repair_snapshot_ ? repair_snapshot_->sequence : 0);
+  if (!snapshot) return;
+  repair_snapshot_ = std::move(snapshot);
+  ++repair_sequence_;
+  if (repair_snapshot_->candidate.metadata.worker_id != worker_id_) {
+    ++peer_imports_;
+    peer_wait_max_ = std::max(peer_wait_max_, std::max(0.0,
+        mipsolver_.timer_.read() - repair_snapshot_->candidate.metadata.publication_time));
+  }
+  // Only the current worker's scalar state changes. Candidate authority is
+  // the checked record; domain/clique and proof updates remain joined.
+  if (repair_snapshot_->upper_bound < upper_bound) {
+    upper_bound = repair_snapshot_->upper_bound;
+    upper_limit = std::min(upper_limit,
+        mipdata_.computeNewUpperLimit(upper_bound, 0.0, 0.0));
+    optimality_limit = std::min(optimality_limit,
+        mipdata_.computeNewUpperLimit(upper_bound,
+            mipsolver_.options_mip_->mip_abs_gap,
+            mipsolver_.options_mip_->mip_rel_gap));
+  }
+}
+
+void HighsMipWorker::residentLpBoundary() {
+  ++resident_boundaries_;
+  if (primal_service_) primal_service_->atResidentBoundary();
+  importPrimalSnapshot();
+}
+
+const std::vector<double>& HighsMipWorker::repairIncumbent() const {
+  if (repair_snapshot_ && (mipdata_.incumbent.empty() ||
+                           repair_snapshot_->upper_bound < mipdata_.upper_bound))
+    return repair_snapshot_->candidate.solution;
+  return mipdata_.incumbent;
+}
+
+int64_t HighsMipWorker::repairIncumbentSequence() const {
+  return mipdata_.numImprovingSols + repair_sequence_;
+}
+
 std::pair<bool, double> HighsMipWorker::transformNewIntegerFeasibleSolution(
-    const std::vector<double>& sol) const {
+    const std::vector<double>& sol, std::vector<double>* original_columns) const {
   HighsSolution solution;
   solution.col_value = sol;
   solution.value_valid = true;
@@ -148,17 +240,21 @@ std::pair<bool, double> HighsMipWorker::transformNewIntegerFeasibleSolution(
           mipsolver_quad_objective_value -
       mipsolver_.model_->offset_);
 
+  if (feasible && original_columns)
+    *original_columns = std::move(solution.col_value);
   return std::make_pair(feasible, transformed_solobj);
 }
 
 bool HighsMipWorker::trySolution(const std::vector<double>& solution,
-                                 const int solution_source) {
-  if (static_cast<int>(solution.size()) != mipsolver_.model_->num_col_)
+                                 const int solution_source, HighsPrimalAdmissionReceipt* receipt) {
+  if (receipt) *receipt = {};
+  if (solution.size() != static_cast<size_t>(mipsolver_.model_->num_col_))
     return false;
 
   HighsCDouble obj = 0;
 
   for (HighsInt i = 0; i != mipsolver_.model_->num_col_; ++i) {
+    if (!std::isfinite(solution[i])) return false;
     if (solution[i] < mipsolver_.model_->col_lower_[i] - mipdata_.feastol)
       return false;
     if (solution[i] > mipsolver_.model_->col_upper_[i] + mipdata_.feastol)
@@ -179,11 +275,12 @@ bool HighsMipWorker::trySolution(const std::vector<double>& solution,
     for (HighsInt j = start; j != end; ++j)
       rowactivity += solution[mipdata_.ARindex_[j]] * mipdata_.ARvalue_[j];
 
+    if (!std::isfinite(rowactivity)) return false;
     if (rowactivity > mipsolver_.rowUpper(i) + mipdata_.feastol) return false;
     if (rowactivity < mipsolver_.rowLower(i) - mipdata_.feastol) return false;
   }
 
-  return addIncumbent(solution, static_cast<double>(obj), solution_source);
+  return addIncumbent(solution, static_cast<double>(obj), solution_source, receipt);
 }
 
 void HighsMipWorker::resetSepaStats() {

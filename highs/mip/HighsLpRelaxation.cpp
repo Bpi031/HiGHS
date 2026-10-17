@@ -10,12 +10,14 @@
 #include <algorithm>
 
 #include "lp_data/HighsSolve.h"  // For useIpm()
+#include "lp_data/HighsRefinementBudget.h"
 #include "mip/HighsCutPool.h"
 #include "mip/HighsDomain.h"
 #include "mip/HighsMipSolver.h"
 #include "mip/HighsMipSolverData.h"
 #include "mip/HighsMipWorker.h"
 #include "mip/HighsPseudocost.h"
+#include "mip/HighsRootLpPortfolio.h"
 #include "mip/MipTimer.h"
 #include "util/HighsCDouble.h"
 #include "util/HighsHash.h"
@@ -23,6 +25,29 @@
 void HighsLpRelaxation::setProfiling(HighsProfiling* profiling) {
   assert(profiling);
   lpsolver.setProfiling(profiling);
+}
+
+HighsLpRelaxation::Playground::~Playground() {
+  if (iterateStored) {
+    HighsLpWorkScope scope(lp->worker_ ? &lp->worker_->search_work : nullptr,
+                           HighsLpWorkKind::kIterateRestoration);
+    lp->getLpSolver().getIterate();
+    lp->run();
+  }
+}
+
+HighsStatus HighsLpRelaxation::optimizeLp(Highs& solver) {
+  if (!worker_ || !worker_->search_work.observingLpWork())
+    return solver.optimizeLp();
+  const auto started = std::chrono::steady_clock::now();
+  const HighsStatus result = solver.optimizeLp();
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+  const HighsInfo& info = solver.getInfo();
+  worker_->search_work.recordLpCall(info.valid ? info.simplex_iteration_count : -1,
+                                  info.valid ? info.ipm_iteration_count : -1,
+                                  seconds);
+  return result;
 }
 
 void HighsLpRelaxation::getCutPool(HighsInt& num_col, HighsInt& num_cut,
@@ -217,6 +242,9 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsLpRelaxation& other)
       currentbasisstored(other.currentbasisstored),
       adjustSymBranchingCol(other.adjustSymBranchingCol),
       worker_(nullptr) {
+  helper_deadline_ = other.helper_deadline_;
+  recovery_ipx_ = other.recovery_ipx_;
+  helper_iteration_limit_ = other.helper_iteration_limit_;
   lpsolver.setOptionValue("output_flag", false);
   lpsolver.passOptions(other.lpsolver.getOptions());
   lpsolver.passModel(other.lpsolver.getLp());
@@ -533,7 +561,7 @@ void HighsLpRelaxation::addCuts(HighsCutSet& cutset) {
   }
 }
 
-void HighsLpRelaxation::removeObsoleteRows(bool notifyPool) {
+void HighsLpRelaxation::removeObsoleteRows(bool notifyPool, CutRemovalMode mode) {
   HighsInt nlprows = numRows();
   HighsInt nummodelrows = getNumModelRows();
   std::vector<HighsInt> deletemask;
@@ -552,10 +580,10 @@ void HighsLpRelaxation::removeObsoleteRows(bool notifyPool) {
     }
   }
 
-  removeCuts(ndelcuts, deletemask);
+  removeCuts(ndelcuts, deletemask, mode);
 }
 
-void HighsLpRelaxation::removeWorkerSpecificRows() {
+void HighsLpRelaxation::removeWorkerSpecificRows(CutRemovalMode mode) {
   HighsInt nlprows = numRows();
   HighsInt nummodelrows = getNumModelRows();
   std::vector<HighsInt> deletemask;
@@ -576,14 +604,20 @@ void HighsLpRelaxation::removeWorkerSpecificRows() {
     getLpSolver().setBasis(root_basis);
   }
 
-  removeCuts(ndelcuts, deletemask);
+  removeCuts(ndelcuts, deletemask, mode);
 }
 
 void HighsLpRelaxation::removeCuts(HighsInt ndelcuts,
-                                   std::vector<HighsInt>& deletemask) {
+                                   std::vector<HighsInt>& deletemask,
+                                   CutRemovalMode mode) {
   assert(lpsolver.getLp().num_row_ ==
          (HighsInt)lpsolver.getLp().row_lower_.size());
   if (ndelcuts > 0) {
+    const double started = mipsolver.timer_.read();
+    HighsTaskPhaseScope phase(worker_ ? &worker_->search_work : nullptr,
+                             HighsTaskPhase::kCutRestoration);
+    HighsLpWorkScope lp_work(worker_ ? &worker_->search_work : nullptr,
+                            HighsLpWorkKind::kCutRestoration);
     HighsBasis basis = lpsolver.getBasis();
     HighsInt nlprows = lpsolver.getNumRow();
     lpsolver.deleteRows(deletemask.data());
@@ -603,8 +637,36 @@ void HighsLpRelaxation::removeCuts(HighsInt ndelcuts,
     assert(lpsolver.getLp().num_row_ == (HighsInt)lprows.size());
     basis.debug_origin_name = "HighsLpRelaxation::removeCuts";
     lpsolver.setBasis(basis);
+    if (mode == CutRemovalMode::kModelAndBasisOnly ||
+        mipsolver.callback_->refinement_budget) {
+      // All structural remapping has finished, but no numerical certificate
+      // survives this operation. Consumers may copy the model/basis or run it.
+      status = Status::kNotSet;
+      objective = -kHighsInf;
+      hasdualproof = false;
+      fractionalints.clear();
+      basischeckpoint.reset();
+      currentbasisstored = false;
+      if (worker_) {
+        worker_->search_work.recordDeferredRestoration();
+        worker_->search_work.recordRestoration(mipsolver.timer_.read() - started);
+      }
+      return;
+    }
     mipsolver.profiling_->solveCall("LP0", mipsolver.submip);
-    lpsolver.optimizeLp();
+    // Cut/basis repair must finish before this LP can be used again. Account
+    // for it explicitly; it is not a safe mid-repair scheduling checkpoint.
+    if (worker_ && worker_->search_work.remaining() != std::numeric_limits<int64_t>::max())
+      worker_->search_work.recordCompletionExemption();
+    optimizeLp(lpsolver);
+    const HighsInt iterations = std::max(HighsInt{0}, lpsolver.getInfo().simplex_iteration_count);
+    if (worker_) {
+      worker_->search_work.chargeLp(iterations);
+      worker_->search_work.recordRestoration(mipsolver.timer_.read() - started);
+    }
+    if (mipsolver.submip)
+      mipsolver.helper_lp_work += std::min<int64_t>(iterations,
+          std::numeric_limits<int64_t>::max() - mipsolver.helper_lp_work);
   }
 }
 
@@ -709,6 +771,7 @@ void HighsLpRelaxation::notifyCutPoolsLpCopied(HighsInt n) {
 }
 
 void HighsLpRelaxation::flushDomain(HighsDomain& domain, bool continuous) {
+  const double started = mipsolver.timer_.read();
   if (!domain.getChangedCols().empty()) {
     if (&domain == &mipsolver.mipdata_->getDomain()) continuous = true;
     currentbasisstored = false;
@@ -726,6 +789,8 @@ void HighsLpRelaxation::flushDomain(HighsDomain& domain, bool continuous) {
                               colLbBuffer.data(), colUbBuffer.data());
 
     domain.clearChangedCols();
+    if (worker_) worker_->search_work.recordRestoration(
+        mipsolver.timer_.read() - started);
   }
 }
 
@@ -1106,10 +1171,13 @@ bool HighsLpRelaxation::computeDualInfProof(const HighsDomain& globaldomain,
 
 bool HighsLpRelaxation::recoverBasis() {
   if (!basischeckpoint) return false;
+  const double started = mipsolver.timer_.read();
   const HighsStatus status =
       lpsolver.setBasis(*basischeckpoint, "HighsLpRelaxation::recoverBasis");
   currentbasisstored = status == HighsStatus::kOk;
   if (!currentbasisstored) basischeckpoint.reset();
+  if (worker_) worker_->search_work.recordRestoration(
+      mipsolver.timer_.read() - started);
   return currentbasisstored;
 }
 
@@ -1126,21 +1194,164 @@ void HighsLpRelaxation::setObjectiveLimit(double objlim) {
 
 HighsLpRelaxation::Status HighsLpRelaxation::run(
     bool resolve_on_error, bool yield_on_iteration_limit) {
+  auto* refinement = mipsolver.callback_->refinement_budget;
+  HighsRefinementLpWork refinement_work(refinement);
+  if (refinement && refinement->stopStatus() != HighsModelStatus::kNotset) {
+    hasdualproof = false;
+    return Status::kIterationLimit;
+  }
+  const HighsCandidateCheckpoint* checkpoint = nullptr;
+  uint64_t checkpoint_sequence = 0;
+  if (candidate_interruptible_ && worker_) {
+    checkpoint = worker_->search_work.checkpoint();
+    checkpoint_sequence = worker_->search_work.batchSequence();
+  }
+  if (mipsolver.submip && mipsolver.parent_candidate_checkpoint) {
+    checkpoint = mipsolver.parent_candidate_checkpoint;
+    checkpoint_sequence = mipsolver.parent_candidate_sequence;
+  }
+  candidate_interrupt_.begin(checkpoint, checkpoint_sequence);
+  const bool resident = worker_ && worker_->residentLpEnabled() &&
+                        !mipsolver.submip && !isBoundedHelper() &&
+                        lpsolver.getBasis().valid;
+  int64_t next_resident_iteration = 0;
+  // This solver is LP-owned; it never installs a callback on the live parent.
+  if (checkpoint || resident || refinement) {
+    lpsolver.setCallback([&](int type, const std::string&, const HighsCallbackOutput* output,
+                            HighsCallbackInput* input, void* context) {
+      if (resident && type == kCallbackSimplexInterrupt &&
+          output->simplex_iteration_count >= next_resident_iteration) {
+        next_resident_iteration = output->simplex_iteration_count + 4096;
+        // Called by HEkk only between complete pivot/update transactions.
+        // Returning continues the same solve, without returnFromSolve cleanup.
+        worker_->residentLpBoundary();
+      }
+      if (refinement) {
+        if (type == kCallbackSimplexInterrupt)
+          refinement_work.observe(output->simplex_iteration_count, -1);
+        else if (type == kCallbackIpmInterrupt)
+          refinement_work.observe(-1, output->ipm_iteration_count);
+      }
+      input->user_interrupt =
+          static_cast<HighsCandidateLpInterrupt*>(context)->poll() ||
+          (refinement && refinement->stopStatus() != HighsModelStatus::kNotset);
+    }, &candidate_interrupt_);
+    lpsolver.startCallback(kCallbackSimplexInterrupt);
+    lpsolver.startCallback(kCallbackIpmInterrupt);
+  }
+  struct StopCandidateCallbacks {
+    Highs& solver;
+    bool active;
+    ~StopCandidateCallbacks() {
+      if (!active) return;
+      solver.stopCallback(kCallbackSimplexInterrupt);
+      solver.stopCallback(kCallbackIpmInterrupt);
+      solver.setCallback(HighsCallbackFunctionType{}, nullptr);
+    }
+  } stop_candidate_callbacks{lpsolver, checkpoint != nullptr || resident || refinement};
+  if (candidate_interrupt_.poll()) {
+    hasdualproof = false;
+    return Status::kIterationLimit;
+  }
+  HighsInt saved_iteration_limit;
+  lpsolver.getOptionValue("simplex_iteration_limit", saved_iteration_limit);
+  struct RestoreIterationLimit {
+    Highs& solver;
+    HighsInt limit;
+    ~RestoreIterationLimit() { solver.setOptionValue("simplex_iteration_limit", limit); }
+  } restore_iteration_limit{lpsolver, saved_iteration_limit};
+  if (mipsolver.submip && mipsolver.helper_lp_limit != std::numeric_limits<int64_t>::max()) {
+    const int64_t remaining = std::max<int64_t>(1,
+        mipsolver.helper_lp_limit - mipsolver.helper_lp_work);
+    lpsolver.setOptionValue("simplex_iteration_limit",
+        static_cast<HighsInt>(std::min<int64_t>(saved_iteration_limit, remaining)));
+  }
   const HighsInfo& info = lpsolver.getInfo();
-  const double this_time_limit =
-      std::max(lpsolver.getRunTime() + mipsolver.options_mip_->time_limit -
+  double this_time_limit =
+      std::max(lpsolver.getRunTime() + std::min(mipsolver.options_mip_->time_limit,
+                                              helper_deadline_) -
                    mipsolver.timer_.read(),
                0.0);
   lpsolver.setOptionValue("time_limit", this_time_limit);
+  auto optimize = [&]() {
+    if (!refinement) return optimizeLp(lpsolver);
+    HighsInt simplex_limit, ipm_limit;
+    lpsolver.getOptionValue("simplex_iteration_limit", simplex_limit);
+    lpsolver.getOptionValue("ipm_iteration_limit", ipm_limit);
+    const HighsInt remaining = static_cast<HighsInt>(std::min<int64_t>(
+        kHighsIInf, refinement->remaining()));
+    lpsolver.setOptionValue("simplex_iteration_limit", std::min(simplex_limit, remaining));
+    lpsolver.setOptionValue("ipm_iteration_limit", std::min(ipm_limit, remaining));
+    lpsolver.setOptionValue("time_limit", std::min(this_time_limit,
+        lpsolver.getRunTime() + refinement->secondsLeft()));
+    refinement_work.begin();
+    const auto result = optimizeLp(lpsolver);
+    refinement_work.observe(lpsolver.getInfo().simplex_iteration_count,
+                             lpsolver.getInfo().ipm_iteration_count);
+    lpsolver.setOptionValue("simplex_iteration_limit", simplex_limit);
+    lpsolver.setOptionValue("ipm_iteration_limit", ipm_limit);
+    return result;
+  };
   // lpsolver.setOptionValue("output_flag", true);
-  const bool valid_basis = lpsolver.getBasis().valid;
-
-  if (mipsolver.profiling_->mip_ && !mipsolver.submip &&
-      !this->solved_first_lp) {
+  const bool first_root_lp = !mipsolver.submip && !this->solved_first_lp;
+  const bool first_child_lp = mipsolver.submip && !this->solved_first_lp &&
+      mipsolver.child_first_lp_seconds < 0;
+  const double first_lp_started = first_root_lp || first_child_lp ? mipsolver.timer_.read() : 0.0;
+  if (mipsolver.profiling_->mip_ && first_root_lp)
     highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                  "MIP-Timing: %11.2g - start first LP solve (with%s basis)\n",
-                 mipsolver.timer_.read(), valid_basis ? "" : "out");
+                 mipsolver.timer_.read(), lpsolver.getBasis().valid ? "" : "out");
+  if (first_root_lp && mipsolver.options_mip_->mip_root_lp_portfolio &&
+      mipsolver.options_mip_->parallel != kHighsOffString &&
+      mipsolver.mipdata_->numRestarts == 0 &&
+      mipsolver.mipdata_->numRestartsRoot == 0 &&
+      mipsolver.options_mip_->mip_incumbent_exchange != "deterministic" &&
+      !mipsolver.options_mip_->mip_search_simulate_concurrency &&
+      !recovery_ipx_ && !checkpoint && !resident && !refinement &&
+      !useIpm(mipsolver.options_mip_->mip_lp_solver)) {
+    // The root owner defers symmetry/analytic-center companions at this
+    // experimental boundary. No tree/primal service is running here.
+    // The solve-owned reservation excludes unaccounted companion work here.
+    // External interrupt callbacks are polled only by the synchronous arm.
+    const double left = std::min(mipsolver.options_mip_->time_limit,
+                                helper_deadline_) - mipsolver.timer_.read();
+    const auto portfolio = HighsRootLpPortfolio::offerBasis(
+        lpsolver, *mipsolver.solve_capacity, left,
+        [&]() { return mipsolver.mipdata_->checkLimits(); });
+    numlpiters += portfolio.iterations;
+    if (worker_) worker_->search_work.chargeLp(portfolio.iterations);
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP-RootPortfolio: version=1 attempted=%d installed=%d "
+                 "winner=%d elapsed=%.6g lp_iterations=%lld "
+                 "primal_status=%d dual_status=%d proof=owner_reoptimization\n",
+                 int(portfolio.attempted), int(portfolio.basis_installed),
+                 portfolio.winner, portfolio.elapsed,
+                 static_cast<long long>(portfolio.iterations),
+                 int(portfolio.status[0]), int(portfolio.status[1]));
+    // Arm startup, solve, checking and joining all consume the parent deadline.
+    this_time_limit = std::max(0.0, lpsolver.getRunTime() +
+        std::min(mipsolver.options_mip_->time_limit, helper_deadline_) -
+        mipsolver.timer_.read());
+    lpsolver.setOptionValue("time_limit", this_time_limit);
   }
+  const bool valid_basis = lpsolver.getBasis().valid;
+  const HighsInt first_lp_analysis =
+      first_root_lp ? mipsolver.options_mip_->highs_analysis_level &
+                          (kHighsAnalysisLevelSolverSummaryData +
+                           kHighsAnalysisLevelSolverTime +
+                           kHighsAnalysisLevelNlaTime)
+                    : 0;
+  const HighsInt saved_lp_analysis = lpsolver.getOptions().highs_analysis_level;
+  if (first_lp_analysis) {
+    // Native operation summaries and clocks are opt-in and first-LP-only.
+    // Do not propagate them to every node or copied heuristic relaxation.
+    lpsolver.setOptionValue("highs_analysis_level",
+                            saved_lp_analysis | first_lp_analysis);
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP-RootLpProfile: event=begin analysis_level=%d\n",
+                 int(first_lp_analysis));
+  }
+
   // Determine the solver
   //
   // Currently use simplex by default, unless IPM is requested
@@ -1151,6 +1362,9 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
   std::string use_solver;
   if (valid_basis) {
     use_solver = kSimplexString;
+  } else if (recovery_ipx_) {
+    // A local recovery request must not be replaced by the parent MIP default.
+    use_solver = kIpxString;
   } else {
     const std::string mip_lp_solver = mipsolver.options_mip_->mip_lp_solver;
     if (useIpm(mip_lp_solver)) {
@@ -1209,12 +1423,14 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
       exit(1);
     }
     mipsolver.profiling_->solveCall("LP1", mipsolver.submip);
-    callstatus = lpsolver.optimizeLp();
+    callstatus = optimize();
     if (ipm_logging) lpsolver.setOptionValue("output_flag", false);
-    if (callstatus == HighsStatus::kError) {
+    if (callstatus == HighsStatus::kError &&
+        (!refinement || refinement->stopStatus() == HighsModelStatus::kNotset)) {
       highsLogDev(
           mipsolver.options_mip_->log_options, HighsLogType::kInfo,
-          "HighsLpRelaxation::run HiPO has failed : status = %s Try IPX\n",
+          "HighsLpRelaxation::run %s has failed : status = %s Try simplex\n",
+          use_solver.c_str(),
           lpsolver.modelStatusToString(lpsolver.getModelStatus()).c_str());
       lpsolver.setOptionValue("solver", kSimplexString);
       use_simplex = true;
@@ -1231,10 +1447,15 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
           mipsolver.submip ? "sub-" : "");
     mipsolver.profiling_->setSubMip(profiling_submip);
     mipsolver.profiling_->solveCall("LP2", mipsolver.submip);
-    callstatus = lpsolver.optimizeLp();
+    callstatus = optimize();
   }
   if (override_first_root_simplex)
     lpsolver.setOptionValue("simplex_strategy", saved_simplex_strategy);
+  if (first_lp_analysis) {
+    lpsolver.setOptionValue("highs_analysis_level", saved_lp_analysis);
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP-RootLpProfile: event=end\n");
+  }
   // Revert the value of lpsolver.options_.solver
   lpsolver.setOptionValue("solver", solver);
   HighsModelStatus model_status = lpsolver.getModelStatus();
@@ -1252,12 +1473,57 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
                  "MIP-RootLp: complete=%s model_status=%s\n",
                  root_lp_complete ? "true" : "false",
                  lpsolver.modelStatusToString(model_status).c_str());
+    const double elapsed = std::max(0.0, mipsolver.timer_.read() - first_lp_started);
+    const HighsLp& lp = lpsolver.getLp();
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP-RootLpWork: elapsed=%.6g rows=%lld columns=%lld "
+                 "nonzeros=%lld simplex_iterations=%lld ipm_iterations=%lld\n",
+                 elapsed, static_cast<long long>(lp.num_row_),
+                 static_cast<long long>(lp.num_col_),
+                 static_cast<long long>(lp.a_matrix_.numNz()),
+                 static_cast<long long>(info.simplex_iteration_count),
+                 static_cast<long long>(info.ipm_iteration_count));
+    const HighsSimplexStats& stats = lpsolver.getSimplexStats();
+    if (use_simplex && info.simplex_iteration_count > 0 && stats.valid)
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                   "MIP-RootLpFactor: inverts=%lld last_factor_nonzeros=%lld "
+                   "last_basis_nonzeros=%lld col_aq_density=%.6g "
+                   "row_ep_density=%.6g row_ap_density=%.6g\n",
+                   static_cast<long long>(stats.num_invert),
+                   static_cast<long long>(stats.last_invert_num_el),
+                   static_cast<long long>(stats.last_factored_basis_num_el),
+                   stats.col_aq_density, stats.row_ep_density,
+                   stats.row_ap_density);
+  }
+  if (first_child_lp) {
+    mipsolver.child_first_lp_seconds = std::max(0.0, mipsolver.timer_.read() - first_lp_started);
+    mipsolver.child_first_lp_iterations = std::max(HighsInt{0}, info.simplex_iteration_count) +
+        std::max(HighsInt{0}, info.ipm_iteration_count);
   }
   this->solved_first_lp = true;
   HighsInt itercount = -1;
   if (use_simplex) {
     itercount = std::max(HighsInt{0}, info.simplex_iteration_count);
     numlpiters += itercount;
+    if (worker_) worker_->search_work.chargeLp(itercount);
+    if (mipsolver.submip)
+      mipsolver.helper_lp_work += std::min<int64_t>(itercount,
+          std::numeric_limits<int64_t>::max() - mipsolver.helper_lp_work);
+  }
+
+  if (model_status == HighsModelStatus::kInterrupt &&
+      candidate_interrupt_.interrupted()) {
+    hasdualproof = false;
+    return Status::kIterationLimit;
+  }
+
+  if (refinement && refinement->stopStatus() != HighsModelStatus::kNotset &&
+      model_status != HighsModelStatus::kOptimal &&
+      model_status != HighsModelStatus::kInfeasible &&
+      model_status != HighsModelStatus::kUnbounded &&
+      model_status != HighsModelStatus::kObjectiveBound) {
+    hasdualproof = false;
+    return Status::kIterationLimit;
   }
 
   if (callstatus == HighsStatus::kError) {
@@ -1386,7 +1652,10 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
 
       return Status::kError;
     case HighsModelStatus::kIterationLimit: {
-      if (yield_on_iteration_limit) return Status::kIterationLimit;
+      if (yield_on_iteration_limit || isBoundedHelper()) {
+        hasdualproof = false;
+        return Status::kIterationLimit;
+      }
       if (!mipsolver.submip && resolve_on_error) {
         // Highs instantiation
         Highs ipm;
@@ -1437,7 +1706,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
           ipm.setOptionValue("output_flag", !mipsolver.submip);
         }
         mipsolver.profiling_->solveCall("LP3", mipsolver.submip);
-        ipm.optimizeLp();
+        optimizeLp(ipm);
         if (ipm_logging) ipm.setOptionValue("output_flag", false);
         if (use_hipo && !ipm.getBasis().valid) {
           // HiPO has failed to get a solution, so try IPX
@@ -1447,7 +1716,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::run(
                       ipm.modelStatusToString(ipm.getModelStatus()).c_str());
           ipm.setOptionValue("solver", kIpxString);
           mipsolver.profiling_->solveCall("LP4", mipsolver.submip);
-          ipm.optimizeLp();
+          optimizeLp(ipm);
         }
         lpsolver.setBasis(ipm.getBasis(), "HighsLpRelaxation::run IPM basis");
         return run(false, false);

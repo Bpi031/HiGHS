@@ -1093,10 +1093,13 @@ HighsStatus Highs::run() {
   HighsStatus status = HighsStatus::kOk;
   if (this->options_.read_solution_file != "")
     status = this->readSolution(this->options_.read_solution_file);
+  if (status == HighsStatus::kError) return status;
   if (this->options_.read_basis_file != "")
-    status = this->readBasis(this->options_.read_basis_file);
+    status = worseStatus(status, this->readBasis(this->options_.read_basis_file));
+  if (status == HighsStatus::kError) return status;
   if (this->options_.write_model_file != "")
-    status = this->writeModel(this->options_.write_model_file);
+    status =
+        worseStatus(status, this->writeModel(this->options_.write_model_file));
 
   if (status != HighsStatus::kOk) return status;
 
@@ -1115,7 +1118,25 @@ HighsStatus Highs::run() {
 
   // Optimize the model in the Highs instance
   status = optimizeHighs();
-  if (status == HighsStatus::kError) return status;
+  if (status == HighsStatus::kError) {
+    const HighsModelStatus failure_status = model_status_;
+    invalidateSolverData();
+    // Failed runs must not expose an earlier optimal result or leave the
+    // caller's model scaled. There is no current solution to unscale/check.
+    switch (failure_status) {
+      case HighsModelStatus::kModelError:
+      case HighsModelStatus::kPresolveError:
+      case HighsModelStatus::kSolveError:
+      case HighsModelStatus::kPostsolveError:
+      case HighsModelStatus::kUnknown:
+        model_status_ = failure_status;
+        break;
+      default:
+        model_status_ = HighsModelStatus::kSolveError;
+    }
+    userUnscale(user_scale_data, false);
+    return status;
+  }
 
   // Assume that run data are valid
   this->run_data_.valid = true;
@@ -1125,12 +1146,16 @@ HighsStatus Highs::run() {
     return HighsStatus::kError;
 
   if (this->options_.write_iis_model_file != "")
-    status = this->writeIisModel(this->options_.write_iis_model_file);
+    status = worseStatus(
+        status, this->writeIisModel(this->options_.write_iis_model_file));
+  if (status == HighsStatus::kError) return status;
   if (this->options_.solution_file != "")
-    status = this->writeSolution(this->options_.solution_file,
-                                 this->options_.write_solution_style);
+    status = worseStatus(
+        status, this->writeSolution(this->options_.solution_file,
+                                    this->options_.write_solution_style));
+  if (status == HighsStatus::kError) return status;
   if (this->options_.write_basis_file != "")
-    status = this->writeBasis(this->options_.write_basis_file);
+    status = worseStatus(status, this->writeBasis(this->options_.write_basis_file));
 
   return status;
 }
@@ -4326,6 +4351,15 @@ HighsStatus Highs::callSolveQp() {
 }
 
 HighsStatus Highs::callSolveMip() {
+  if (options_.mip_incumbent_exchange == "opportunistic" &&
+      callback_.active[kCallbackMipDefineLazyConstraints]) {
+    highsLogUser(options_.log_options, HighsLogType::kError,
+                 "Checked incumbent exchange requires a fixed model; "
+                 "lazy-constraint callbacks are unsupported\n");
+    invalidateSolverData();
+    model_status_ = HighsModelStatus::kModelError;
+    return HighsStatus::kError;
+  }
   // Record whether there is a valid primal solution on entry
   const bool user_solution = solution_.value_valid;
   std::vector<double> user_solution_col_value;

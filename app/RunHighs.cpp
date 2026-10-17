@@ -9,11 +9,18 @@
  * @brief HiGHS main
  */
 #include <cstdio>  // For fclose
+#include <atomic>
+#include <csignal>
 
 #include "Highs.h"
 #include "HighsRuntimeOptions.h"
 
 static bool written_cli_copyright_line = false;
+static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "CLI interrupt flag must be signal-safe");
+static std::atomic<bool> cli_stop_requested{false};
+static void requestCliStop(int) {
+  cli_stop_requested.store(true, std::memory_order_relaxed);
+}
 
 void cliCopyrightLine(const HighsLogOptions& log_options) {
   if (written_cli_copyright_line) return;
@@ -136,7 +143,15 @@ int main(int argc, char** argv) {
     return runHighsReturn(highs, status);
   }
   // Solve the model
+  highs.setCallback([](int, const std::string&, const HighsCallbackOutput*,
+                       HighsCallbackInput* input, void*) {
+    input->user_interrupt = cli_stop_requested.load(std::memory_order_relaxed);
+  });
+  for (int type : {kCallbackSimplexInterrupt, kCallbackIpmInterrupt, kCallbackMipInterrupt})
+    highs.startCallback(type);
+  const auto previous_sigint = std::signal(SIGINT, requestCliStop);
   HighsStatus run_status = highs.run();
+  std::signal(SIGINT, previous_sigint);
   if (run_status == HighsStatus::kError) runHighsReturn(highs, run_status);
 
   // Shut down task executor for explicit release of memory.

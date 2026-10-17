@@ -1368,7 +1368,7 @@ HPresolve::Result HPresolve::dominatedColumns(
               HPRESOLVE_CHECKED_CALL(
                   tightenBounds(col, dominatingBound, direction > 0, k,
                                 dominatedBound, direction * direction_k));
-            if (!colDeleted[col] && isDominatingBoundFinite)
+            if (!colDeleted[col] && !colDeleted[k] && isDominatingBoundFinite)
               HPRESOLVE_CHECKED_CALL(
                   tightenBounds(k, dominatedBound, direction_k < 0, col,
                                 dominatingBound, direction * direction_k));
@@ -1381,17 +1381,25 @@ HPresolve::Result HPresolve::dominatedColumns(
     // lambda for finding a domination relationship in the given row
     auto checkRow = [&](HighsInt row, HighsInt col, HighsInt direction,
                         double bestVal, bool boundImplied, bool hasCliques) {
-      storeRow(row);
+      if (rowDeleted[row] || colDeleted[col]) return Result::kOk;
+      // Nested fixings reuse rowpositions and can remove/replace matrix entries.
+      // Retain column IDs, never a slice into that shared scratch buffer.
+      std::vector<HighsInt> candidateCols;
+      for (const HighsSliceNonzero& nonz : getSortedRowVector(row))
+        candidateCols.push_back(nonz.index());
       bool onlyPredBndAnalysis = !boundImplied && !hasCliques;
-      for (const HighsSliceNonzero& nonz : getStoredRow()) {
-        // get column index
-        HighsInt k = nonz.index();
+      for (HighsInt k : candidateCols) {
+        if (rowDeleted[row] || colDeleted[col]) break;
 
         // skip column 'col' and deleted columns
         if (k == col || colDeleted[k]) continue;
 
-        // get coefficient
-        double ak = nonz.value();
+        HighsInt colPos = findNonzero(row, col);
+        HighsInt kPos = findNonzero(row, k);
+        if (colPos == -1) break;
+        if (kPos == -1) continue;
+        bestVal = Avalue[colPos];
+        double ak = Avalue[kPos];
 
         // check if variables have the same type
         bool sameVarType = varsHaveSameType(col, k);
@@ -1409,8 +1417,16 @@ HPresolve::Result HPresolve::dominatedColumns(
           if (colDeleted[col]) break;
         }
 
-        if (!colDeleted[k] &&
-            checkDominationNonZero(row, direction * bestVal, -direction * ak)) {
+        if (rowDeleted[row] || colDeleted[col]) break;
+        if (colDeleted[k]) continue;
+        colPos = findNonzero(row, col);
+        kPos = findNonzero(row, k);
+        if (colPos == -1) break;
+        if (kPos == -1) continue;
+        bestVal = Avalue[colPos];
+        ak = Avalue[kPos];
+        sameVarType = varsHaveSameType(col, k);
+        if (checkDominationNonZero(row, direction * bestVal, -direction * ak)) {
           HPRESOLVE_CHECKED_CALL(checkCols(row, col, k, direction, HighsInt{-1},
                                            boundImplied, hasCliques,
                                            sameVarType));
@@ -5879,7 +5895,15 @@ HPresolve::Result HPresolve::presolve(HighsPostsolveStack& postsolve_stack) {
     assert(this->timer->running());
 
     if (options->presolve_rule_test) {
-      HPRESOLVE_CHECKED_CALL(presolveRuleTest(postsolve_stack));
+      if (options->presolve_rule_test == kPresolveRuleSparsify) {
+        // Equality-row additions cannot recover an LP basis.
+        if (analysis_.allow_rule_[kPresolveRuleSparsify] &&
+            (mipsolver || !options->lp_presolve_requires_basis_postsolve))
+          HPRESOLVE_PHASE_CALL(kPresolvePhaseSparsify,
+                               sparsify(postsolve_stack));
+      } else {
+        HPRESOLVE_CHECKED_CALL(presolveRuleTest(postsolve_stack));
+      }
       return presolveReturn();
     }
     HPRESOLVE_PHASE_CALL(kPresolvePhaseInitialSweep,
@@ -6373,9 +6397,8 @@ HighsModelStatus HPresolve::run(HighsPostsolveStack& postsolve_stack) {
   postsolve_stack.debug_prev_col_upper = 0;
   postsolve_stack.debug_prev_row_lower = 0;
   postsolve_stack.debug_prev_row_upper = 0;
-  // Presolve should only be called with a model that has a non-empty
-  // constraint matrix unless it has no rows
-  assert(model->a_matrix_.numNz() || model->num_row_ == 0);
+  // MIP and IPM callers can pass constant rows with an empty matrix. The
+  // ordinary empty-row reductions below must check their feasibility.
   auto reportReductions = [&]() {
     if (options->presolve != kHighsOffString &&
         reductionLimit < kHighsSize_tInf) {
@@ -8496,6 +8519,8 @@ HPresolve::Result HPresolve::sparsify(HighsPostsolveStack& postsolve_stack) {
         possibleScales.clear();
         bool skip = false;
         for (const HighsSliceNonzero& nonzero : getStoredRow()) {
+          // This missing entry is the one fill already allowed by this scan.
+          if (nonzero.index() == sparsestCol) continue;
           double candRowVal;
           if (nonzero.index() == secondSparsestCol) {
             candRowVal = colNz.value();

@@ -1,6 +1,8 @@
 #include "HCheckConfig.h"
 #include "Highs.h"
 #include "catch.hpp"
+#include "parallel/HighsParallel.h"
+#include "simplex/HEkk.h"
 #include "util/HFactor.h"
 
 const bool dev_run = false;
@@ -100,6 +102,7 @@ TEST_CASE("Factor-put-get-iterate", "[highs_test_factor]") {
     highs.changeColBounds(iCol, lower, upper);
     if (!put_iterate) {
       REQUIRE(highs.putIterate() == HighsStatus::kOk);
+      put_iterate = true;
     } else {
       REQUIRE(highs.getIterate() == HighsStatus::kOk);
     }
@@ -110,6 +113,120 @@ TEST_CASE("Factor-put-get-iterate", "[highs_test_factor]") {
   }
 
   highs.resetGlobalScheduler(true);
+}
+
+TEST_CASE("Iterate restoration preserves independently known LP optima",
+          "[highs_robustness][highs_test_factor]") {
+  for (double scale : {0.125, 1.0, 8.0}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", false);
+    highs.setOptionValue("presolve", "off");
+    highs.setOptionValue("solver", "simplex");
+    HighsLp model;
+    model.num_col_ = 2;
+    model.num_row_ = 2;
+    model.col_cost_ = {-3, -2};
+    model.col_lower_ = {0, 0};
+    model.col_upper_ = {4, 4};
+    model.row_lower_ = {-kHighsInf, -kHighsInf};
+    model.row_upper_ = {4 * scale, 5 * scale};
+    model.a_matrix_.format_ = MatrixFormat::kColwise;
+    model.a_matrix_.start_ = {0, 2, 4};
+    model.a_matrix_.index_ = {0, 1, 0, 1};
+    model.a_matrix_.value_ = {scale, 2 * scale, scale, scale};
+    REQUIRE(highs.passModel(model) == HighsStatus::kOk);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    REQUIRE(highs.getObjectiveValue() == Approx(-9));
+    REQUIRE(highs.putIterate() == HighsStatus::kOk);
+    for (double lower : {2.0, 0.0, 2.0, 0.0}) {
+      REQUIRE(highs.changeColBounds(0, lower, 4) == HighsStatus::kOk);
+      REQUIRE(highs.getIterate() == HighsStatus::kOk);
+      REQUIRE(highs.run() == HighsStatus::kOk);
+      REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+      const auto& answer = highs.getSolution().col_value;
+      REQUIRE(answer.size() == 2);
+      REQUIRE(answer[0] == Approx(lower ? 2 : 1));
+      REQUIRE(answer[1] == Approx(lower ? 1 : 3));
+      REQUIRE(highs.getObjectiveValue() == Approx(lower ? -8 : -9));
+      REQUIRE(answer[0] + answer[1] <= 4 + 1e-9);
+      REQUIRE(2 * answer[0] + answer[1] <= 5 + 1e-9);
+    }
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("Iterate restoration recovers saved edge-weight validity",
+          "[highs_robustness][highs_test_factor][highs_iterate_restore]") {
+  struct SchedulerReset {
+    ~SchedulerReset() { Highs::resetGlobalScheduler(true); }
+  } reset;
+  Highs::resetGlobalScheduler(true);
+  highs::parallel::initialize_scheduler(1);
+  for (bool saved_weights : {false, true}) {
+    for (bool current_weights : {false, true}) {
+      HighsOptions options;
+      options.output_flag = false;
+      HighsTimer timer;
+      Highs callback_owner;
+      HighsCallback callback(&callback_owner);
+      HEkk ekk;
+      ekk.lp_.num_row_ = 2;
+      ekk.lp_.num_col_ = 2;
+      ekk.lp_.a_matrix_.num_row_ = 2;
+      ekk.lp_.a_matrix_.num_col_ = 2;
+      ekk.lp_.a_matrix_.format_ = MatrixFormat::kColwise;
+      ekk.lp_.a_matrix_.start_ = {0, 2, 4};
+      ekk.lp_.a_matrix_.index_ = {0, 1, 0, 1};
+      ekk.lp_.a_matrix_.value_ = {2, -1, 1, 3};
+      ekk.lp_.col_cost_ = {-1, 2};
+      ekk.lp_.col_lower_ = {0, 0};
+      ekk.lp_.col_upper_ = {10, 10};
+      ekk.lp_.row_lower_ = {0, 0};
+      ekk.lp_.row_upper_ = {0, 0};
+      ekk.setPointers(&callback, &options, &timer);
+      ekk.initialiseEkk();
+      ekk.info_.simplex_strategy = kSimplexStrategyDualPlain;
+      REQUIRE(ekk.initialiseSimplexLpBasisAndFactor() == HighsStatus::kOk);
+      const auto basis = ekk.basis_.basicIndex_;
+      // The logical identity basis has exact unit squared row norms.
+      ekk.dual_edge_weight_ = saved_weights ? std::vector<double>{1, 1}
+                                            : std::vector<double>{};
+      ekk.scattered_dual_edge_weight_.resize(4);
+      ekk.status_.has_dual_steepest_edge_weights = saved_weights;
+      ekk.putIterate();
+      ekk.clearEkkDualEdgeWeightData();
+      if (current_weights) ekk.dual_edge_weight_ = {1, 1};
+      ekk.status_.has_dual_steepest_edge_weights = current_weights;
+      REQUIRE(ekk.getIterate() == HighsStatus::kOk);
+      REQUIRE(ekk.status_.has_invert);
+      REQUIRE(ekk.status_.has_dual_steepest_edge_weights == saved_weights);
+      REQUIRE(ekk.basis_.basicIndex_ == basis);
+      if (saved_weights) REQUIRE(ekk.dual_edge_weight_ == std::vector<double>{1, 1});
+      if (saved_weights) REQUIRE(ekk.scattered_dual_edge_weight_.size() >= 4);
+      for (bool transpose : {false, true}) {
+        HVector rhs;
+        rhs.setup(2);
+        rhs.array[0] = 3;
+        rhs.array[1] = -4;
+        rhs.index[0] = 0;
+        rhs.index[1] = 1;
+        rhs.count = 2;
+        if (transpose)
+          ekk.btran(rhs, 1);
+        else
+          ekk.ftran(rhs, 1);
+        REQUIRE(rhs.array[0] == 3);
+        REQUIRE(rhs.array[1] == -4);
+      }
+      REQUIRE(ekk.solve() == HighsStatus::kOk);
+      REQUIRE(ekk.model_status_ == HighsModelStatus::kOptimal);
+      const auto answer = ekk.getSolution().col_value;
+      REQUIRE(answer.size() == 2);
+      REQUIRE(answer[0] == Approx(0));
+      REQUIRE(answer[1] == Approx(0));
+    }
+  }
 }
 
 TEST_CASE("Factor-get-set-invert", "[highs_test_factor]") {

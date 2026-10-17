@@ -67,14 +67,19 @@ void HEkkDualRow::chooseMakepack(const HVector* row, const HighsInt offset) {
    * Offset of numCol is used when packing row_ep
    */
   const HighsInt rowCount = row->count;
+  if (rowCount <= 0) return;
   const HighsInt* rowIndex = row->index.data();
   const double* rowArray = row->array.data();
+  HighsInt packed_count = packCount;
+  HighsInt* const packed_index = packIndex.data();
+  double* const packed_value = packValue.data();
   for (HighsInt i = 0; i < rowCount; i++) {
     const HighsInt index = rowIndex[i];
     const double value = rowArray[index];
-    packIndex[packCount] = index + offset;
-    packValue[packCount++] = value;
+    packed_index[packed_count] = index + offset;
+    packed_value[packed_count++] = value;
   }
+  packCount = packed_count;
 }
 
 void HEkkDualRow::choosePossible() {
@@ -108,8 +113,16 @@ void HEkkDualRow::chooseJoinpack(const HEkkDualRow* otherRow) {
    * candidates in otherRow
    */
   const HighsInt otherCount = otherRow->workCount;
-  const pair<HighsInt, double>* otherData = otherRow->workData.data();
-  copy(otherData, otherData + otherCount, &workData[workCount]);
+  assert(otherCount >= 0 && workCount >= 0);
+  assert(static_cast<size_t>(otherCount) <= otherRow->workData.size());
+  assert(static_cast<size_t>(workCount) <= workData.size());
+  assert(static_cast<size_t>(otherCount) <=
+         workData.size() - static_cast<size_t>(workCount));
+  // Empty slices must not form a reference at the destination's end.
+  if (otherCount > 0) {
+    const pair<HighsInt, double>* otherData = otherRow->workData.data();
+    copy(otherData, otherData + otherCount, workData.data() + workCount);
+  }
   workCount = workCount + otherCount;
   workTheta = min(workTheta, otherRow->workTheta);
 }

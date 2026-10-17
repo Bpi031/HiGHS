@@ -22,7 +22,8 @@ inline void initialize_scheduler(int numThreads = 0) {
 #ifdef HIGHS_NO_DEFAULT_THREADS
     numThreads = 1;
 #else
-    numThreads = (std::thread::hardware_concurrency() + 1) / 2;
+    const unsigned int logical = std::thread::hardware_concurrency();
+    numThreads = std::max(1u, logical / 2 + logical % 2);
 #endif
   }
   HighsTaskExecutor::initialize(numThreads);

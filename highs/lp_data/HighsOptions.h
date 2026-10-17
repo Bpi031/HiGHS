@@ -500,6 +500,11 @@ struct HighsOptionsStruct {
   std::string mip_lp_solver;
   std::string mip_ipm_solver;
   HighsInt mip_root_simplex_strategy;
+  bool mip_root_lp_portfolio;
+  bool mip_root_primal_helper;
+  bool mip_root_cut_exchange;
+  bool mip_root_helper_private;
+  bool mip_flexible_node_dispatch;
   HighsInt mip_root_max_separation_rounds;
   double mip_root_max_separation_time;
   bool mip_root_work_budget;
@@ -509,12 +514,16 @@ struct HighsOptionsStruct {
   double mip_root_work_max_single_helper_time;
   double mip_root_work_tree_reserve_time;
   bool mip_node_lp_effort;
+  HighsInt mip_search_work_lp_limit;
+  bool mip_search_work_enforce;
+  bool mip_candidate_checkpoint;
   HighsInt mip_node_lp_effort_min_iterations;
   HighsInt mip_node_lp_effort_max_iterations;
   HighsInt mip_node_lp_effort_max_yields;
   std::string mip_incumbent_exchange;
   HighsInt mip_incumbent_epoch_nodes;
   std::string mip_primal_heuristic_schedule;
+  std::string mip_primal_partition_file;
   HighsInt mip_rins_max_calls;
   HighsInt mip_rins_max_nodes;
   HighsInt mip_rins_max_lp_iterations;
@@ -704,6 +713,11 @@ struct HighsOptionsStruct {
         mip_lp_solver(""),
         mip_ipm_solver(""),
         mip_root_simplex_strategy(-1),
+        mip_root_lp_portfolio(false),
+        mip_root_primal_helper(false),
+        mip_root_cut_exchange(false),
+        mip_root_helper_private(false),
+        mip_flexible_node_dispatch(false),
         mip_root_max_separation_rounds(-1),
         mip_root_max_separation_time(-1.0),
         mip_root_work_budget(false),
@@ -713,12 +727,16 @@ struct HighsOptionsStruct {
         mip_root_work_max_single_helper_time(-1.0),
         mip_root_work_tree_reserve_time(-1.0),
         mip_node_lp_effort(false),
+        mip_search_work_lp_limit(0),
+        mip_search_work_enforce(false),
+        mip_candidate_checkpoint(false),
         mip_node_lp_effort_min_iterations(10000),
         mip_node_lp_effort_max_iterations(250000),
         mip_node_lp_effort_max_yields(3),
         mip_incumbent_exchange("off"),
         mip_incumbent_epoch_nodes(64),
         mip_primal_heuristic_schedule("off"),
+        mip_primal_partition_file(""),
         mip_rins_max_calls(-1),
         mip_rins_max_nodes(-1),
         mip_rins_max_lp_iterations(-1),
@@ -1300,6 +1318,39 @@ class HighsOptions : public HighsOptionsStruct {
         advanced, &mip_root_simplex_strategy, -1, -1, kSimplexStrategyMax);
     records.push_back(record_int);
 
+    record_bool = new OptionRecordBool(
+        "mip_root_lp_portfolio",
+        "Experimental opportunistic first-root primal/dual basis race; "
+        "requires two executor slots, finite deadline, no user callbacks, "
+        "and at most 256 MiB of model-copy reservation (not an RSS limit)",
+        advanced, &mip_root_lp_portfolio, false);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_root_primal_helper",
+        "Experimental bounded candidate-only private root search; shares "
+        "executor capacity and replaces analytic/symmetry companion work",
+        advanced, &mip_root_primal_helper, false);
+    records.push_back(record_bool);
+    record_bool = new OptionRecordBool(
+        "mip_root_cut_exchange",
+        "Experimental copied global integer-row cut packets; native owner "
+        "checks exact derivations and reoptimizes, no helper proof import",
+        advanced, &mip_root_cut_exchange, false);
+    records.push_back(record_bool);
+    record_bool = new OptionRecordBool(
+        "mip_root_helper_private",
+        "Internal private-helper context: suppress nested root companions",
+        advanced, &mip_root_helper_private, false);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_flexible_node_dispatch",
+        "Experimental epoch-local immutable sibling donation and idle-worker "
+        "dispatch; proof bounds and global domain commits remain joined",
+        advanced, &mip_flexible_node_dispatch, false);
+    records.push_back(record_bool);
+
     record_int = new OptionRecordInt(
         "mip_root_max_separation_rounds",
         "Maximum root separation rounds; -1 keeps the upstream adaptive limit",
@@ -1361,10 +1412,26 @@ class HighsOptions : public HighsOptionsStruct {
     records.push_back(record_bool);
 
     record_int = new OptionRecordInt(
+        "mip_search_work_lp_limit",
+        "Experimental cooperative tree task work reservation (0 disables)",
+        advanced, &mip_search_work_lp_limit, 0, 0, kHighsIInf);
+    records.push_back(record_int);
+    record_bool = new OptionRecordBool(
+        "mip_search_work_enforce",
+        "Enforce cooperative tree reservations; otherwise observe only",
+        advanced, &mip_search_work_enforce, false);
+    records.push_back(record_bool);
+    record_int = new OptionRecordInt(
         "mip_node_lp_effort_min_iterations",
         "Minimum simplex iterations for one resumable tree-node LP lease",
         advanced, &mip_node_lp_effort_min_iterations, 1, 10000, kHighsIInf);
     records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_candidate_checkpoint",
+        "Experimental candidate-triggered cooperative search checkpoints",
+        advanced, &mip_candidate_checkpoint, false);
+    records.push_back(record_bool);
 
     record_int = new OptionRecordInt(
         "mip_node_lp_effort_max_iterations",
@@ -1381,7 +1448,7 @@ class HighsOptions : public HighsOptionsStruct {
 
     record_string = new OptionRecordString(
         "mip_incumbent_exchange",
-        "Worker incumbent exchange: off, observe, or deterministic", advanced,
+        "Worker incumbent exchange: off, observe, deterministic, or experimental opportunistic", advanced,
         &mip_incumbent_exchange, "off");
     records.push_back(record_string);
 
@@ -1393,8 +1460,13 @@ class HighsOptions : public HighsOptionsStruct {
 
     record_string = new OptionRecordString(
         "mip_primal_heuristic_schedule",
-        "Experimental incumbent manager: off, compatibility, or managed-rins",
+        "Experimental incumbent manager: off, compatibility, managed-rins, portfolio, portfolio-burst, portfolio-continuation, portfolio-deferred-continuation, portfolio-cost-aware, portfolio-ucb-success, portfolio-ucb-cost, portfolio-assignment-adaptive, portfolio-assignment-composed, portfolio-assignment-progressive, or portfolio-assignment-opportunities",
         advanced, &mip_primal_heuristic_schedule, "off");
+    records.push_back(record_string);
+    record_string = new OptionRecordString(
+        "mip_primal_partition_file",
+        "Experimental original-column binary partition contract for the cost-aware portfolio",
+        advanced, &mip_primal_partition_file, "");
     records.push_back(record_string);
 
     record_int = new OptionRecordInt(

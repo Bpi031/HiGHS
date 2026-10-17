@@ -74,6 +74,7 @@ class HighsTimer {
     this->num_clock = 0;
     this->clock_num_call.clear();
     this->clock_start.clear();
+    this->clock_time.clear();
     this->clock_names.clear();
     HighsInt i_clock = clock_def("Run HiGHS");
     assert(i_clock == 0);

@@ -12,6 +12,8 @@
 #define UTIL_HIGHSRANDOM_H_
 
 #include <cassert>
+#include <cmath>
+#include <limits>
 
 #include "util/HighsHash.h"
 
@@ -26,7 +28,8 @@ class HighsRandom {
     // until we get one that is in the desired range we first use all available
     // output functions for the same state before we advance the state again. We
     // expect nbits to be at most 32 for this 32 bit version.
-    assert(sup <= uint32_t{1} << nbits);
+    assert(sup > 0 && nbits > 0 && nbits <= 32 &&
+           (nbits == 32 || sup <= (uint32_t{1} << nbits)));
     while (true) {
       advance();
       uint32_t lo = static_cast<uint32_t>(state);
@@ -79,9 +82,12 @@ class HighsRandom {
     // 64 bit version for drawUniform. If result fits in 32 bits use 32 bit
     // version above so that it is only called when we actually need more than
     // 32 bits
-    if (nbits <= 32) return drawUniform(uint32_t(sup), nbits);
+    // A range of exactly 2^32 cannot be represented by the 32-bit upper bound.
+    if (nbits <= 32 && sup <= (std::numeric_limits<uint32_t>::max)())
+      return drawUniform(uint32_t(sup), nbits);
 
-    assert(sup <= uint64_t{1} << nbits);
+    assert(sup > 0 && nbits > 0 && nbits <= 64 &&
+           (nbits == 64 || sup <= (uint64_t{1} << nbits)));
     while (true) {
       advance();
       uint32_t lo = static_cast<uint32_t>(state);
@@ -142,7 +148,7 @@ class HighsRandom {
   }
 
   /**
-   * @brief Return a random integer between 0 and 2147483647
+   * @brief Return a nonnegative representable HighsInt
    */
   HighsInt integer() {
     advance();
@@ -173,7 +179,16 @@ class HighsRandom {
    * @brief Return a random integer between [min,sup)
    */
   HighsInt integer(HighsInt min, HighsInt sup) {
-    return min + integer(sup - min);
+    if (sup <= min) return min;
+    const HighsUInt range = HighsUInt(sup) - HighsUInt(min);
+    if (range <= 1) return min;
+    const int nbits = HighsHashHelpers::log2i(range - 1) + 1;
+    const HighsUInt offset = drawUniform(range, nbits);
+    if (offset <= HighsUInt((std::numeric_limits<HighsInt>::max)()))
+      return min + static_cast<HighsInt>(offset);
+    // For a larger offset, reconstruct from the upper endpoint so the cast
+    // and both signed arithmetic operations stay representable.
+    return sup - 1 - static_cast<HighsInt>(range - 1 - offset);
   }
 
   /**
@@ -212,7 +227,15 @@ class HighsRandom {
   /**
    * @brief Return a random real value in the interval [a,b]
    */
-  double real(double a, double b) { return a + (b - a) * closedFraction(); }
+  double real(double a, double b) {
+    const double fraction = closedFraction();
+    const double half_max = (std::numeric_limits<double>::max)() / 2;
+    // Opposite-sign endpoints can overflow b-a. Keep ordinary draws unchanged.
+    if ((std::fabs(a) > half_max || std::fabs(b) > half_max) &&
+        ((a < 0 && b > 0) || (a > 0 && b < 0)))
+      return a * (1 - fraction) + b * fraction;
+    return a + (b - a) * fraction;
+  }
 
   /**
    * @brief Return a random bit
